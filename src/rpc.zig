@@ -15749,9 +15749,9 @@ pub const RpcServer = struct {
     ///
     /// Routes each transaction through acceptToMemoryPool(test_accept=true) so
     /// the real policy gates (checkStandard, duplicate detection) fire without
-    /// mutating mempool state.  Multi-tx packages (>1 entry) are routed through
-    /// acceptPackage with test_accept semantics: validation runs but the txns
-    /// are NOT added to the mempool.
+    /// mutating mempool state.  Multi-tx arrays (>1 entry) follow Core's
+    /// AcceptMultipleTransactions (Mempool.testAcceptMultiple): no package
+    /// feerate, first failure ends validation, nothing is added to the pool.
     ///
     /// Arguments:
     ///   1. rawtxs (array of strings, required) - hex-encoded transactions
@@ -15916,14 +15916,14 @@ pub const RpcServer = struct {
                 try writer.writeByte('}');
             }
         } else {
-            // Multi-transaction package path: route through acceptPackage.
-            // To preserve test_accept semantics (no mempool mutation), we run
-            // validation but roll back any additions by working on a snapshot.
-            // Since clearbit has no snapshot support, we call acceptPackage and
-            // then remove the added transactions — this is safe because the
-            // caller holds no lock and test_accept semantics are required.
+            // Multi-transaction path: Core's AcceptMultipleTransactions with
+            // test_accept (Mempool.testAcceptMultiple).  It validates against
+            // a read-only view and never adds to the pool.  (This used to run
+            // the CPFP submit path, acceptPackage, and roll the additions back:
+            // a 1-sat parent was allowed through its child, and a conflict it
+            // replaced stayed evicted.)
             //
-            // Build the decoded-tx slice for acceptPackage (skip decode-error entries).
+            // Build the decoded-tx slice (skip decode-error entries).
             var valid_txns = std.ArrayList(types.Transaction).init(self.allocator);
             defer valid_txns.deinit();
             var has_decode_error = false;
@@ -15957,74 +15957,75 @@ pub const RpcServer = struct {
                     }
                 }
             } else {
-                // Run package validation; collect txids added so we can roll back.
-                self.mempool.mutex.lock();
-                const pkg_result_or_err = mempool_mod.acceptPackage(self.mempool, valid_txns.items, self.allocator);
-                if (pkg_result_or_err) |pkg_result| {
-                    // Capture each accepted member's fee before the rollback drops
-                    // its entry: Core reports fees.base from the real fee.
-                    // isWellFormedPackage caps a package at MAX_PACKAGE_COUNT, so a
-                    // fixed buffer needs no allocation (an OOM path here would skip
-                    // the rollback below).
-                    var member_fees = [_]i64{0} ** mempool_mod.MAX_PACKAGE_COUNT;
-                    for (pkg_result.tx_results, 0..) |tx_res, i| {
-                        if (i < member_fees.len) {
-                            member_fees[i] = if (self.mempool.entries.get(tx_res.txid)) |e| e.fee else 0;
-                        }
-                    }
-                    // Roll back: remove any transactions acceptPackage added (test_accept semantics).
-                    for (pkg_result.tx_results) |tx_res| {
-                        if (tx_res.accepted) {
-                            self.mempool.removeTransaction(tx_res.txid);
-                        }
-                    }
-                    self.mempool.mutex.unlock();
-
-                    // Emit per-tx results
-                    for (pkg_result.tx_results, 0..) |tx_res, i| {
+                // Core: ProcessNewPackage(test_accept=true) ->
+                // AcceptMultipleTransactions, after IsWellFormedPackage.  No
+                // package feerate: each tx pays the relay minimum alone, and
+                // the first failure leaves the rest unfinished (see
+                // Mempool.testAcceptMultiple).  A package that is not well
+                // formed answers package-error on every entry, as before.
+                const well_formed = if (mempool_mod.isWellFormedPackage(valid_txns.items, self.allocator)) |_| true else |_| false;
+                const results = try self.allocator.alloc(mempool_mod.Mempool.MultiTestResult, valid_txns.items.len);
+                for (results) |*r| r.* = .{ .txid = std.mem.zeroes(types.Hash256), .wtxid = std.mem.zeroes(types.Hash256) };
+                defer {
+                    for (results) |r| if (r.reject_details) |d| self.allocator.free(d);
+                    self.allocator.free(results);
+                }
+                if (well_formed) {
+                    self.mempool.mutex.lock();
+                    defer self.mempool.mutex.unlock();
+                    self.mempool.testAcceptMultiple(valid_txns.items, results, self.allocator) catch {
+                        return self.jsonRpcError(RPC_OUT_OF_MEMORY, "Out of memory", id);
+                    };
+                }
+                if (well_formed) {
+                    for (results, 0..) |r, i| {
                         if (i > 0) try writer.writeByte(',');
                         try writer.writeAll("{\"txid\":\"");
-                        try writeHashHex(writer, &tx_res.txid);
+                        try writeHashHex(writer, &r.txid);
                         try writer.writeAll("\",\"wtxid\":\"");
-                        try writeHashHex(writer, &tx_res.wtxid);
-                        try writer.writeAll("\",\"allowed\":");
-                        if (tx_res.accepted) {
-                            try writer.writeAll("true");
-                            // vsize from the decoded tx
-                            const tx = valid_txns.items[i];
-                            const weight = mempool_mod.computeTxWeight(&tx, self.allocator) catch 0;
-                            const vsize = (weight + 3) / 4;
-                            try writer.writeAll(",\"vsize\":");
-                            try writer.print("{d}", .{vsize});
-                            // Core: fees.base is the tx's own fee; effective-feerate is
-                            // CFeeRate(fee, vsize).GetFeePerK() and effective-includes
-                            // the wtxids that fed it (just this tx).
-                            const fee = member_fees[i];
-                            try writer.writeAll(",\"fees\":{\"base\":");
-                            try writeSatsAsBtc(writer, fee);
-                            const per_k: i64 = if (vsize == 0) 0 else @divTrunc(fee * 1000, @as(i64, @intCast(vsize)));
-                            try writer.writeAll(",\"effective-feerate\":");
-                            try writeSatsAsBtc(writer, per_k);
-                            try writer.writeAll(",\"effective-includes\":[\"");
-                            try writeHashHex(writer, &tx_res.wtxid);
-                            try writer.writeAll("\"]}");
-                        } else {
-                            try writer.writeAll("false");
-                            if (tx_res.error_message) |reason| {
-                                try writer.writeAll(",\"reject-reason\":\"");
-                                try writer.writeAll(reason);
-                                try writer.writeByte('"');
-                            }
+                        try writeHashHex(writer, &r.wtxid);
+                        try writer.writeByte('"');
+                        switch (r.state) {
+                            // Validation unfinished: txid and wtxid only.
+                            .unfinished => {},
+                            .allowed => {
+                                try writer.writeAll(",\"allowed\":true,\"vsize\":");
+                                try writer.print("{d}", .{r.vsize});
+                                // Core: fees.base is the tx's own fee;
+                                // effective-feerate is CFeeRate(fee,
+                                // vsize).GetFeePerK() and effective-includes
+                                // just this tx (no package feerates here).
+                                try writer.writeAll(",\"fees\":{\"base\":");
+                                try writeSatsAsBtc(writer, r.fee);
+                                const per_k: i64 = if (r.vsize == 0) 0 else @divTrunc(r.fee * 1000, @as(i64, @intCast(r.vsize)));
+                                try writer.writeAll(",\"effective-feerate\":");
+                                try writeSatsAsBtc(writer, per_k);
+                                try writer.writeAll(",\"effective-includes\":[\"");
+                                try writeHashHex(writer, &r.wtxid);
+                                try writer.writeAll("\"]}");
+                            },
+                            .rejected => {
+                                try writer.writeAll(",\"allowed\":false");
+                                if (r.reject_reason) |reason| {
+                                    try writer.writeAll(",\"reject-reason\":\"");
+                                    try writer.writeAll(reason);
+                                    try writer.writeByte('"');
+                                    // Same reject-details rule as the single-tx
+                                    // path, plus Core's debug message when known.
+                                    const details: ?[]const u8 = r.reject_details orelse
+                                        (if (rejectDetailsEqualReason(reason)) reason else null);
+                                    if (details) |d| {
+                                        try writer.writeAll(",\"reject-details\":\"");
+                                        try writer.writeAll(d);
+                                        try writer.writeByte('"');
+                                    }
+                                }
+                            },
                         }
                         try writer.writeByte('}');
                     }
-
-                    // pkg_result.deinit() requires non-const — copy to mutable.
-                    var mutable_result = pkg_result;
-                    mutable_result.deinit();
-                } else |_| {
-                    self.mempool.mutex.unlock();
-                    // Emit package-error for all entries on fatal package error
+                } else {
+                    // IsWellFormedPackage failed: package-error for all entries.
                     for (rawtxs, 0..) |_, i| {
                         if (i > 0) try writer.writeByte(',');
                         const tx = txns.items[i];
@@ -25108,6 +25109,7 @@ fn rejectDetailsEqualReason(reason: []const u8) bool {
         "txn-already-in-mempool",
         "txn-already-known",
         "txn-same-nonwitness-data-in-mempool",
+        "bip125-replacement-disallowed",
         "coinbase",
         "non-final",
         "non-BIP68-final",

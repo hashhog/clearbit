@@ -1835,6 +1835,38 @@ pub fn build(b: *std.Build) void {
         tma_step.dependOn(&run_tma_tests.step);
     }
 
+    // testmempoolaccept with a multi-tx array: Core's AcceptMultipleTransactions
+    // (no package feerate, first failure ends validation).  Same rig as
+    // test-tma-parity; also part of `test`.
+    {
+        const tmp_tests = b.addTest(.{
+            .root_source_file = b.path("tests_tma_package.zig"),
+            .target = target,
+            .optimize = optimize,
+            .filters = &[_][]const u8{"tests_tma_package"},
+        });
+        tmp_tests.linkSystemLibrary("rocksdb");
+        tmp_tests.linkSystemLibrary("secp256k1");
+        tmp_tests.addIncludePath(.{ .cwd_relative = secp256k1_include });
+        tmp_tests.linkLibC();
+        if (target.result.cpu.arch == .x86_64) {
+            tmp_tests.addCSourceFile(.{
+                .file = b.path("src/sha256_shani.c"),
+                .flags = shani_cflags,
+            });
+        }
+        if (minisketch_enabled) {
+            tmp_tests.linkSystemLibrary("minisketch");
+            tmp_tests.addIncludePath(.{ .cwd_relative = minisketch_include });
+        }
+        tmp_tests.root_module.addOptions("build_options", build_options);
+
+        const run_tmp_tests = b.addRunArtifact(tmp_tests);
+        const tmp_step = b.step("test-tma-package", "Run testmempoolaccept multi-tx (AcceptMultipleTransactions) tests");
+        tmp_step.dependOn(&run_tmp_tests.step);
+        test_step.dependOn(&run_tmp_tests.step);
+    }
+
     // submitpackage response shape vs Core.  Same rig as test-tma-parity above.
     {
         const sps_tests = b.addTest(.{
