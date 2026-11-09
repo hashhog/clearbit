@@ -192,6 +192,86 @@ pub fn isSystemScriptError(err: ScriptError) bool {
     return err == ScriptError.OutOfMemory or err == ScriptError.InternalError;
 }
 
+/// Core's ScriptErrorString text for SCRIPT_ERR_EVAL_FALSE: `verify()`
+/// returned false (the scripts ran but left a false/empty top element).
+pub const EVAL_FALSE_STRING = "Script evaluated without error but finished with a false/empty top stack element";
+
+/// Core's `ScriptErrorString` (script/script_error.cpp) for a clearbit
+/// ScriptError.  Strings only: used to build Core's mempool reject reason
+/// `mempool-script-verify-flag-failed (<this>)`; no verdict depends on it.
+///
+/// clearbit's error set is coarser than Core's SCRIPT_ERR_* enum in a few
+/// places; those take the Core error their most common raise site means:
+///   InvalidScript         truncated push -> BAD_OPCODE (also raised for
+///                         MAX_SCRIPT_SIZE, Core SCRIPT_SIZE)
+///   VerifyFailed          OP_VERIFY -> VERIFY (also OP_NUMEQUALVERIFY)
+///   InvalidStackOperation PICK/ROLL index -> INVALID_STACK_OPERATION (also
+///                         CHECKMULTISIG key/sig counts, Core PUBKEY_COUNT /
+///                         SIG_COUNT)
+///   StackUnderflow        -> INVALID_STACK_OPERATION (also OP_FROMALTSTACK,
+///                         Core INVALID_ALTSTACK_OPERATION)
+///   WitnessUnexpected     -> WITNESS_UNEXPECTED (also a non-empty scriptSig
+///                         on a native witness program, Core WITNESS_MALLEATED)
+///   WitnessProgramMismatch -> WITNESS_PROGRAM_MISMATCH (also an unknown
+///                         witness version under the discourage flag, Core
+///                         DISCOURAGE_UPGRADABLE_WITNESS_PROGRAM)
+///   NullFail              -> SIG_NULLFAIL (also a failed non-empty tapscript
+///                         CHECKSIG, Core SCHNORR_SIG)
+/// and `verify()` returning false is EVAL_FALSE, which also covers a failed
+/// taproot key-path signature (Core SCHNORR_SIG).
+/// The switch is exhaustive so a new ScriptError cannot go unmapped.
+pub fn scriptErrorString(err: ScriptError) []const u8 {
+    return switch (err) {
+        ScriptError.InvalidScript, ScriptError.InvalidOpcode => "Opcode missing or not understood",
+        ScriptError.StackUnderflow, ScriptError.InvalidStackOperation => "Operation not valid with the current stack size",
+        ScriptError.StackOverflow, ScriptError.StackSize => "Stack size limit exceeded",
+        ScriptError.DisabledOpcode => "Attempted to use a disabled opcode",
+        ScriptError.PushSizeExceeded, ScriptError.PushSize => "Push value size limit exceeded",
+        ScriptError.OpCountExceeded => "Operation limit exceeded",
+        ScriptError.EqualVerifyFailed => "Script failed an OP_EQUALVERIFY operation",
+        ScriptError.CheckSigFailed => "Script failed an OP_CHECKSIGVERIFY operation",
+        ScriptError.CheckMultisigFailed => "Script failed an OP_CHECKMULTISIGVERIFY operation",
+        ScriptError.NullDummy => "Dummy CHECKMULTISIG argument must be zero",
+        ScriptError.NullFail => "Signature must be zero for failed CHECK(MULTI)SIG operation",
+        ScriptError.CleanStack => "Stack size must be exactly one after execution",
+        ScriptError.MinimalData => "Data push larger than necessary",
+        ScriptError.MinimalIf => "OP_IF/NOTIF argument must be minimal",
+        ScriptError.NegativeLocktime => "Negative locktime",
+        ScriptError.UnsatisfiedLocktime => "Locktime requirement not satisfied",
+        ScriptError.WitnessProgramMismatch => "Witness program hash mismatch",
+        ScriptError.WitnessProgramWrongLength => "Witness program has incorrect length",
+        ScriptError.WitnessPubkeyType => "Using non-compressed keys in segwit",
+        ScriptError.WitnessUnexpected => "Witness provided for non-witness script",
+        ScriptError.InvalidNumber => "Script number overflowed or is non-minimally encoded",
+        ScriptError.VerifyFailed => "Script failed an OP_VERIFY operation",
+        ScriptError.OpReturnEncountered => "OP_RETURN was encountered",
+        ScriptError.UnbalancedConditional => "Invalid OP_IF construction",
+        ScriptError.SigPushOnly => "Only push operators allowed in signatures",
+        ScriptError.InvalidSignatureEncoding => "Non-canonical DER signature",
+        ScriptError.SigHighS => "Non-canonical signature: S value is unnecessarily high",
+        ScriptError.InvalidSigHashType => "Signature hash type missing or not understood",
+        ScriptError.InvalidPubkeyType => "Public key is neither compressed or uncompressed",
+        ScriptError.DiscourageOpSuccess => "OP_SUCCESSx reserved for soft-fork upgrades",
+        ScriptError.DiscourageUpgradableNops => "NOPx reserved for soft-fork upgrades",
+        ScriptError.DiscourageUpgradablePubkeyType => "Public key version reserved for soft-fork upgrades",
+        ScriptError.DiscourageUpgradableTaprootVersion => "Taproot version reserved for soft-fork upgrades",
+        ScriptError.TapscriptEmptyPubkey => "Empty public key in tapscript",
+        ScriptError.TapscriptCheckmultisigDisabled => "OP_CHECKMULTISIG(VERIFY) is not available in tapscript",
+        ScriptError.WitnessProgramWitnessEmpty => "Witness program was passed an empty witness",
+        ScriptError.TaprootWrongControlSize => "Invalid Taproot control block size",
+        ScriptError.TapscriptValidationWeight => "Too much signature validation relative to witness weight",
+        ScriptError.TapscriptMinimalIf => "OP_IF/NOTIF argument must be minimal in tapscript",
+        ScriptError.ConstScriptCode => "Using OP_CODESEPARATOR in non-witness script",
+        ScriptError.SigFindAndDelete => "Signature is found in scriptCode",
+        ScriptError.SchnorrSigSize => "Invalid Schnorr signature size",
+        ScriptError.SchnorrSigHashType => "Invalid Schnorr signature hash type",
+        ScriptError.WitnessMalleatedP2sh => "Witness requires only-redeemscript scriptSig",
+        // Never raised as a script result (ScriptFailed, DivisionByZero) or
+        // not a script result at all (gate 6): Core's fallback text.
+        ScriptError.ScriptFailed, ScriptError.DivisionByZero, ScriptError.OutOfMemory, ScriptError.InternalError => "unknown error",
+    };
+}
+
 /// Gate 6: a sighash computation failed.  OutOfMemory is ours — it must
 /// propagate as a system fault.  Pre-fix every site did `catch return false`,
 /// so an allocation failure while hashing a VALID signature made CHECKSIG
