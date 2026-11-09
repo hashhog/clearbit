@@ -209,6 +209,49 @@ test "tests_mempool_error_strings submitpackage: a parent failing its script che
     try testing.expectEqual(@as(usize, 0), r.mp.entries.count());
 }
 
+test "tests_mempool_error_strings submitpackage: the child of a parent that failed its script check is bad-txns-inputs-missingorspent" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const r = try rig(a, try chainWithCoin(a, PREV, &REDEEM_CHECKSIG));
+
+    const parent = try spendTo(a, PREV, 0, &SIG_BAD_ECDSA, COIN_VALUE - 20_000, &REDEEM_TRUE);
+    const child = try spendTo(a, try crypto.computeTxid(&parent, a), 0, &SIG_TRUE, COIN_VALUE - 40_000, &REDEEM_TRUE);
+    const p = try call(a, r.srv, "submitpackage", &.{ &parent, &child });
+
+    // The parent is not in the pool, so Core's PreChecks finds the child's
+    // input neither in the pool nor the UTXO set.
+    const c = try txResult(a, p, &child);
+    try testing.expectEqualStrings("bad-txns-inputs-missingorspent", c.get("error").?.string);
+}
+
+test "tests_mempool_error_strings submitpackage: a child spending an unknown outpoint is bad-txns-inputs-missingorspent" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const r = try rig(a, try chainWithCoin(a, PREV, &REDEEM_TRUE));
+
+    // As the harness's package/submit/missing-input: the child spends the
+    // parent and an outpoint that exists nowhere.
+    const parent = try spendTo(a, PREV, 0, &SIG_TRUE, COIN_VALUE - 20_000, &REDEEM_TRUE);
+    var child = try spendTo(a, try crypto.computeTxid(&parent, a), 0, &SIG_TRUE, COIN_VALUE - 40_000, &REDEEM_TRUE);
+    const ins = try a.alloc(types.TxIn, 2);
+    ins[0] = child.inputs[0];
+    ins[1] = .{
+        .previous_output = .{ .hash = OTHER, .index = 1 },
+        .script_sig = &SIG_TRUE,
+        .sequence = 0xFFFFFFFF,
+        .witness = &.{},
+    };
+    child.inputs = ins;
+    const p = try call(a, r.srv, "submitpackage", &.{ &parent, &child });
+
+    const res = p.value.object.get("result").?.object;
+    try testing.expectEqualStrings("transaction failed", res.get("package_msg").?.string);
+    const c = try txResult(a, p, &child);
+    try testing.expectEqualStrings("bad-txns-inputs-missingorspent", c.get("error").?.string);
+}
+
 /// Wraps an allocator and remembers every pointer handed to `free`.
 const FreeTracker = struct {
     child: std.mem.Allocator,

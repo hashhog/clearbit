@@ -11370,7 +11370,16 @@ pub fn acceptPackage(
                 MempoolError.ClusterSizeLimitExceeded => "too-large-cluster",
                 MempoolError.DustOutput => "dust output",
                 MempoolError.NonStandard => "non-standard",
-                else => "validation failed",
+                // Core PreChecks: an input neither in the pool nor the UTXO
+                // set is TX_MISSING_INPUTS "bad-txns-inputs-missingorspent"
+                // (validation.cpp); submitpackage reports that ToString.
+                // Only testmempoolaccept renames it "missing-inputs".
+                MempoolError.MissingInputs => "bad-txns-inputs-missingorspent",
+                // Every other reject: the same Core token the
+                // sendrawtransaction path reports.  This is the bare reason;
+                // Core's ToString also appends a debug message where it has
+                // one, which this does not reproduce.
+                else => rejectReasonForError(err),
             };
             // Core submitpackage reports TxValidationState::ToString: for a
             // script-check failure, "mempool-script-verify-flag-failed
