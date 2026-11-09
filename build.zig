@@ -1867,6 +1867,38 @@ pub fn build(b: *std.Build) void {
         test_step.dependOn(&run_tmp_tests.step);
     }
 
+    // Core's script-check and per-tx error strings in package results
+    // (testmempoolaccept multi-tx, submitpackage).  Same rig as
+    // test-tma-parity; also part of `test`.
+    {
+        const mes_tests = b.addTest(.{
+            .root_source_file = b.path("tests_mempool_error_strings.zig"),
+            .target = target,
+            .optimize = optimize,
+            .filters = &[_][]const u8{"tests_mempool_error_strings"},
+        });
+        mes_tests.linkSystemLibrary("rocksdb");
+        mes_tests.linkSystemLibrary("secp256k1");
+        mes_tests.addIncludePath(.{ .cwd_relative = secp256k1_include });
+        mes_tests.linkLibC();
+        if (target.result.cpu.arch == .x86_64) {
+            mes_tests.addCSourceFile(.{
+                .file = b.path("src/sha256_shani.c"),
+                .flags = shani_cflags,
+            });
+        }
+        if (minisketch_enabled) {
+            mes_tests.linkSystemLibrary("minisketch");
+            mes_tests.addIncludePath(.{ .cwd_relative = minisketch_include });
+        }
+        mes_tests.root_module.addOptions("build_options", build_options);
+
+        const run_mes_tests = b.addRunArtifact(mes_tests);
+        const mes_step = b.step("test-mempool-error-strings", "Run package-result error string tests (Core ScriptErrorString, ToString tokens)");
+        mes_step.dependOn(&run_mes_tests.step);
+        test_step.dependOn(&run_mes_tests.step);
+    }
+
     // submitpackage response shape vs Core.  Same rig as test-tma-parity above.
     {
         const sps_tests = b.addTest(.{

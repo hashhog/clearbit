@@ -492,6 +492,54 @@ fn rejectReasonForError(err: MempoolError) []const u8 {
     };
 }
 
+/// Which input failed a mempool script check, and how: the facts Core puts in
+/// a script-check reject (validation.cpp CheckInputScripts + CScriptCheck).
+pub const ScriptFailure = struct {
+    input_index: usize,
+    /// The engine's error; null when `verify()` returned false
+    /// (Core SCRIPT_ERR_EVAL_FALSE).
+    err: ?script.ScriptError,
+
+    /// Core's reject reason under STANDARD_SCRIPT_VERIFY_FLAGS (the mempool
+    /// always checks with them, so it is always the `mempool-` form):
+    ///   strprintf("mempool-script-verify-flag-failed (%s)", ScriptErrorString(err))
+    /// Static string, no allocation.
+    pub fn reason(self: ScriptFailure) []const u8 {
+        const prefix = "mempool-script-verify-flag-failed (";
+        const e = self.err orelse return prefix ++ script.EVAL_FALSE_STRING ++ ")";
+        inline for (@typeInfo(script.ScriptError).ErrorSet.?) |f| {
+            const v = @field(script.ScriptError, f.name);
+            if (e == v) return prefix ++ comptime script.scriptErrorString(v) ++ ")";
+        }
+        unreachable;
+    }
+
+    /// Core's TxValidationState::ToString for this reject: the reason, then
+    /// CScriptCheck's debug message
+    ///   "input %i of %s (wtxid %s), spending %s:%i"
+    /// (txid, wtxid and prevout hash in display byte order).  Owned by
+    /// `allocator`.
+    pub fn details(self: ScriptFailure, allocator: std.mem.Allocator, tx: *const types.Transaction) error{OutOfMemory}![]u8 {
+        const txid = crypto.computeTxid(tx, allocator) catch return error.OutOfMemory;
+        const wtxid = crypto.computeWtxid(tx, allocator) catch return error.OutOfMemory;
+        const prevout = tx.inputs[self.input_index].previous_output;
+        var t = txid;
+        var w = wtxid;
+        var p = prevout.hash;
+        std.mem.reverse(u8, &t);
+        std.mem.reverse(u8, &w);
+        std.mem.reverse(u8, &p);
+        return std.fmt.allocPrint(allocator, "{s}, input {d} of {s} (wtxid {s}), spending {s}:{d}", .{
+            self.reason(),
+            self.input_index,
+            std.fmt.fmtSliceHexLower(&t),
+            std.fmt.fmtSliceHexLower(&w),
+            std.fmt.fmtSliceHexLower(&p),
+            prevout.index,
+        });
+    }
+};
+
 // ============================================================================
 // Cluster Mempool Constants
 // ============================================================================
@@ -3794,6 +3842,15 @@ pub const Mempool = struct {
     /// cluster.  Prevouts are only resolvable here, so this is the natural place
     /// to compute it once.
     fn verifyInputScripts(self: *Mempool, tx: *const types.Transaction) MempoolError!u64 {
+        var ignored: ?ScriptFailure = null;
+        return self.verifyInputScriptsDetailed(tx, &ignored);
+    }
+
+    /// `verifyInputScripts`, and on `ScriptVerifyFailed` also records which
+    /// input failed and the engine's error in `fail` (left untouched on every
+    /// other outcome), so callers can report Core's reject reason and debug
+    /// message.  The verdict is the same either way.
+    fn verifyInputScriptsDetailed(self: *Mempool, tx: *const types.Transaction, fail: *?ScriptFailure) MempoolError!u64 {
         // No chain_state → unit-test path, skip script verify (parity with
         // the "assume inputs exist" branch a few lines up the call stack).
         // No prevouts means no resolvable sigop cost either; report 0, which
@@ -3937,10 +3994,12 @@ pub const Mempool = struct {
             );
             // Gate 6: a system fault (OOM / no secp context) is not "script
             // failed" — the tx was not judged.
+            var script_err: ?script.ScriptError = null;
             const script_ok: bool = if (result) |ok| ok else |e| blk: {
                 if (script.isSystemScriptError(e)) {
                     return if (e == error.OutOfMemory) MempoolError.OutOfMemory else MempoolError.SystemFault;
                 }
+                script_err = e;
                 break :blk false;
             };
             if (!script_ok) {
@@ -3957,6 +4016,11 @@ pub const Mempool = struct {
                 if (!txHasAnyWitness(tx) and spendsNonAnchorWitnessProgram(tx, spent_scripts)) {
                     return MempoolError.WitnessStripped;
                 }
+                // Core CheckInputScripts reports the first failing input.
+                // (The consensus-flags re-check below records nothing: Core
+                // treats a failure there as an internal bug, and the STANDARD
+                // set is a superset, so it cannot fail after this loop passed.)
+                fail.* = .{ .input_index = input_index, .err = script_err };
                 return MempoolError.ScriptVerifyFailed;
             }
         }
@@ -5286,10 +5350,20 @@ pub const Mempool = struct {
         for (txns, 0..) |*tx, i| {
             self.test_package_view = txns[0..i];
             self.test_package_txids = txids[0..i];
-            _ = self.verifyInputScripts(tx) catch |err| {
+            var fail: ?ScriptFailure = null;
+            _ = self.verifyInputScriptsDetailed(tx, &fail) catch |err| {
                 if (err == MempoolError.OutOfMemory) return error.OutOfMemory;
                 results[i].state = .rejected;
                 results[i].reject_reason = rejectReasonForError(err);
+                // Core: reject-reason is "mempool-script-verify-flag-failed
+                // (<ScriptErrorString>)", reject-details adds the failing
+                // input (TxValidationState::ToString).
+                if (err == MempoolError.ScriptVerifyFailed) {
+                    if (fail) |f| {
+                        results[i].reject_reason = f.reason();
+                        results[i].reject_details = try f.details(allocator, tx);
+                    }
+                }
                 return;
             };
             results[i].state = .allowed;
@@ -5491,6 +5565,13 @@ pub const Mempool = struct {
     /// This allows transactions with individual fee rates below minimum
     /// when the package fee rate is sufficient.
     pub fn addTransactionWithPackageRate(self: *Mempool, tx: types.Transaction, package_fee_rate: f64) MempoolError!void {
+        var ignored: ?ScriptFailure = null;
+        return self.addTransactionWithPackageRateDetailed(tx, package_fee_rate, &ignored);
+    }
+
+    /// `addTransactionWithPackageRate`, also recording a script-check
+    /// failure in `fail` (see `verifyInputScriptsDetailed`).
+    pub fn addTransactionWithPackageRateDetailed(self: *Mempool, tx: types.Transaction, package_fee_rate: f64, fail: *?ScriptFailure) MempoolError!void {
         // Reads the coin view: cs_main first, then mempool.cs (Core ATMP:
         // AssertLockHeld(cs_main); LOCK(m_pool.cs)).
         self.lockChainThenPool();
@@ -5575,7 +5656,7 @@ pub const Mempool = struct {
         // 6b. Script verification (STANDARD_SCRIPT_VERIFY_FLAGS) — same gate
         // as `addTransaction`. See that function's comment for the why.
         // Also yields the weighted sigop cost for the cluster weight gate.
-        const sigop_cost = try self.verifyInputScripts(&tx);
+        const sigop_cost = try self.verifyInputScriptsDetailed(&tx, fail);
 
         // Per-tx cluster contribution in WEIGHT units — identical form to
         // `addTransaction`, via the single shared helper.
@@ -10824,6 +10905,10 @@ pub const PackageTxResult = struct {
     accepted: bool,
     /// Error message if rejected.
     error_message: ?[]const u8,
+    /// `error_message` was allocated with the PackageResult's allocator
+    /// (Core's script-check message carries the failing input) and is freed
+    /// by `PackageResult.deinit`; otherwise it is a static string.
+    error_message_owned: bool = false,
     /// Effective fee rate within the package.
     effective_fee_rate: ?f64,
     /// This transaction's own fee in satoshis (Core `fees.base`).
@@ -10864,6 +10949,9 @@ pub const PackageResult = struct {
     allocator: std.mem.Allocator,
 
     pub fn deinit(self: *PackageResult) void {
+        for (self.tx_results) |r| {
+            if (r.error_message_owned) if (r.error_message) |m| self.allocator.free(m);
+        }
         self.allocator.free(self.tx_results);
         // FIX-73: free heap-owned replaced_transactions slice.
         self.allocator.free(self.replaced_transactions);
@@ -11239,6 +11327,9 @@ pub fn acceptPackage(
     }
 
     // Step 5: Add transactions to mempool (in order, parents first)
+    errdefer for (tx_results) |r| {
+        if (r.error_message_owned) if (r.error_message) |m| allocator.free(m);
+    };
     var all_accepted = true;
     for (txns, 0..) |tx, i| {
         if (already_in_mempool.contains(tx_results[i].txid)) {
@@ -11247,7 +11338,8 @@ pub fn acceptPackage(
 
         // Try to add to mempool
         // Note: Individual transactions may have fee rate below minimum, but package fee rate is sufficient
-        const result = mempool.addTransactionWithPackageRate(tx, package_fee_rate);
+        var script_fail: ?ScriptFailure = null;
+        const result = mempool.addTransactionWithPackageRateDetailed(tx, package_fee_rate, &script_fail);
         if (result) |_| {
             tx_results[i].accepted = true;
             tx_results[i].effective_fee_rate = package_fee_rate;
@@ -11280,6 +11372,16 @@ pub fn acceptPackage(
                 MempoolError.NonStandard => "non-standard",
                 else => "validation failed",
             };
+            // Core submitpackage reports TxValidationState::ToString: for a
+            // script-check failure, "mempool-script-verify-flag-failed
+            // (<ScriptErrorString>), input N of <txid> (wtxid <wtxid>),
+            // spending <prevout>".
+            if (err == MempoolError.ScriptVerifyFailed) {
+                if (script_fail) |f| {
+                    tx_results[i].error_message = f.details(allocator, &tx) catch return PackageError.OutOfMemory;
+                    tx_results[i].error_message_owned = true;
+                }
+            }
             all_accepted = false;
         }
     }
