@@ -6200,22 +6200,235 @@ pub const Mempool = struct {
                 const uf = if (self.cluster_union) |*u| u else break :lin;
                 const cluster = self.getClusterTxidsForRoot(uf.find(idx)) catch break :lin;
                 defer self.allocator.free(cluster);
-                var lin = self.linearizeCluster(cluster, self.allocator) catch break :lin;
-                defer lin.deinit();
-                for (lin.chunks) |c| {
-                    var info = ChunkInfo{ .fee = 0, .weight = 0 };
-                    for (c.tx_indices) |i| {
-                        const e = self.entries.get(cluster[i]) orelse continue;
-                        info.fee += self.getModifiedFee(e);
-                        info.weight += if (e.cluster_weight != 0) e.cluster_weight else e.weight;
-                    }
-                    for (c.tx_indices) |i| try map.put(cluster[i], info);
-                }
+                const infos = self.optimalChunkInfos(cluster, self.allocator) catch break :lin;
+                defer self.allocator.free(infos);
+                for (cluster, infos) |id, info| try map.put(id, info);
             }
             if (!map.contains(txid)) try map.put(txid, solo);
         }
         return map;
     }
+
+    /// The chunk of every transaction of one cluster in Core v31's
+    /// linearization: optimal (no topological prefix has a higher feerate)
+    /// with minimal chunks (no chunk splits into equal-feerate parts).
+    ///
+    /// Core reaches this with the spanning-forest linearizer
+    /// (cluster_linearize.h `Linearize`: MakeTopological, OptimizeStep until
+    /// optimal, then MinimizeStep until "optimal with minimal chunks") and
+    /// reports it through TxGraph (txgraph.cpp, `GetMainChunkFeerate`), which
+    /// rpc/mempool.cpp entryToJSON prints as `chunkweight` / `fees.chunk`.
+    /// That chunk partition is unique, so it is computed here directly:
+    /// repeatedly take the minimal highest-feerate ancestor-closed subset of
+    /// what is left. The highest feerate comes from Dinkelbach iteration over
+    /// a max-weight-closure min cut; among the subsets with that feerate, the
+    /// smallest one that contains a given root is the minimal source side of
+    /// the cut with that root forced in. Feerate is modified fee over
+    /// sigops-adjusted weight (FeePerWeight), as in Core's TxGraph.
+    ///
+    /// `cluster.len` must be at most 64 (MAX_CLUSTER_SIZE); a transiently
+    /// larger cluster returns error.ClusterTooLarge. The caller owns the
+    /// returned slice, indexed like `cluster`.
+    pub fn optimalChunkInfos(self: *Mempool, cluster: []const types.Hash256, allocator: std.mem.Allocator) ![]ChunkInfo {
+        const n = cluster.len;
+        const out = try allocator.alloc(ChunkInfo, n);
+        errdefer allocator.free(out);
+        if (n == 0) return out;
+        if (n > 64) return error.ClusterTooLarge;
+
+        var fees: [64]i64 = undefined;
+        var sizes: [64]u64 = undefined;
+        var parents = [_]u64{0} ** 64;
+        var index_of = std.AutoHashMap(types.Hash256, usize).init(allocator);
+        defer index_of.deinit();
+        for (cluster, 0..) |id, i| {
+            try index_of.put(id, i);
+            const e = self.entries.get(id) orelse return error.TxNotFound;
+            fees[i] = self.getModifiedFee(e);
+            // A zero size would make every feerate comparison degenerate.
+            sizes[i] = @max(entryClusterWeight(e), 1);
+        }
+        for (cluster, 0..) |id, i| {
+            const e = self.entries.get(id).?;
+            for (e.tx.inputs) |inp| {
+                if (index_of.get(inp.previous_output.hash)) |p| {
+                    if (p != i) parents[i] |= @as(u64, 1) << @intCast(p);
+                }
+            }
+        }
+        const solver = ChunkSolver{ .n = n, .fees = fees[0..n], .sizes = sizes[0..n], .parents = parents[0..n] };
+        const flow_buf = try allocator.alloc(i128, (n + 2) * (n + 2));
+        defer allocator.free(flow_buf);
+
+        var remaining: u64 = if (n == 64) std.math.maxInt(u64) else (@as(u64, 1) << @intCast(n)) - 1;
+        while (remaining != 0) {
+            const chunk = solver.nextChunk(remaining, flow_buf);
+            if (chunk == 0) return error.ClusterTooLarge; // unreachable: a non-empty set always has a best subset
+            const info = ChunkInfo{ .fee = solver.feeOf(chunk), .weight = solver.sizeOf(chunk) };
+            var bits = chunk;
+            while (bits != 0) {
+                const b = @ctz(bits);
+                out[b] = info;
+                bits &= bits - 1;
+            }
+            remaining &= ~chunk;
+        }
+        return out;
+    }
+
+    /// Exact max-feerate closure search over one cluster of at most 64
+    /// transactions, as bitmasks. See `optimalChunkInfos`.
+    const ChunkSolver = struct {
+        n: usize,
+        fees: []const i64,
+        sizes: []const u64,
+        /// Direct in-cluster parents of each transaction.
+        parents: []const u64,
+
+        const INF: i128 = std.math.maxInt(i128) >> 4;
+
+        fn feeOf(self: ChunkSolver, mask: u64) i64 {
+            var total: i64 = 0;
+            var bits = mask;
+            while (bits != 0) : (bits &= bits - 1) total += self.fees[@ctz(bits)];
+            return total;
+        }
+
+        fn sizeOf(self: ChunkSolver, mask: u64) u64 {
+            var total: u64 = 0;
+            var bits = mask;
+            while (bits != 0) : (bits &= bits - 1) total += self.sizes[@ctz(bits)];
+            return total;
+        }
+
+        /// The minimal highest-feerate ancestor-closed subset of `remaining`.
+        fn nextChunk(self: ChunkSolver, remaining: u64, buf: []i128) u64 {
+            // Start from the best ancestor set, then improve (Dinkelbach):
+            // with lambda = fee(S)/size(S), the max-weight closure under
+            // weight fee*size(S) - fee(S)*size is positive exactly when some
+            // closure beats S's feerate, and that closure is the next S.
+            var best: u64 = 0;
+            var bits = remaining;
+            while (bits != 0) : (bits &= bits - 1) {
+                const anc = self.ancestorsIn(@ctz(bits), remaining);
+                if (best == 0 or better(self.feeOf(anc), self.sizeOf(anc), self.feeOf(best), self.sizeOf(best))) best = anc;
+            }
+            if (best == 0) return 0;
+            var num: i128 = self.feeOf(best);
+            var den: i128 = self.sizeOf(best);
+            var guard: usize = 0;
+            while (guard < 4096) : (guard += 1) {
+                const c = self.maxClosure(remaining, num, den, null, buf);
+                if (c == 0 or self.weight(c, num, den) <= 0) break;
+                best = c;
+                num = self.feeOf(c);
+                den = self.sizeOf(c);
+            }
+            // Minimal chunk (Core MinimizeStep): every minimal subset with the
+            // optimal feerate contains a transaction with no parent left in
+            // `remaining`, and is the smallest optimal closure containing it.
+            var minimal = best;
+            var minimal_size = self.sizeOf(best);
+            bits = best;
+            while (bits != 0) : (bits &= bits - 1) {
+                const r = @ctz(bits);
+                if (self.parents[r] & remaining != 0) continue;
+                const c = self.maxClosure(remaining, num, den, r, buf);
+                if (c == 0 or self.weight(c, num, den) != 0) continue;
+                const sz = self.sizeOf(c);
+                if (sz < minimal_size) {
+                    minimal = c;
+                    minimal_size = sz;
+                }
+            }
+            return minimal;
+        }
+
+        fn ancestorsIn(self: ChunkSolver, tx: usize, remaining: u64) u64 {
+            var set: u64 = @as(u64, 1) << @intCast(tx);
+            var frontier = set;
+            while (frontier != 0) {
+                var next: u64 = 0;
+                var bits = frontier;
+                while (bits != 0) : (bits &= bits - 1) next |= self.parents[@ctz(bits)] & remaining;
+                frontier = next & ~set;
+                set |= next;
+            }
+            return set;
+        }
+
+        fn weight(self: ChunkSolver, mask: u64, num: i128, den: i128) i128 {
+            return @as(i128, self.feeOf(mask)) * den - num * @as(i128, self.sizeOf(mask));
+        }
+
+        /// True when fee_a/size_a beats fee_b/size_b, ties to the smaller size
+        /// (Core FeeFrac order, util/feefrac.h).
+        fn better(fee_a: i64, size_a: u64, fee_b: i64, size_b: u64) bool {
+            const cross_a = @as(i128, fee_a) * @as(i128, size_b);
+            const cross_b = @as(i128, fee_b) * @as(i128, size_a);
+            if (cross_a != cross_b) return cross_a > cross_b;
+            return size_a < size_b;
+        }
+
+        /// The minimal max-weight ancestor-closed subset of `remaining` under
+        /// weight fee*den - num*size, containing `force` when given: the nodes
+        /// reachable from the source in the residual graph of a min cut
+        /// (source -> positive weights, negative weights -> sink, child ->
+        /// parent unbounded so a chosen child drags its parents in).
+        fn maxClosure(self: ChunkSolver, remaining: u64, num: i128, den: i128, force: ?usize, buf: []i128) u64 {
+            const v_count = self.n + 2;
+            const src = self.n;
+            const sink = self.n + 1;
+            @memset(buf, 0);
+            var bits = remaining;
+            while (bits != 0) : (bits &= bits - 1) {
+                const v = @ctz(bits);
+                const w = @as(i128, self.fees[v]) * den - num * @as(i128, self.sizes[v]);
+                if (w > 0) buf[src * v_count + v] = w else if (w < 0) buf[v * v_count + sink] = -w;
+                var ps = self.parents[v] & remaining;
+                while (ps != 0) : (ps &= ps - 1) buf[v * v_count + @ctz(ps)] = INF;
+            }
+            if (force) |f| buf[src * v_count + f] = INF;
+
+            // Edmonds-Karp on the residual capacities held in `buf`.
+            var prev: [66]usize = undefined;
+            var queue: [66]usize = undefined;
+            while (true) {
+                var seen = [_]bool{false} ** 66;
+                seen[src] = true;
+                var head: usize = 0;
+                var tail: usize = 0;
+                queue[tail] = src;
+                tail += 1;
+                while (head < tail and !seen[sink]) {
+                    const u = queue[head];
+                    head += 1;
+                    for (0..v_count) |v| {
+                        if (seen[v] or buf[u * v_count + v] <= 0) continue;
+                        seen[v] = true;
+                        prev[v] = u;
+                        queue[tail] = v;
+                        tail += 1;
+                    }
+                }
+                if (!seen[sink]) {
+                    var mask: u64 = 0;
+                    for (0..self.n) |v| {
+                        if (seen[v]) mask |= @as(u64, 1) << @intCast(v);
+                    }
+                    return mask;
+                }
+                var amount: i128 = INF;
+                var v = sink;
+                while (v != src) : (v = prev[v]) amount = @min(amount, buf[prev[v] * v_count + v]);
+                v = sink;
+                while (v != src) : (v = prev[v]) {
+                    buf[prev[v] * v_count + v] -= amount;
+                    buf[v * v_count + prev[v]] += amount;
+                }
+            }
+        }
+    };
 
     /// Get all txids for a given cluster root.
     fn getClusterTxidsForRoot(self: *Mempool, root: u32) ![]types.Hash256 {
@@ -15951,4 +16164,297 @@ test "rbf rule 5: 101 clusters of two direct conflicts are refused" {
     defer mempool.deinit();
     const replacement = try rule5ConflictPool(arena_state.allocator(), &mempool, MAX_REPLACEMENT_EVICTIONS + 1, 2);
     try std.testing.expectError(MempoolError.TooManyEvictions, mempool.addTransaction(replacement));
+}
+
+// ----------------------------------------------------------------------------
+// Cluster chunks as Core v31 reports them (chunkweight / fees.chunk)
+// ----------------------------------------------------------------------------
+
+const ChunkTestTx = struct {
+    /// Indices of earlier transactions this one spends (one output each).
+    spends: []const usize,
+    fee: i64,
+    outputs: usize = 1,
+};
+
+const ChunkTestPool = struct {
+    txids: []types.Hash256,
+    arena: std.heap.ArenaAllocator,
+
+    fn deinit(self: *ChunkTestPool) void {
+        self.arena.deinit();
+    }
+};
+
+/// Add `specs` to `mempool` in order. Fees come from prioritiseTransaction
+/// (no chain state, so the base fee is 0). Every output of a transaction is
+/// spent at most once; the next unspent output of a parent is used.
+fn chunkTestBuild(mempool: *Mempool, specs: []const ChunkTestTx, salt: u8) !ChunkTestPool {
+    var pool = ChunkTestPool{ .txids = undefined, .arena = std.heap.ArenaAllocator.init(std.testing.allocator) };
+    errdefer pool.arena.deinit();
+    const a = pool.arena.allocator();
+    pool.txids = try a.alloc(types.Hash256, specs.len);
+    const next_out = try a.alloc(u32, specs.len);
+    @memset(next_out, 0);
+    // Value of each output of tx i: the outputs split its input value, so the
+    // base fee is the division remainder (under `outputs` sats) and the fee is
+    // essentially the prioritise delta.
+    const out_value = try a.alloc(i64, specs.len);
+    const spk = try a.dupe(u8, &([_]u8{ 0x00, 0x14 } ++ [_]u8{0xAA} ** 20));
+    for (specs, 0..) |spec, i| {
+        const n_in = if (spec.spends.len == 0) 1 else spec.spends.len;
+        var total_in: i64 = 0;
+        for (spec.spends) |p| total_in += out_value[p];
+        if (spec.spends.len == 0) total_in = 1_000_000_000;
+        out_value[i] = @divTrunc(total_in, @as(i64, @intCast(spec.outputs)));
+        const ins = try a.alloc(types.TxIn, n_in);
+        if (spec.spends.len == 0) {
+            var h: types.Hash256 = .{salt} ** 32;
+            h[0] = @intCast(i & 0xff);
+            h[1] = @intCast(i >> 8);
+            ins[0] = .{ .previous_output = .{ .hash = h, .index = 0 }, .script_sig = &[_]u8{}, .sequence = 0xFFFFFFFD, .witness = &[_][]const u8{} };
+        } else for (spec.spends, 0..) |p, k| {
+            ins[k] = .{ .previous_output = .{ .hash = pool.txids[p], .index = next_out[p] }, .script_sig = &[_]u8{}, .sequence = 0xFFFFFFFD, .witness = &[_][]const u8{} };
+            next_out[p] += 1;
+            try std.testing.expect(next_out[p] <= specs[p].outputs);
+        }
+        const outs = try a.alloc(types.TxOut, spec.outputs);
+        for (outs) |*o| o.* = .{ .value = out_value[i], .script_pubkey = spk };
+        const tx = types.Transaction{ .version = 2, .inputs = ins, .outputs = outs, .lock_time = 0 };
+        pool.txids[i] = try crypto.computeTxid(&tx, std.testing.allocator);
+        _ = try mempool.prioritiseTransaction(pool.txids[i], spec.fee);
+        try mempool.addTransaction(tx);
+    }
+    return pool;
+}
+
+/// Reference partition by exhaustive search: repeatedly the best
+/// ancestor-closed subset of what is left, by feerate and then smaller size.
+fn chunkTestBrute(fees: []const i64, sizes: []const u64, parents: []const u64, out_fee: []i64, out_size: []u64) void {
+    const n = fees.len;
+    var remaining: u64 = (@as(u64, 1) << @intCast(n)) - 1;
+    while (remaining != 0) {
+        var best: u64 = 0;
+        var bf: i64 = 0;
+        var bs: u64 = 1;
+        var mask: u64 = 1;
+        while (mask < (@as(u64, 1) << @intCast(n))) : (mask += 1) {
+            if (mask & remaining != mask) continue;
+            var closed = true;
+            var f: i64 = 0;
+            var s: u64 = 0;
+            for (0..n) |i| {
+                if ((mask >> @intCast(i)) & 1 == 0) continue;
+                if (parents[i] & remaining & ~mask != 0) closed = false;
+                f += fees[i];
+                s += sizes[i];
+            }
+            if (!closed) continue;
+            const better = if (best == 0) true else blk: {
+                const x = @as(i128, f) * bs;
+                const y = @as(i128, bf) * s;
+                break :blk if (x != y) x > y else s < bs;
+            };
+            if (better) {
+                best = mask;
+                bf = f;
+                bs = s;
+            }
+        }
+        for (0..n) |i| {
+            if ((best >> @intCast(i)) & 1 == 1) {
+                out_fee[i] = bf;
+                out_size[i] = bs;
+            }
+        }
+        remaining &= ~best;
+    }
+}
+
+// Core v31.1 regtest, harness group warden_e: a parent with 64 children,
+// child i paying (i+1)*1000 sat, then invalidateblock re-adds the parent and
+// the cluster trims child 0. Core's getmempoolentry reports one chunk of the
+// parent plus children 30..63 (chunkweight 23107, fees.chunk 0.01625); the
+// cheaper children are chunks of their own. Same shape here, 63 children.
+test "cluster chunks: a parent and its best-paying children are one chunk past 12 transactions" {
+    const allocator = std.testing.allocator;
+    var mempool = Mempool.init(null, null, allocator);
+    defer mempool.deinit();
+    const kids = 63;
+    var specs: [kids + 1]ChunkTestTx = undefined;
+    const parent_only = [_]usize{0};
+    specs[0] = .{ .spends = &.{}, .fee = 10_000, .outputs = kids };
+    for (1..kids + 1) |i| specs[i] = .{ .spends = &parent_only, .fee = @as(i64, @intCast(i + 1)) * 1000 };
+    var pool = try chunkTestBuild(&mempool, &specs, 0xC1);
+    defer pool.deinit();
+    try std.testing.expectEqual(@as(usize, kids + 1), mempool.getClusterSize(pool.txids[0]));
+
+    var map = try mempool.buildChunkInfoMap(allocator, null);
+    defer map.deinit();
+
+    // Expected: children sorted by feerate (all the same weight, so by fee)
+    // join the parent while they raise the chunk feerate.
+    const wp = mempool.entries.get(pool.txids[0]).?.cluster_weight;
+    const wc = mempool.entries.get(pool.txids[1]).?.cluster_weight;
+    var fee: i64 = 10_000;
+    var size: u64 = wp;
+    var first_in: usize = kids + 1;
+    var i: usize = kids;
+    while (i >= 1) : (i -= 1) {
+        const cf = mempool.getModifiedFee(mempool.entries.get(pool.txids[i]).?);
+        if (@as(i128, cf) * size <= @as(i128, fee) * wc) break;
+        fee += cf;
+        size += wc;
+        first_in = i;
+    }
+    try std.testing.expect(first_in > 1 and first_in < kids); // a real split, not all or nothing
+    const parent_chunk = map.get(pool.txids[0]).?;
+    try std.testing.expectEqual(size, parent_chunk.weight);
+    try std.testing.expectEqual(fee, parent_chunk.fee);
+    for (1..kids + 1) |k| {
+        const got = map.get(pool.txids[k]).?;
+        if (k >= first_in) {
+            try std.testing.expectEqual(size, got.weight);
+            try std.testing.expectEqual(fee, got.fee);
+        } else {
+            try std.testing.expectEqual(wc, got.weight);
+            try std.testing.expectEqual(mempool.getModifiedFee(mempool.entries.get(pool.txids[k]).?), got.fee);
+        }
+    }
+}
+
+// Core's linearization is "optimal with minimal chunks" (cluster_linearize.h
+// Linearize / MinimizeStep): a parent and child at exactly the same feerate are
+// two chunks, not one.
+test "cluster chunks: equal-feerate parent and child stay separate chunks" {
+    const allocator = std.testing.allocator;
+    var mempool = Mempool.init(null, null, allocator);
+    defer mempool.deinit();
+    // Weights first, then fees scaled to them.
+    var probe = Mempool.init(null, null, allocator);
+    defer probe.deinit();
+    const parent_only = [_]usize{0};
+    const shape = [_]ChunkTestTx{ .{ .spends = &.{}, .fee = 1_000 }, .{ .spends = &parent_only, .fee = 1_000 } };
+    var p0 = try chunkTestBuild(&probe, &shape, 0xC2);
+    defer p0.deinit();
+    const wp: i64 = @intCast(probe.entries.get(p0.txids[0]).?.cluster_weight);
+    const wc: i64 = @intCast(probe.entries.get(p0.txids[1]).?.cluster_weight);
+    const specs = [_]ChunkTestTx{ .{ .spends = &.{}, .fee = wp * 7 }, .{ .spends = &parent_only, .fee = wc * 7 } };
+    var pool = try chunkTestBuild(&mempool, &specs, 0xC2);
+    defer pool.deinit();
+    var map = try mempool.buildChunkInfoMap(allocator, null);
+    defer map.deinit();
+    try std.testing.expectEqual(@as(u64, @intCast(wp)), map.get(pool.txids[0]).?.weight);
+    try std.testing.expectEqual(@as(u64, @intCast(wc)), map.get(pool.txids[1]).?.weight);
+    try std.testing.expectEqual(wc * 7, map.get(pool.txids[1]).?.fee);
+}
+
+// The first optimal set the search finds can be a union of equal-feerate
+// parts: P (fee 0) with children C1, C2 and grandchild G (under C1), fees set
+// so {P, C1, C2} and {G} both pay exactly 4 sat/WU while every ancestor set
+// pays less. Core's MinimizeStep (cluster_linearize.h) splits that chunk, so
+// G is reported as a chunk of its own and P, C1, C2 as one chunk.
+test "cluster chunks: an optimal union of equal-feerate parts is reported as its minimal parts" {
+    const allocator = std.testing.allocator;
+    const parent_only = [_]usize{0};
+    const c1_only = [_]usize{1};
+    var probe = Mempool.init(null, null, allocator);
+    defer probe.deinit();
+    const shape = [_]ChunkTestTx{
+        .{ .spends = &.{}, .fee = 1_000, .outputs = 2 },
+        .{ .spends = &parent_only, .fee = 1_000 },
+        .{ .spends = &parent_only, .fee = 1_000 },
+        .{ .spends = &c1_only, .fee = 1_000 },
+    };
+    var p0 = try chunkTestBuild(&probe, &shape, 0xC3);
+    defer p0.deinit();
+    var w: [4]i64 = undefined;
+    for (0..4) |i| w[i] = @intCast(probe.entries.get(p0.txids[i]).?.cluster_weight);
+    try std.testing.expectEqual(w[1], w[2]);
+    const rate: i64 = 4;
+    const f_child = @divExact(rate * (w[0] + 2 * w[1]), 2);
+    var mempool = Mempool.init(null, null, allocator);
+    defer mempool.deinit();
+    const specs = [_]ChunkTestTx{
+        .{ .spends = &.{}, .fee = 0, .outputs = 2 },
+        .{ .spends = &parent_only, .fee = f_child },
+        .{ .spends = &parent_only, .fee = f_child },
+        .{ .spends = &c1_only, .fee = rate * w[3] },
+    };
+    var pool = try chunkTestBuild(&mempool, &specs, 0xC3);
+    defer pool.deinit();
+    var map = try mempool.buildChunkInfoMap(allocator, null);
+    defer map.deinit();
+    const top_w: u64 = @intCast(w[0] + 2 * w[1]);
+    for (0..3) |i| {
+        try std.testing.expectEqual(top_w, map.get(pool.txids[i]).?.weight);
+        try std.testing.expectEqual(2 * f_child, map.get(pool.txids[i]).?.fee);
+    }
+    try std.testing.expectEqual(@as(u64, @intCast(w[3])), map.get(pool.txids[3]).?.weight);
+    try std.testing.expectEqual(rate * w[3], map.get(pool.txids[3]).?.fee);
+}
+
+// Random connected clusters of up to 10 transactions with up to two parents
+// each: the chunk of every transaction equals the exhaustive reference.
+test "cluster chunks: random small clusters match an exhaustive search" {
+    const allocator = std.testing.allocator;
+    var prng = std.Random.DefaultPrng.init(0x5eed_c1a5);
+    const rnd = prng.random();
+    var round: usize = 0;
+    while (round < 60) : (round += 1) {
+        var mempool = Mempool.init(null, null, allocator);
+        defer mempool.deinit();
+        const n = rnd.intRangeAtMost(usize, 2, 10);
+        var specs: [10]ChunkTestTx = undefined;
+        var spend_buf: [10][2]usize = undefined;
+        for (0..n) |i| {
+            // A few fees repeat so equal-feerate ties occur.
+            const fee: i64 = if (rnd.boolean()) @as(i64, rnd.intRangeAtMost(u8, 1, 4)) * 5_000 else rnd.intRangeAtMost(i64, 1_000, 60_000);
+            if (i == 0) {
+                specs[i] = .{ .spends = &.{}, .fee = fee, .outputs = 4 };
+                continue;
+            }
+            spend_buf[i][0] = rnd.uintLessThan(usize, i);
+            var cnt: usize = 1;
+            if (i > 1 and rnd.boolean()) {
+                const second = rnd.uintLessThan(usize, i);
+                if (second != spend_buf[i][0]) {
+                    spend_buf[i][1] = second;
+                    cnt = 2;
+                }
+            }
+            specs[i] = .{ .spends = spend_buf[i][0..cnt], .fee = fee, .outputs = 4 };
+        }
+        // Keep every output spent at most once (4 outputs each).
+        var used = [_]usize{0} ** 10;
+        var ok = true;
+        for (1..n) |i| for (specs[i].spends) |p| {
+            used[p] += 1;
+            if (used[p] > 4) ok = false;
+        };
+        if (!ok) continue;
+        var pool = try chunkTestBuild(&mempool, specs[0..n], @intCast(round));
+        defer pool.deinit();
+        try std.testing.expectEqual(n, mempool.getClusterSize(pool.txids[0]));
+
+        var fees: [10]i64 = undefined;
+        var sizes: [10]u64 = undefined;
+        var parents = [_]u64{0} ** 10;
+        for (0..n) |i| {
+            const e = mempool.entries.get(pool.txids[i]).?;
+            fees[i] = mempool.getModifiedFee(e);
+            sizes[i] = e.cluster_weight;
+            for (specs[i].spends) |p| parents[i] |= @as(u64, 1) << @intCast(p);
+        }
+        var want_fee: [10]i64 = undefined;
+        var want_size: [10]u64 = undefined;
+        chunkTestBrute(fees[0..n], sizes[0..n], parents[0..n], want_fee[0..n], want_size[0..n]);
+        var map = try mempool.buildChunkInfoMap(allocator, null);
+        defer map.deinit();
+        for (0..n) |i| {
+            const got = map.get(pool.txids[i]).?;
+            try std.testing.expectEqual(want_size[i], got.weight);
+            try std.testing.expectEqual(want_fee[i], got.fee);
+        }
+    }
 }
