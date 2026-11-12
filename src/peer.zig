@@ -110,6 +110,39 @@ pub const MAX_HEADER_INDEX: usize = 10_000;
 /// header sync froze (live 60000→91705 after the HOL fix, tip=82656=2016*41).
 pub const HEADER_PREFETCH_CAP: usize = MAX_HEADER_INDEX - consensus.DIFFICULTY_ADJUSTMENT_INTERVAL;
 
+/// Hard cap on queued-but-unconnected headers (expected_blocks past
+/// connect_cursor).  HEADER_PREFETCH_CAP only stops US from asking for more;
+/// it never stopped a peer from SENDING more, so unsolicited batches of
+/// headers with real (regtest- or difficulty-1-cheap) proof of work grew
+/// expected_blocks and the persisted header DB without bound (security audit
+/// 2026-10-29, finding C2).  Honest sync stays below this: we ask only while
+/// the queue is under HEADER_PREFETCH_CAP, and one reply adds at most
+/// MAX_HEADERS_RESULTS.  Headers past the cap are dropped without penalty;
+/// the drain re-asks (getheaders) once the queue runs low, so nothing is lost.
+pub const MAX_UNCONNECTED_HEADERS: usize = HEADER_PREFETCH_CAP + MAX_HEADERS_RESULTS;
+
+/// How long an armed pending reorg may go without a fork body arriving
+/// before it is given up.  Core has no indefinite "pending" reorg state: a
+/// block requested from a peer that does not deliver is re-requested elsewhere
+/// after the block-download timeout (net_processing.cpp
+/// BLOCK_DOWNLOAD_TIMEOUT_BASE = one block interval).  Pre-fix, a peer that
+/// announced a higher-work fork and never sent the bodies held
+/// `pending_reorg` forever, and every later honest fork was refused as
+/// `already_pending`.  Measured from the arm or from the last fork body
+/// received, so a slow but progressing reorg is not dropped.
+pub const PENDING_REORG_TIMEOUT_SECS: i64 = 600;
+
+/// Seconds of total lifetime allowed per fork block on top of
+/// PENDING_REORG_TIMEOUT_SECS, whatever the progress.
+pub const PENDING_REORG_SECS_PER_BLOCK: i64 = 60;
+
+/// Hard ceiling on how long a pending reorg of `fork_len` blocks may stay
+/// armed, even while bodies trickle in one at a time.
+pub fn pendingReorgLifetimeSecs(fork_len: usize) i64 {
+    const n: i64 = @intCast(@min(fork_len, 1_000_000));
+    return PENDING_REORG_TIMEOUT_SECS + n * PENDING_REORG_SECS_PER_BLOCK;
+}
+
 /// In-memory record of a single block header that we've SEEN but may or
 /// may not have a body for.  Populated by the `.headers` handler so we
 /// can detect competing-fork announcements (Case B).  Each entry knows
@@ -215,6 +248,13 @@ pub const PendingReorg = struct {
     /// pointer if the peer disconnects mid-reorg; use only for ID +
     /// the misbehaving call inside the same drain pass.
     source_peer: ?*Peer,
+    /// Unix time of the arm (0 = unknown, treated as stale).
+    armed_at: i64 = 0,
+    /// Unix time of the arm or of the last NEW fork body buffered.
+    /// `expireStalePendingReorg` gives up the reorg when this is older than
+    /// PENDING_REORG_TIMEOUT_SECS, or when `armed_at` is older than
+    /// pendingReorgLifetimeSecs (so dribbling bodies cannot hold it forever).
+    last_progress_at: i64 = 0,
 
     pub fn deinit(self: *PendingReorg) void {
         self.fork_hashes.deinit();
@@ -3612,6 +3652,14 @@ pub const PeerManager = struct {
     /// active chain at fire time (fork point advanced past them, never
     /// re-connected).
     reorg_active_prefix_trims: u64 = 0,
+    /// Pending reorgs given up after PENDING_REORG_TIMEOUT_SECS without a
+    /// fork body (see expireStalePendingReorg).
+    pending_reorgs_expired: u64 = 0,
+    /// Cap on queued-but-unconnected headers (MAX_UNCONNECTED_HEADERS; a
+    /// field so tests can exercise the cap with a few real blocks).
+    max_unconnected_headers: usize = MAX_UNCONNECTED_HEADERS,
+    /// Header batches (or tails of batches) dropped at that cap.
+    unconnected_header_cap_drops: u64 = 0,
     /// How many REORG-CANDIDATE lines were actually printed.
     reorg_candidate_logs_emitted: u64 = 0,
     /// How many times the competing_fork arm called sendGetHeaders for more.
@@ -7198,6 +7246,35 @@ pub const PeerManager = struct {
         }
     }
 
+    /// Give up the pending reorg when no new fork body has arrived for
+    /// PENDING_REORG_TIMEOUT_SECS, or it has been armed longer than
+    /// pendingReorgLifetimeSecs.  Drops the fork's buffered bodies (they
+    /// are re-fetched if a later announcement re-arms the same fork) and
+    /// punishes nobody: a slow peer is not proof of a bad one.  The fork's
+    /// headers stay in header_index, so a re-announced or extended fork is
+    /// evaluated again on its work.  Returns true when it expired one.
+    pub fn expireStalePendingReorg(self: *PeerManager, now: i64) bool {
+        const pr_ptr = if (self.pending_reorg) |*p| p else return false;
+        const stalled = now - pr_ptr.last_progress_at >= PENDING_REORG_TIMEOUT_SECS;
+        const too_old = now - pr_ptr.armed_at >= pendingReorgLifetimeSecs(pr_ptr.fork_hashes.items.len);
+        if (!stalled and !too_old) return false;
+        std.log.info(
+            "[REORG] pending fork ({d} block(s)) armed {d}s ago, no new body for {d}s — given up, later forks may arm",
+            .{ pr_ptr.fork_hashes.items.len, now - pr_ptr.armed_at, now - pr_ptr.last_progress_at },
+        );
+        for (pr_ptr.fork_hashes.items) |fh| {
+            if (self.block_buffer.fetchRemove(fh)) |kv| {
+                var b = kv.value;
+                serialize.freeBlock(self.allocator, &b);
+            }
+            _ = self.block_source_peers.remove(fh);
+        }
+        pr_ptr.deinit();
+        self.pending_reorg = null;
+        self.pending_reorgs_expired += 1;
+        return true;
+    }
+
     /// Once a header batch has been ingested AND the first header was
     /// classified as competing_fork, walk through the new headers and
     /// figure out:
@@ -7218,6 +7295,9 @@ pub const PeerManager = struct {
         peer: *Peer,
         fork_tip_hash: *const types.Hash256,
     ) void {
+        // A pending reorg whose bodies stopped arriving does not get to block
+        // every later fork (security audit 2026-10-29, finding C2).
+        _ = self.expireStalePendingReorg(std.time.timestamp());
         if (self.pending_reorg != null) {
             // Already arming a reorg — defer this fork until the next round.
             self.last_arm_result = .already_pending;
@@ -7563,6 +7643,8 @@ pub const PeerManager = struct {
             .fork_hashes = owned,
             .new_tip_chain_work = tip_entry.chain_work,
             .source_peer = peer,
+            .armed_at = std.time.timestamp(),
+            .last_progress_at = std.time.timestamp(),
         };
 
         // Request the bodies from the peer that announced the fork.
@@ -8582,14 +8664,35 @@ pub const PeerManager = struct {
                 // the first and header sync would stall.  CLEARBIT_REORG
                 // defaults to ON (isReorgEnabled), so this only changes the
                 // explicitly-disabled configuration.
-                for (admitted) |header| {
+                //
+                // Bounded by max_unconnected_headers (MAX_UNCONNECTED_HEADERS):
+                // headers past the cap are neither queued nor written to the
+                // header DB.  No penalty — the batch is valid, we just will
+                // not hold more of it than we can download; the drain asks
+                // for headers again once the queue runs low.
+                const queued_now = self.expected_blocks.items.len -| self.connect_cursor;
+                const room = self.max_unconnected_headers -| queued_now;
+                if (room == 0) {
+                    self.unconnected_header_cap_drops += 1;
+                    std.debug.print(
+                        "P2P: header queue full ({d} unconnected) — dropped {d} headers from peer={any}, no penalty\n",
+                        .{ queued_now, admitted.len, peer.address },
+                    );
+                    self.pipelineBlockRequests() catch {};
+                    return;
+                }
+                const to_queue: []const types.BlockHeader = if (admitted.len > room) blk_cap: {
+                    self.unconnected_header_cap_drops += 1;
+                    break :blk_cap admitted[0..room];
+                } else admitted;
+                for (to_queue) |header| {
                     const block_hash = crypto.computeBlockHash(&header);
                     self.expected_blocks.append(block_hash) catch continue;
                     _ = self.insertHeader(&header, &block_hash) catch null;
                 }
                 // Before the pipeline call below: the announcer is the peer
                 // known to hold these blocks.
-                self.noteBlockAvailability(peer, &crypto.computeBlockHash(&admitted[admitted.len - 1]));
+                self.noteBlockAvailability(peer, &crypto.computeBlockHash(&to_queue[to_queue.len - 1]));
 
                 // Request more headers from this specific peer if we got a full batch
                 // But limit the queue to avoid too many outstanding blocks
@@ -8606,6 +8709,12 @@ pub const PeerManager = struct {
                 const in_window = self.isConnectWindowHash(&block_hash);
                 const was_requested = self.inflight_block_peer.contains(block_hash);
                 const reorg_body = self.isPendingReorgHash(&block_hash);
+                // A NEW fork body is progress: restart the pending reorg's
+                // stall timer (PENDING_REORG_TIMEOUT_SECS).  A re-sent body
+                // is not progress.
+                if (reorg_body and !self.block_buffer.contains(block_hash)) {
+                    if (self.pending_reorg) |*pr| pr.last_progress_at = std.time.timestamp();
+                }
                 if (in_window) self.noteBlockAvailability(peer, &block_hash);
 
                 var historical_body = false;
