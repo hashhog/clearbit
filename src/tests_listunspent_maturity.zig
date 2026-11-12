@@ -71,3 +71,43 @@ test "tests_listunspent_maturity: CONTROL 101-conf coinbase is listed" {
 test "tests_listunspent_maturity: CONTROL 99-conf coinbase is not listed" {
     try testing.expectEqual(@as(usize, 0), try countListUnspent(testing.allocator, 101, &.{3}));
 }
+
+// listtransactions / gettransaction category at the same boundary
+// (wallet-cause-E). Core ListTransactions: IsTxImmatureCoinBase ? "immature" :
+// "generate", with immature <=> depth <= COINBASE_MATURITY. A coinbase with
+// exactly 100 confirmations is "immature"; 101 is the first "generate".
+fn categoryAtDepth(depth: u32) []const u8 {
+    const rec = wallet_mod.WalletTxRecord{
+        .txid = [_]u8{0} ** 32,
+        .is_coinbase = true,
+        .is_from_me = false,
+        .height = 1,
+        .block_hash = [_]u8{0} ** 32,
+        .block_time = 0,
+        .net_credit = 5_000_000_000,
+        .debit = 0,
+        .fee = 0,
+        .raw_hex = "",
+        .details = std.ArrayList(wallet_mod.WalletTxDetail).init(testing.allocator),
+    };
+    const detail = wallet_mod.WalletTxDetail{
+        .address = null,
+        .category = .receive,
+        .amount = 5_000_000_000,
+        .vout = 0,
+    };
+    return rpc.resolveCategory(&rec, &detail, depth);
+}
+
+test "tests_listunspent_maturity: listtransactions category, coinbase at 100 confs is immature" {
+    try testing.expectEqualStrings("immature", categoryAtDepth(100));
+}
+
+test "tests_listunspent_maturity: listtransactions category, coinbase at 101 confs is generate" {
+    try testing.expectEqualStrings("generate", categoryAtDepth(101));
+}
+
+test "tests_listunspent_maturity: listtransactions category CONTROL 99 confs immature, 0 confs orphan" {
+    try testing.expectEqualStrings("immature", categoryAtDepth(99));
+    try testing.expectEqualStrings("orphan", categoryAtDepth(0));
+}

@@ -25166,9 +25166,9 @@ fn writeJsonEscaped(writer: anytype, s: []const u8) !void {
 /// send details.
 /// Resolve the *displayed* category for a detail at the current depth. Only
 /// coinbase credits are depth-dependent (Core: orphan if <1 conf, immature if
-/// below COINBASE_MATURITY, else generate). Sends and ordinary receives carry
+/// at or below COINBASE_MATURITY, else generate). Sends and ordinary receives carry
 /// their stored category verbatim.
-fn resolveCategory(
+pub fn resolveCategory(
     rec: *const wallet_mod.WalletTxRecord,
     detail: *const wallet_mod.WalletTxDetail,
     confirmations: u32,
@@ -25176,7 +25176,7 @@ fn resolveCategory(
     if (detail.category == .send) return "send";
     if (rec.is_coinbase) {
         if (confirmations < 1) return "orphan";
-        if (confirmations < consensus.COINBASE_MATURITY) return "immature";
+        if (confirmations <= consensus.COINBASE_MATURITY) return "immature";
         return "generate";
     }
     return "receive";
