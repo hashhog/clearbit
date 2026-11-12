@@ -77,8 +77,19 @@ test "tests_listunspent_maturity: CONTROL 99-conf coinbase is not listed" {
 // "generate", with immature <=> depth <= COINBASE_MATURITY. A coinbase with
 // exactly 100 confirmations is "immature"; 101 is the first "generate".
 fn categoryAtDepth(depth: u32) []const u8 {
-    var rec = std.mem.zeroes(wallet_mod.WalletTxRecord);
-    rec.is_coinbase = true;
+    const rec = wallet_mod.WalletTxRecord{
+        .txid = [_]u8{0} ** 32,
+        .is_coinbase = true,
+        .is_from_me = false,
+        .height = 1,
+        .block_hash = [_]u8{0} ** 32,
+        .block_time = 0,
+        .net_credit = 5_000_000_000,
+        .debit = 0,
+        .fee = 0,
+        .raw_hex = "",
+        .details = std.ArrayList(wallet_mod.WalletTxDetail).init(testing.allocator),
+    };
     const detail = wallet_mod.WalletTxDetail{
         .address = null,
         .category = .receive,
