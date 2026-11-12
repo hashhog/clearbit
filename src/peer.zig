@@ -646,6 +646,17 @@ pub const OUTBOUND_DIAL_MIN_GAP_MS: i64 = 500;
 /// Most outbound auto-dials in flight at once (worker threads).
 pub const MAX_CONCURRENT_OUTBOUND_DIALS: u32 = 4;
 
+/// Most messages one processAllMessages pass takes from a single peer.  Core
+/// ThreadMessageHandler handles ONE message per peer per round and loops
+/// again at once while any peer has more (fMoreWork).  This loop pass also
+/// runs the block drain, request pipeline and timers, so it takes a few
+/// messages per round rather than one; the old bound was 256, which let one
+/// peer's backlog hold up every other peer, inbound accept and dial adoption.
+pub const MAX_MSGS_PER_PEER_PER_PASS: u32 = 16;
+/// Wall-clock budget for one peer within one pass.  At least one message is
+/// always handled, so a single slow message (a big block) still completes.
+pub const PEER_SLICE_MS: i64 = 50;
+
 /// Outcome of one outbound dial worker.  `peer` is null on failure.
 const DialResult = struct {
     addr: std.net.Address,
@@ -1107,6 +1118,10 @@ pub const Peer = struct {
     /// to IGNORE such a message the way Core does before verack, instead of
     /// failing the whole handshake. Cleared on every receive.
     last_recv_undecodable: bool = false,
+    /// processAllMessages stopped reading this peer at its per-pass bound
+    /// (Core fMoreWork): the next pass reads it again without waiting in
+    /// poll, even if all its bytes are already in user-space buffers (v2).
+    recv_more_work: bool = false,
 
     /// BIP-324 v2 transport protocol version.
     transport_version: TransportVersion = .v1,
@@ -5762,6 +5777,17 @@ pub const PeerManager = struct {
         // establishment is suppressed.
         if (!self.network_active) return;
 
+        // Count inbound connections (established + handshaking).
+        var inbound_count: usize = self.inbound_hs_workers.load(.acquire);
+        for (self.peers.items) |peer| {
+            if (peer.direction == .inbound) inbound_count += 1;
+        }
+        // Inside a processAllMessages pass (accept on every wake-up) the
+        // eviction below must not run: it removes a peer the pass may still
+        // hold (W141).  Leave the connection in the backlog; the run() loop's
+        // own acceptInbound call, outside the pass, evicts and accepts it.
+        if (self.in_pam and inbound_count >= MAX_INBOUND_CONNECTIONS) return;
+
         // Poll with 0 timeout to check if a connection is pending (non-blocking)
         var pollfds = [_]std.posix.pollfd{.{
             .fd = self.listener.?.stream.handle,
@@ -5783,12 +5809,6 @@ pub const PeerManager = struct {
         if (self.ban_list.isAddressBanned(conn.address)) {
             conn.stream.close();
             return;
-        }
-
-        // Count inbound connections (established + handshaking).
-        var inbound_count: usize = self.inbound_hs_workers.load(.acquire);
-        for (self.peers.items) |peer| {
-            if (peer.direction == .inbound) inbound_count += 1;
         }
 
         // If inbound slots are full, try to evict a peer
@@ -5968,9 +5988,40 @@ pub const PeerManager = struct {
         }
     }
 
+    /// Connection establishment that must not wait for a whole message pass
+    /// (Core: SocketHandler accepts on every wake-up, ThreadOpenConnections
+    /// runs on its own thread).  Called from inside processAllMessages after
+    /// the poll and after each peer that had work: adopt finished inbound
+    /// handshakes and outbound dials, start the next dial when one finished,
+    /// and accept one pending inbound connection.  Only appends to `peers`
+    /// (acceptInbound does not evict while in_pam), so the pass's indices
+    /// stay valid.
+    fn serviceConnectionsInPass(self: *PeerManager) void {
+        if (self.stopping()) return;
+        self.adoptInboundHandshakes();
+        const dial_finished = blk: {
+            self.dial_mutex.lock();
+            defer self.dial_mutex.unlock();
+            break :blk self.dial_done.items.len > 0;
+        };
+        if (dial_finished) {
+            // Same gate as run(): no auto-dials in --connect mode or while
+            // networking is disabled; finished dials are still adopted.
+            if (self.network_active and self.connect_address == null) {
+                self.maintainOutbound() catch {};
+            } else {
+                self.adoptOutboundDials();
+            }
+        }
+        if (self.network_active) self.acceptInbound() catch {};
+    }
+
     /// Process messages from all connected peers using multiplexed I/O.
-    /// Uses poll() to wait for data on ALL peer sockets simultaneously,
-    /// then drains ALL available messages from each ready socket.
+    /// Uses poll() to wait for data on ALL peer sockets (and the listener)
+    /// simultaneously, then reads a bounded slice from each ready peer:
+    /// at most MAX_MSGS_PER_PEER_PER_PASS messages or PEER_SLICE_MS.  A peer
+    /// cut off at the bound is marked recv_more_work and read again on the
+    /// next pass without a poll wait (Core ThreadMessageHandler fMoreWork).
     pub fn processAllMessages(self: *PeerManager) !void {
         // Re-entrancy guard (W141): if an outer processAllMessages pass is
         // already iterating self.peers.items, do NOT re-enter.  A nested pass
@@ -6028,9 +6079,11 @@ pub const PeerManager = struct {
 
         if (self.peers.items.len == 0) return;
 
-        // Build pollfd array for all connected peers
-        var pollfds: [MAX_TOTAL_CONNECTIONS]std.posix.pollfd = undefined;
+        // Build pollfd array for all connected peers, plus the listener so
+        // an inbound connection wakes the poll (Core SocketHandlerListening).
+        var pollfds: [MAX_TOTAL_CONNECTIONS + 1]std.posix.pollfd = undefined;
         const num_peers = @min(self.peers.items.len, MAX_TOTAL_CONNECTIONS);
+        var more_work = false;
         for (0..num_peers) |idx| {
             const pp = self.peers.items[idx];
             // Core fPauseSend: a peer over the send limit is not read from
@@ -6043,17 +6096,37 @@ pub const PeerManager = struct {
                 .events = ev,
                 .revents = 0,
             };
+            if (pp.recv_more_work and !pp.sendPaused()) more_work = true;
+        }
+        var num_fds = num_peers;
+        if (self.listener) |l| {
+            // Not while inbound slots are full: the in-pass accept leaves
+            // that connection for run() (no eviction mid-pass), so polling
+            // the listener would only wake every pass at once until then.
+            var inbound_count: usize = self.inbound_hs_workers.load(.acquire);
+            for (self.peers.items) |pp| {
+                if (pp.direction == .inbound) inbound_count += 1;
+            }
+            if (self.network_active and inbound_count < MAX_INBOUND_CONNECTIONS) {
+                pollfds[num_fds] = .{ .fd = l.stream.handle, .events = std.posix.POLL.IN, .revents = 0 };
+                num_fds += 1;
+            }
         }
 
-        // Poll all sockets at once. During IBD use 10ms timeout, otherwise 100ms.
-        const timeout_ms: i32 = if (self.isIBD()) 10 else 100;
+        // Poll all sockets at once. During IBD use 10ms timeout, otherwise
+        // 100ms; no wait at all while a peer still has work from last pass.
+        const timeout_ms: i32 = if (more_work) 0 else if (self.isIBD()) 10 else 100;
         const ready = blk: {
             const w = self.ioWindow();
             defer w.end();
-            break :blk std.posix.poll(pollfds[0..num_peers], timeout_ms) catch 0;
+            break :blk std.posix.poll(pollfds[0..num_fds], timeout_ms) catch 0;
         };
 
-        if (ready == 0) {
+        // A wake-up services accepts and finished dials before any peer.
+        self.serviceConnectionsInPass();
+        if (self.stopping()) return;
+
+        if (ready == 0 and !more_work) {
             // No data on any socket - send getheaders to ONE peer if needed
             // Throttle: only send if last attempt was >5s ago (avoid spam)
             const now_ts = std.time.timestamp();
@@ -6093,9 +6166,11 @@ pub const PeerManager = struct {
 
             const peer_obj = self.peers.items[i];
 
-            // Check if this socket has data (or an error/hangup)
+            // Check if this socket has data (or an error/hangup), or was cut
+            // off at the per-pass bound last time with data still buffered.
             const revents = pollfds[i].revents;
-            const has_data = (revents & std.posix.POLL.IN) != 0;
+            const has_data = (revents & std.posix.POLL.IN) != 0 or
+                (peer_obj.recv_more_work and !peer_obj.sendPaused());
             const has_error = (revents & (std.posix.POLL.ERR | std.posix.POLL.HUP | std.posix.POLL.NVAL)) != 0;
 
             if (has_error and !has_data) {
@@ -6109,13 +6184,23 @@ pub const PeerManager = struct {
                 continue;
             }
 
-            // Socket has data - set a very short timeout for reading and drain ALL messages
+            // Socket has data - set a very short timeout for reading and
+            // read a bounded slice: MAX_MSGS_PER_PEER_PER_PASS messages or
+            // PEER_SLICE_MS, whichever comes first (always at least one).
             peer_obj.setRecvTimeout(0, 1_000); // 1ms timeout for drain loop
+            peer_obj.recv_more_work = false;
 
             var msgs_read: u32 = 0;
-            const max_msgs_per_peer: u32 = 256; // Safety limit per cycle
+            const slice_end_ms = std.time.milliTimestamp() + PEER_SLICE_MS;
+            var cut_off = false;
 
-            while (msgs_read < max_msgs_per_peer) {
+            while (true) {
+                if (msgs_read >= MAX_MSGS_PER_PEER_PER_PASS or
+                    (msgs_read > 0 and std.time.milliTimestamp() >= slice_end_ms))
+                {
+                    cut_off = true;
+                    break;
+                }
                 if (self.stopping()) break;
                 // Core fPauseSend: stop processing this peer's messages once
                 // its replies are backed up; resume when it reads them.
@@ -6189,6 +6274,13 @@ pub const PeerManager = struct {
             // Restore long timeout for handshake use
             if (i < self.peers.items.len and self.peers.items[i] == peer_obj) {
                 peer_obj.setRecvTimeout(30, 0);
+                peer_obj.recv_more_work = cut_off;
+            }
+
+            // Accept and adopt between peers, not once per full pass.
+            if (msgs_read > 0) {
+                self.serviceConnectionsInPass();
+                if (self.stopping()) return;
             }
         }
     }
