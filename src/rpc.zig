@@ -9512,8 +9512,6 @@ pub const RpcServer = struct {
         defer buf.deinit();
         const writer = buf.writer();
 
-        const balance = wallet.getBalance();
-        const immature = wallet.getImmatureBalance();
         const name = self.walletNameOf(wallet);
         // Core keeps emitting the latest legacy min-version even on
         // descriptor wallets (wallet.cpp:85-89).
@@ -9525,12 +9523,6 @@ pub const RpcServer = struct {
         try writer.writeByte('"');
         try writer.print(",\"walletversion\":{d}", .{walletversion});
         try writer.writeAll(",\"format\":\"sqlite\"");
-        try writer.print(",\"balance\":{d}.{d:0>8},\"unconfirmed_balance\":0.0,\"immature_balance\":{d}.{d:0>8}", .{
-            @divTrunc(balance, 100_000_000),
-            @abs(@rem(balance, 100_000_000)),
-            @divTrunc(immature, 100_000_000),
-            @abs(@rem(immature, 100_000_000)),
-        });
         try writer.print(",\"txcount\":{d}", .{wallet.tx_history.items.len});
         try writer.print(",\"keypoolsize\":{d}", .{wallet.keys.items.len});
         try writer.print(",\"private_keys_enabled\":{s}", .{
