@@ -2517,6 +2517,14 @@ pub const Peer = struct {
         return (self.services & p2p.NODE_WITNESS) != 0;
     }
 
+    /// May be asked for historical (assumeutxo-hole) bodies: a witness peer
+    /// that also advertises NODE_NETWORK. A NODE_NETWORK_LIMITED-only peer
+    /// keeps ~288 blocks and Core disconnects anyone asking deeper
+    /// (net_processing.cpp:2384-2390).
+    pub fn canServeHistoricalBodies(self: *const Peer) bool {
+        return historical_backfill_mod.servicesServeHistory(self.services);
+    }
+
     /// Read until the peer's VERSION arrives, then apply Core's only
     /// version-based gate. Core ignores any message that precedes VERSION
     /// ("non-version message before version handshake", no disconnect).
@@ -6071,9 +6079,10 @@ pub const PeerManager = struct {
                     }
                 }
                 if (self.historical_backfill != null and now_ts - self.last_historical_drive_ts > 5) {
-                    // Drive from a peer that can serve witness blocks, not
-                    // merely the first handshake-complete one.
-                    if (peer_obj.state == .handshake_complete and peer_obj.canServeWitnesses()) {
+                    // Drive from a peer that can serve historical witness
+                    // blocks (NODE_NETWORK + NODE_WITNESS), not merely the
+                    // first handshake-complete one.
+                    if (peer_obj.state == .handshake_complete and peer_obj.canServeHistoricalBodies()) {
                         self.driveHistoricalBackfill(peer_obj);
                         self.finishHistoricalBackfillIfDone();
                         break;
@@ -6354,11 +6363,17 @@ pub const PeerManager = struct {
             } };
             target_peer.sendMessage(&msg) catch {};
         }
-        // Bodies only from a peer that can serve witnesses (Core
-        // CanServeWitnesses) — headers above are fine from anyone.
-        if (!target_peer.canServeWitnesses()) return;
+        // Bodies only from a full-archive witness peer (Core
+        // CanServeWitnesses + the NODE_NETWORK_LIMITED depth rule) — headers
+        // above are fine from anyone.
+        if (!target_peer.canServeHistoricalBodies()) return;
+        const now = std.time.timestamp();
+        // Re-route bodies a peer did not deliver in time.
+        _ = bf.expireStale(now, historical_backfill_mod.HISTORICAL_BODY_TIMEOUT_S);
+        // Top this peer up to MAX_HISTORICAL_IN_FLIGHT_PER_PEER outstanding,
+        // never past it: the `.block` handler re-drives after every body.
         var reqs: [historical_backfill_mod.BACKFILL_BODIES_PER_REQUEST]historical_backfill_mod.BodyRequest = undefined;
-        const n = bf.nextBodyHashes(cs, &reqs);
+        const n = bf.nextBodyHashesFor(cs, @intFromPtr(target_peer), now, &reqs);
         if (n > 0) {
             var inv: [historical_backfill_mod.BACKFILL_BODIES_PER_REQUEST]p2p.InvVector = undefined;
             var i: usize = 0;
@@ -6375,6 +6390,12 @@ pub const PeerManager = struct {
                 .{bf.targetFloor() -| 1},
             );
         }
+    }
+
+    /// Release every historical body `peer` still owes us. Called before the
+    /// peer is destroyed, so its pointer key cannot alias a later peer.
+    fn releaseHistoricalFor(self: *PeerManager, peer: *const Peer) void {
+        if (self.historical_backfill) |*bf| _ = bf.releasePeer(@intFromPtr(peer));
     }
 
     fn finishHistoricalBackfillIfDone(self: *PeerManager) void {
@@ -10727,6 +10748,9 @@ pub const PeerManager = struct {
         self.lockChain();
         defer self.unlockChain();
         const peer = self.peers.swapRemove(index);
+        // Historical bodies this peer owed us go back to the pool so another
+        // peer is asked (they used to stay "in flight" for the whole run).
+        self.releaseHistoricalFor(peer);
         // pending_reorg.source_peer must never outlive the peer it names.
         if (self.pending_reorg) |*pr| {
             if (pr.source_peer == peer) pr.source_peer = null;
@@ -13436,6 +13460,7 @@ pub const PeerManager = struct {
         defer self.unlockChain();
         for (self.peers.items, 0..) |p, i| {
             if (p == peer) {
+                self.releaseHistoricalFor(peer);
                 peer.disconnect();
                 _ = self.peers.swapRemove(i);
                 self.allocator.destroy(peer);
