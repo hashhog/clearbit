@@ -47,6 +47,35 @@ const storage = @import("storage.zig");
 /// per-peer in-flight cap so historical download cannot starve tip sync.
 pub const BACKFILL_BODIES_PER_REQUEST: usize = 16;
 
+/// Historical bodies one peer may owe us at once. Core
+/// `MAX_BLOCKS_IN_TRANSIT_PER_PEER` (net_processing.cpp). Every request path
+/// (new peer, idle tick, and the `.block` re-drive after each delivered body)
+/// only tops a peer up to this number, so a peer is never sent more than 16
+/// outstanding historical getdata, however many bodies it delivers.
+pub const MAX_HISTORICAL_IN_FLIGHT_PER_PEER: usize = 16;
+
+/// A historical body not delivered within this many seconds is released so
+/// another peer can be asked for it. Core disconnects a peer whose block
+/// download times out (BLOCK_DOWNLOAD_TIMEOUT_BASE); here the request is
+/// only re-routed, because the forward path already polices peers.
+pub const HISTORICAL_BODY_TIMEOUT_S: i64 = 120;
+
+/// Test hook: the number of cumulative-tx-count reads made by
+/// `persistTxCounts`. Lets a test prove each accepted body costs O(1) reads
+/// instead of a walk from height 1 (11-11: ~179k RocksDB gets per body with
+/// the cursor stuck at a hole).
+pub var tx_count_reads: usize = 0;
+
+/// Core `CanServeWitnesses` plus the NODE_NETWORK half of
+/// net_processing.cpp:2384-2390: a NODE_NETWORK_LIMITED peer only keeps the
+/// last 288 blocks and disconnects a peer that asks for anything deeper, so
+/// historical bodies go only to full-archive witness peers.
+pub fn servicesServeHistory(services: u64) bool {
+    const NODE_NETWORK: u64 = 1;
+    const NODE_WITNESS: u64 = 1 << 3;
+    return (services & NODE_NETWORK) != 0 and (services & NODE_WITNESS) != 0;
+}
+
 pub const BackfillError = error{
     /// Batch does not connect to the genesis-side tip and is not an overlapping
     /// re-send of already-stored historical headers.
@@ -76,6 +105,14 @@ pub const BodyRequest = struct {
     hash: types.Hash256,
 };
 
+/// Who owes us an in-flight historical body, and since when.
+pub const InFlight = struct {
+    /// Opaque peer key (`@intFromPtr(peer)` in the P2P layer).
+    peer: usize,
+    /// Unix seconds when the getdata was queued.
+    requested_at: i64,
+};
+
 /// Background backfill of the assumeutxo height-index hole.
 pub const HistoricalBackfill = struct {
     allocator: std.mem.Allocator,
@@ -91,8 +128,15 @@ pub const HistoricalBackfill = struct {
     floor_hash: types.Hash256,
     /// First height in `1..floor-1` whose body is still missing.
     next_body_height: u32,
-    /// Hashes we have asked a peer for and not yet received.
-    in_flight: std.AutoHashMap(types.Hash256, void),
+    /// Hashes we have asked a peer for and not yet received, keyed to the
+    /// peer that owes them so they can be released when it leaves.
+    in_flight: std.AutoHashMap(types.Hash256, InFlight),
+    /// Highest height in `1..floor-1` up to which cumulative tx counts are
+    /// known to be written (contiguous from genesis), and that count. `null`
+    /// until the first `persistTxCounts` scan after boot. Keeps each body at
+    /// O(newly countable heights) instead of a walk from height 1.
+    tx_counted_height: ?u32 = null,
+    tx_counted_total: u64 = 1,
 
     pub fn deinit(self: *HistoricalBackfill) void {
         self.in_flight.deinit();
@@ -164,7 +208,7 @@ pub const HistoricalBackfill = struct {
             .target_floor = target_floor,
             .floor_hash = floor_hash,
             .next_body_height = next_body_height,
-            .in_flight = std.AutoHashMap(types.Hash256, void).init(cs.allocator),
+            .in_flight = std.AutoHashMap(types.Hash256, InFlight).init(cs.allocator),
         };
     }
 
@@ -322,9 +366,35 @@ pub const HistoricalBackfill = struct {
 
     /// Next historical bodies to request, up to `out.len`. Records them as
     /// in-flight so a subsequent call does not re-request the same hashes.
+    /// Peer-less form (key 0, no cap); the P2P layer uses `nextBodyHashesFor`.
     pub fn nextBodyHashes(
         self: *HistoricalBackfill,
         cs: *storage.ChainState,
+        out: []BodyRequest,
+    ) usize {
+        return self.collect(cs, 0, std.time.timestamp(), out);
+    }
+
+    /// Next historical bodies to request from `peer`, topping it up to
+    /// `MAX_HISTORICAL_IN_FLIGHT_PER_PEER` outstanding and never past it.
+    pub fn nextBodyHashesFor(
+        self: *HistoricalBackfill,
+        cs: *storage.ChainState,
+        peer: usize,
+        now: i64,
+        out: []BodyRequest,
+    ) usize {
+        const owed = self.inFlightFor(peer);
+        if (owed >= MAX_HISTORICAL_IN_FLIGHT_PER_PEER) return 0;
+        const room = MAX_HISTORICAL_IN_FLIGHT_PER_PEER - owed;
+        return self.collect(cs, peer, now, out[0..@min(out.len, room)]);
+    }
+
+    fn collect(
+        self: *HistoricalBackfill,
+        cs: *storage.ChainState,
+        peer: usize,
+        now: i64,
         out: []BodyRequest,
     ) usize {
         if (self.bodiesComplete() or out.len == 0) return 0;
@@ -332,13 +402,54 @@ pub const HistoricalBackfill = struct {
         var h = self.next_body_height;
         while (n < out.len and h < self.target_floor and h <= self.genesis_tip) : (h += 1) {
             const hash = cs.getBlockHashByHeight(h) orelse continue;
-            if (cs.hasBlock(&hash)) continue;
             if (self.in_flight.contains(hash)) continue;
-            self.in_flight.put(hash, {}) catch continue;
+            if (cs.hasBlock(&hash)) continue;
+            self.in_flight.put(hash, .{ .peer = peer, .requested_at = now }) catch continue;
             out[n] = .{ .height = h, .hash = hash };
             n += 1;
         }
         return n;
+    }
+
+    /// Historical bodies `peer` still owes us.
+    pub fn inFlightFor(self: *const HistoricalBackfill, peer: usize) usize {
+        var n: usize = 0;
+        var it = self.in_flight.valueIterator();
+        while (it.next()) |v| {
+            if (v.peer == peer) n += 1;
+        }
+        return n;
+    }
+
+    /// Release every hash `peer` owes us (it disconnected), so the next drive
+    /// asks another peer. Returns how many were released.
+    pub fn releasePeer(self: *HistoricalBackfill, peer: usize) usize {
+        return self.releaseWhere(peer, null);
+    }
+
+    /// Release every request older than `timeout_s` (the peer did not deliver
+    /// in time). Returns how many were released.
+    pub fn expireStale(self: *HistoricalBackfill, now: i64, timeout_s: i64) usize {
+        return self.releaseWhere(null, now - timeout_s);
+    }
+
+    fn releaseWhere(self: *HistoricalBackfill, peer: ?usize, older_than: ?i64) usize {
+        var stale: [64]types.Hash256 = undefined;
+        var released: usize = 0;
+        while (true) {
+            var n: usize = 0;
+            var it = self.in_flight.iterator();
+            while (it.next()) |kv| {
+                const hit = if (peer) |p| kv.value_ptr.peer == p else kv.value_ptr.requested_at < older_than.?;
+                if (!hit) continue;
+                stale[n] = kv.key_ptr.*;
+                n += 1;
+                if (n == stale.len) break;
+            }
+            for (stale[0..n]) |k| _ = self.in_flight.remove(k);
+            released += n;
+            if (n < stale.len) return released;
+        }
     }
 
     pub fn clearInFlight(self: *HistoricalBackfill) void {
@@ -370,17 +481,35 @@ pub const HistoricalBackfill = struct {
         }
     }
 
+    /// Write cumulative tx counts for every newly contiguous body below the
+    /// cursor. Incremental: resumes after `tx_counted_height`, so a body that
+    /// lands above a stuck cursor costs no reads at all. The first call after
+    /// boot scans once from height 1 (the old per-body behaviour, paid once).
     fn persistTxCounts(self: *HistoricalBackfill, cs: *storage.ChainState) void {
-        var h: u32 = 1;
+        var h: u32 = undefined;
+        var total: u64 = undefined;
+        if (self.tx_counted_height) |done| {
+            h = done + 1;
+            total = self.tx_counted_total;
+        } else {
+            h = 1;
+            total = 1; // genesis: Core m_chain_tx_count = 1
+        }
         while (h < self.next_body_height) : (h += 1) {
-            if (cs.getCumulativeTxCount(h) != null) continue;
-            const hash = cs.getBlockHashByHeight(h) orelse continue;
+            tx_count_reads += 1;
+            if (cs.getCumulativeTxCount(h)) |known| {
+                total = known;
+                continue;
+            }
             // An unreadable body is an UNKNOWN count (Core m_chain_tx_count = 0):
             // stop rather than count the block as one transaction.
+            const hash = cs.getBlockHashByHeight(h) orelse break;
             const n_tx = nTxAt(cs, &hash) orelse break;
-            const prev = cs.getCumulativeTxCount(h - 1) orelse break;
-            cs.putCumulativeTxCount(h, prev + n_tx);
+            total += n_tx;
+            cs.putCumulativeTxCount(h, total);
         }
+        self.tx_counted_height = h - 1;
+        self.tx_counted_total = total;
     }
 };
 
