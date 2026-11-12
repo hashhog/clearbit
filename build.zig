@@ -4255,4 +4255,33 @@ pub fn build(b: *std.Build) void {
         const prevout_step = b.step("test-prevout", "Run getrawtransaction/getblock prevout+fee tests");
         prevout_step.dependOn(&run_prevout_tests.step);
     }
+
+    // getwalletinfo Core field-set regression (no legacy balance fields).
+    {
+        const gwi_tests = b.addTest(.{
+            .root_source_file = b.path("tests_wallet_getwalletinfo_fields.zig"),
+            .target = target,
+            .optimize = optimize,
+            .filters = &[_][]const u8{"tests_wallet_getwalletinfo_fields"},
+        });
+        gwi_tests.linkSystemLibrary("rocksdb");
+        gwi_tests.linkSystemLibrary("secp256k1");
+        gwi_tests.addIncludePath(.{ .cwd_relative = secp256k1_include });
+        gwi_tests.linkLibC();
+        if (target.result.cpu.arch == .x86_64) {
+            gwi_tests.addCSourceFile(.{
+                .file = b.path("src/sha256_shani.c"),
+                .flags = shani_cflags,
+            });
+        }
+        if (minisketch_enabled) {
+            gwi_tests.linkSystemLibrary("minisketch");
+            gwi_tests.addIncludePath(.{ .cwd_relative = minisketch_include });
+        }
+        gwi_tests.root_module.addOptions("build_options", build_options);
+
+        const run_gwi_tests = b.addRunArtifact(gwi_tests);
+        const gwi_step = b.step("test-wallet-getwalletinfo-fields", "Run the getwalletinfo field-set regression tests");
+        gwi_step.dependOn(&run_gwi_tests.step);
+    }
 }
