@@ -25176,7 +25176,7 @@ fn writeJsonEscaped(writer: anytype, s: []const u8) !void {
 /// coinbase credits are depth-dependent (Core: orphan if <1 conf, immature if
 /// below COINBASE_MATURITY, else generate). Sends and ordinary receives carry
 /// their stored category verbatim.
-fn resolveCategory(
+pub fn resolveCategory(
     rec: *const wallet_mod.WalletTxRecord,
     detail: *const wallet_mod.WalletTxDetail,
     confirmations: u32,
