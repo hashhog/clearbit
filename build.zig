@@ -4103,8 +4103,25 @@ pub fn build(b: *std.Build) void {
             .target = target,
             .optimize = optimize,
         });
+        rocksdb_tests.root_module.addOptions("build_options", build_options);
         rocksdb_tests.linkSystemLibrary("rocksdb");
+        rocksdb_tests.linkSystemLibrary("secp256k1");
+        rocksdb_tests.addIncludePath(.{ .cwd_relative = secp256k1_include });
         rocksdb_tests.linkLibC();
+        if (target.result.cpu.arch == .x86_64) {
+            rocksdb_tests.addCSourceFile(.{
+                .file = b.path("src/sha256_shani.c"),
+                .flags = shani_cflags,
+            });
+        }
+        if (zmq_enabled) {
+            const zmq_so_path_r = "/usr/lib/x86_64-linux-gnu/libzmq.so";
+            if (std.fs.cwd().access(zmq_so_path_r, .{})) |_| {
+                rocksdb_tests.linkSystemLibrary("zmq");
+            } else |_| {
+                rocksdb_tests.addObjectFile(.{ .cwd_relative = "/usr/lib/x86_64-linux-gnu/libzmq.so.5" });
+            }
+        }
 
         const run_rocksdb_tests = b.addRunArtifact(rocksdb_tests);
         const rocksdb_test_step = b.step("test-rocksdb", "Run RocksDB-specific tests");
