@@ -8517,7 +8517,10 @@ pub const PeerManager = struct {
                         } else {
                             self.last_arm_result = .unresolved;
                         }
-                        self.rememberForkBatch(batch_key);
+                        // A fork deferred as already_pending was never judged:
+                        // do not mark its batch seen, or its retry would be
+                        // dropped after the pending slot frees up.
+                        if (self.last_arm_result != .already_pending) self.rememberForkBatch(batch_key);
                         if (self.last_arm_result == .armed) {
                             if (self.pending_reorg) |*pr| pr.batch_key = batch_key;
                         }
