@@ -166,7 +166,7 @@ fn pendingIs(pm: *PeerManager, hashes: []const types.Hash256) bool {
 
 /// Active chain genesis <- b1 (connected), then a 2-header fork off genesis
 /// with valid proof of work whose bodies are never sent: pending_reorg armed.
-fn armWithheldFork(fx: *Fx) !struct { b1: types.Block, f: [2]types.Hash256 } {
+fn armWithheldFork(fx: *Fx) !struct { b1: types.Block, f: [2]types.Hash256, hdrs: [2]types.BlockHeader } {
     const p = fx.params;
     const t0 = p.genesis_header.timestamp;
     const b1 = try mineBlock(fx.a, p.genesis_hash, 1, 1);
@@ -180,7 +180,7 @@ fn armWithheldFork(fx: *Fx) !struct { b1: types.Block, f: [2]types.Hash256 } {
     const f = [2]types.Hash256{ crypto.computeBlockHash(&f1), crypto.computeBlockHash(&f2) };
     try testing.expectEqual(peer_mod.ReorgArmResult.armed, fx.pm.last_arm_result);
     try testing.expect(pendingIs(&fx.pm, &f));
-    return .{ .b1 = b1, .f = f };
+    return .{ .b1 = b1, .f = f, .hdrs = .{ f1, f2 } };
 }
 
 /// Honest 3-block fork off genesis (more work than the withheld 2-block fork).
@@ -201,6 +201,22 @@ fn gHashes(g: *const [3]types.Block) [3]types.Hash256 {
     };
 }
 
+/// Honest 2-block fork off genesis with the SAME work as the withheld fork:
+/// it cannot displace the withheld reorg on work, so it arms only once that
+/// reorg is given up. Tests of the timeout itself use this fork, because a
+/// heavier fork displaces a pending reorg without any timeout.
+fn mineEqualFork(fx: *Fx) ![2]types.Block {
+    const p = fx.params;
+    var e: [2]types.Block = undefined;
+    e[0] = try mineBlock(fx.a, p.genesis_hash, 1, 0x61);
+    e[1] = try mineBlock(fx.a, crypto.computeBlockHash(&e[0].header), 2, 0x62);
+    return e;
+}
+
+fn eHashes(e: *const [2]types.Block) [2]types.Hash256 {
+    return .{ crypto.computeBlockHash(&e[0].header), crypto.computeBlockHash(&e[1].header) };
+}
+
 test "sec_p2p_headers_queue: a pending reorg whose bodies never arrive is given up after the timeout and a later honest reorg is accepted" {
     var fx: Fx = undefined;
     try fx.init(testing.allocator, &consensus.REGTEST);
@@ -208,22 +224,22 @@ test "sec_p2p_headers_queue: a pending reorg whose bodies never arrive is given 
 
     var w = try armWithheldFork(&fx);
     defer serialize.freeBlock(fx.a, &w.b1);
-    var g = try mineHonestFork(&fx);
-    defer for (&g) |*b| serialize.freeBlock(fx.a, b);
-    const gh = gHashes(&g);
+    var e = try mineEqualFork(&fx);
+    defer for (&e) |*b| serialize.freeBlock(fx.a, b);
+    const eh = eHashes(&e);
 
     // The withholding peer never delivers. Move past the stall timeout.
     age(&fx.pm, 601, 601);
 
-    try fx.send(&.{ g[0].header, g[1].header, g[2].header });
+    try fx.send(&.{ e[0].header, e[1].header });
     // Pre-fix: .already_pending, forever.
     try testing.expectEqual(peer_mod.ReorgArmResult.armed, fx.pm.last_arm_result);
-    try testing.expect(pendingIs(&fx.pm, &gh));
+    try testing.expect(pendingIs(&fx.pm, &eh));
 
-    for (&g) |*b| try fx.pm.ingestBlockMessage(fx.peer, try cloneBlock(fx.a, b));
+    for (&e) |*b| try fx.pm.ingestBlockMessage(fx.peer, try cloneBlock(fx.a, b));
     try testing.expect(fx.pm.pending_reorg == null);
-    try testing.expectEqual(@as(u32, 3), fx.cs.best_height);
-    try testing.expectEqualSlices(u8, &gh[2], &fx.cs.best_hash);
+    try testing.expectEqual(@as(u32, 2), fx.cs.best_height);
+    try testing.expectEqualSlices(u8, &eh[1], &fx.cs.best_hash);
     try testing.expect(!fx.peer.should_ban);
 }
 
@@ -234,17 +250,17 @@ test "sec_p2p_headers_queue: a pending reorg that keeps receiving bodies is stil
 
     var w = try armWithheldFork(&fx);
     defer serialize.freeBlock(fx.a, &w.b1);
-    var g = try mineHonestFork(&fx);
-    defer for (&g) |*b| serialize.freeBlock(fx.a, b);
+    var e = try mineEqualFork(&fx);
+    defer for (&e) |*b| serialize.freeBlock(fx.a, b);
 
     // Progress is fresh (a body arrived just now) but the 2-block fork has
     // been armed for longer than 600 s + 2 * 60 s: a peer dribbling bodies
     // cannot hold the slot forever.
     age(&fx.pm, 721, 0);
 
-    try fx.send(&.{ g[0].header, g[1].header, g[2].header });
+    try fx.send(&.{ e[0].header, e[1].header });
     try testing.expectEqual(peer_mod.ReorgArmResult.armed, fx.pm.last_arm_result);
-    try testing.expect(pendingIs(&fx.pm, &gHashes(&g)));
+    try testing.expect(pendingIs(&fx.pm, &eHashes(&e)));
 }
 
 test "sec_p2p_headers_queue: control, before the timeout a second fork is still deferred" {
@@ -254,11 +270,12 @@ test "sec_p2p_headers_queue: control, before the timeout a second fork is still 
 
     var w = try armWithheldFork(&fx);
     defer serialize.freeBlock(fx.a, &w.b1);
-    var g = try mineHonestFork(&fx);
-    defer for (&g) |*b| serialize.freeBlock(fx.a, b);
+    var e = try mineEqualFork(&fx);
+    defer for (&e) |*b| serialize.freeBlock(fx.a, b);
 
+    // Same work as the pending fork, so only the timeout could free the slot.
     age(&fx.pm, 599, 599);
-    try fx.send(&.{ g[0].header, g[1].header, g[2].header });
+    try fx.send(&.{ e[0].header, e[1].header });
     try testing.expectEqual(peer_mod.ReorgArmResult.already_pending, fx.pm.last_arm_result);
     try testing.expect(pendingIs(&fx.pm, &w.f));
 }
@@ -287,12 +304,11 @@ test "sec_p2p_headers_queue: control, a reorg whose bodies are arriving is not d
     try fx.pm.ingestBlockMessage(fx.peer, try cloneBlock(fx.a, &g[0]));
     try testing.expect(pendingIs(&fx.pm, &gh));
 
-    // Another fork announcement does not displace it.
+    // Another fork announcement with the same work does not displace it.
     const x1 = grind(p, p.genesis_hash, REGTEST_BITS, t0 + 700, 0x31, true);
     const x2 = grind(p, crypto.computeBlockHash(&x1), REGTEST_BITS, t0 + 1300, 0x32, true);
     const x3 = grind(p, crypto.computeBlockHash(&x2), REGTEST_BITS, t0 + 1900, 0x33, true);
-    const x4 = grind(p, crypto.computeBlockHash(&x3), REGTEST_BITS, t0 + 2500, 0x34, true);
-    try fx.send(&.{ x1, x2, x3, x4 });
+    try fx.send(&.{ x1, x2, x3 });
     try testing.expectEqual(peer_mod.ReorgArmResult.already_pending, fx.pm.last_arm_result);
     try testing.expect(pendingIs(&fx.pm, &gh));
 
@@ -491,12 +507,50 @@ test "sec_p2p_headers_queue: control, re-sending the headers of a reorg that is 
     try testing.expect(!fx.peer.should_ban);
 }
 
-test "sec_p2p_headers_queue: a heavier fork deferred as already_pending is armed when its headers are re-sent after the pending reorg expires" {
+test "sec_p2p_headers_queue: a fork deferred as already_pending is armed when its headers are re-sent after the pending reorg expires" {
     // Pre-review of the clearbit#71 rework: a fork turned away as
     // already_pending had its batch key recorded too, and only the ARMING
     // batch's key is dropped on expiry. So the honest fork that arrived while
     // a withholder held the slot stayed a "seen" batch and its retry was
     // ignored after the slot expired.
+    var fx: Fx = undefined;
+    try fx.init(testing.allocator, &consensus.REGTEST);
+    defer fx.deinit();
+
+    var w = try armWithheldFork(&fx);
+    defer serialize.freeBlock(fx.a, &w.b1);
+    var e = try mineEqualFork(&fx);
+    defer for (&e) |*b| serialize.freeBlock(fx.a, b);
+    const eh = eHashes(&e);
+
+    // An honest fork with the same work arrives while the withheld one is
+    // pending: deferred.
+    try fx.send(&.{ e[0].header, e[1].header });
+    try testing.expectEqual(peer_mod.ReorgArmResult.already_pending, fx.pm.last_arm_result);
+    try testing.expect(pendingIs(&fx.pm, &w.f));
+
+    // The withheld fork times out; the honest fork's headers are re-sent.
+    age(&fx.pm, 601, 601);
+    fx.pm.last_arm_result = .skipped;
+    try fx.send(&.{ e[0].header, e[1].header });
+    try testing.expectEqual(peer_mod.ReorgArmResult.armed, fx.pm.last_arm_result);
+    try testing.expect(pendingIs(&fx.pm, &eh));
+
+    for (&e) |*b| try fx.pm.ingestBlockMessage(fx.peer, try cloneBlock(fx.a, b));
+    try testing.expect(fx.pm.pending_reorg == null);
+    try testing.expectEqual(@as(u32, 2), fx.cs.best_height);
+    try testing.expectEqualSlices(u8, &eh[1], &fx.cs.best_hash);
+    try testing.expect(!fx.peer.should_ban);
+    for (eh) |h| try testing.expect(!fx.pm.failed_blocks.contains(h));
+}
+
+test "sec_p2p_headers_queue: a withholder re-sending its own expired fork cannot keep a heavier fork from arming" {
+    // Second pre-review of the clearbit#71 rework: once expiry forgot the
+    // arming batch, the withholder could re-send its own headers right
+    // after each expiry and re-take the slot in the same message, and the
+    // heavier honest fork kept getting already_pending. A fork with more
+    // work than the pending one now takes the slot, so holding it costs the
+    // withholder real work.
     var fx: Fx = undefined;
     try fx.init(testing.allocator, &consensus.REGTEST);
     defer fx.deinit();
@@ -509,14 +563,12 @@ test "sec_p2p_headers_queue: a heavier fork deferred as already_pending is armed
 
     // The heavier honest fork arrives while the withheld one is pending.
     try fx.send(&.{ g[0].header, g[1].header, g[2].header });
-    try testing.expectEqual(peer_mod.ReorgArmResult.already_pending, fx.pm.last_arm_result);
-    try testing.expect(pendingIs(&fx.pm, &w.f));
-
-    // The withheld fork times out; the honest fork's headers are re-sent.
+    // Whatever holds the slot ages out; the withholder re-sends its own
+    // headers FIRST, then the honest fork is re-sent.
     age(&fx.pm, 601, 601);
+    try fx.send(&w.hdrs);
     fx.pm.last_arm_result = .skipped;
     try fx.send(&.{ g[0].header, g[1].header, g[2].header });
-    try testing.expectEqual(peer_mod.ReorgArmResult.armed, fx.pm.last_arm_result);
     try testing.expect(pendingIs(&fx.pm, &gh));
 
     for (&g) |*b| try fx.pm.ingestBlockMessage(fx.peer, try cloneBlock(fx.a, b));
@@ -525,4 +577,41 @@ test "sec_p2p_headers_queue: a heavier fork deferred as already_pending is armed
     try testing.expectEqualSlices(u8, &gh[2], &fx.cs.best_hash);
     try testing.expect(!fx.peer.should_ban);
     for (gh) |h| try testing.expect(!fx.pm.failed_blocks.contains(h));
+}
+
+test "sec_p2p_headers_queue: a heavier extension displaces a pending reorg before the timeout and keeps the body already received" {
+    var fx: Fx = undefined;
+    try fx.init(testing.allocator, &consensus.REGTEST);
+    defer fx.deinit();
+
+    var b1 = try mineBlock(fx.a, fx.params.genesis_hash, 1, 1);
+    defer serialize.freeBlock(fx.a, &b1);
+    try fx.send(&.{b1.header});
+    try fx.pm.ingestBlockMessage(fx.peer, try cloneBlock(fx.a, &b1));
+
+    var g = try mineHonestFork(&fx);
+    defer for (&g) |*b| serialize.freeBlock(fx.a, b);
+    const gh = gHashes(&g);
+    var g4 = try mineBlock(fx.a, gh[2], 4, 0x24);
+    defer serialize.freeBlock(fx.a, &g4);
+    const g4h = crypto.computeBlockHash(&g4.header);
+
+    try fx.send(&.{ g[0].header, g[1].header, g[2].header });
+    try testing.expect(pendingIs(&fx.pm, &gh));
+    try fx.pm.ingestBlockMessage(fx.peer, try cloneBlock(fx.a, &g[0]));
+    try testing.expect(fx.pm.block_buffer.contains(gh[0]));
+
+    // One more block on the same fork, well before any timeout.
+    try fx.send(&.{ g[0].header, g[1].header, g[2].header, g4.header });
+    try testing.expectEqual(peer_mod.ReorgArmResult.armed, fx.pm.last_arm_result);
+    try testing.expect(pendingIs(&fx.pm, &.{ gh[0], gh[1], gh[2], g4h }));
+    // The body the displaced reorg already had is not thrown away.
+    try testing.expect(fx.pm.block_buffer.contains(gh[0]));
+
+    for (g[1..]) |*b| try fx.pm.ingestBlockMessage(fx.peer, try cloneBlock(fx.a, b));
+    try fx.pm.ingestBlockMessage(fx.peer, try cloneBlock(fx.a, &g4));
+    try testing.expect(fx.pm.pending_reorg == null);
+    try testing.expectEqual(@as(u32, 4), fx.cs.best_height);
+    try testing.expectEqualSlices(u8, &g4h, &fx.cs.best_hash);
+    try testing.expect(!fx.peer.should_ban);
 }
