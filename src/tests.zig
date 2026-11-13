@@ -1047,6 +1047,7 @@ comptime {
     _ = @import("tests_p2p_loop_fairness.zig"); // 2026-11-11: one busy peer must not hold up accept and dial adoption
     _ = @import("tests_tip_lag_front_block.zig"); // at-tip DRAIN-BREAK-WEDGE lag: ask only peers that have the block
     _ = @import("tests_sec_p2p_decode_alloc.zig"); // security audit C1/C4/C5: decode allocs + leaks
+    _ = @import("tests_sec_p2p_block_buffer.zig"); // security audit C5: mutated bodies refused on receipt, block_buffer byte cap
     _ = @import("tests_mtp_bip68.zig"); // 2026-10-05 mempool MTP / BIP68 + MTP ring rewind (base-comparable)
     _ = @import("tests_mtp_bip68_fix.zig"); // 2026-10-05 mempool MTP / BIP68 (new API: removeForReorg, tipMtp)
     _ = @import("mempool.zig");

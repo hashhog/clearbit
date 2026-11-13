@@ -2612,6 +2612,75 @@ fn checkWitnessMalleation(
     }
 }
 
+/// Analogue of Bitcoin Core's IsBlockMutated (validation.cpp:4027-4056),
+/// which net_processing runs on every received `block` message BEFORE the
+/// body is handed to ProcessNewBlock (net_processing.cpp:4785-4791).
+///
+/// True when the body cannot be the block its header commits to:
+///   1. CheckMerkleRoot: the txids do not hash to header.merkle_root, or the
+///      tree has a CVE-2012-2459 duplicate-subtree mutation.
+///   2. No coinbase first (or no txs) and some tx is exactly 64 bytes
+///      without witness (merkle-tree ambiguity, Core's comment 3.1).
+///   3. CheckWitnessMalleation(check_witness_root): the witness data is not
+///      committed to (bad nonce size / commitment mismatch / unexpected
+///      witness).
+///
+/// `check_witness_root`: Core passes DeploymentActiveAfter(prev, SEGWIT) and
+/// only calls this when prev is known.  Pass `null` when the parent is
+/// unknown: steps 1-2 are context-free (a body failing them is invalid under
+/// any parent) and still run; step 3 needs the segwit context and is skipped,
+/// because guessing it wrong would refuse a valid block.
+///
+/// An out-of-memory while hashing returns false (not mutated): this check is
+/// an early filter, and connect-time checkBlock still runs every rule.
+pub fn isBlockMutated(
+    block: *const types.Block,
+    check_witness_root: ?bool,
+    allocator: std.mem.Allocator,
+) bool {
+    const txids = allocator.alloc(types.Hash256, block.transactions.len) catch return false;
+    defer allocator.free(txids);
+    for (block.transactions, 0..) |*tx, i| {
+        txids[i] = crypto.computeTxid(tx, allocator) catch return false;
+    }
+    var mutated: bool = false;
+    const root = crypto.computeMerkleRootMutated(txids, allocator, &mutated) catch return false;
+    if (!std.mem.eql(u8, &root, &block.header.merkle_root)) return true; // bad-txnmrklroot
+    if (mutated) return true; // bad-txns-duplicate
+
+    if (block.transactions.len == 0 or !block.transactions[0].isCoinbase()) {
+        for (block.transactions) |*tx| {
+            if (txBaseSerializeSize(tx) == 64) return true;
+        }
+        return false;
+    }
+
+    const expect = check_witness_root orelse return false;
+    checkWitnessMalleation(block, expect, allocator) catch |err| switch (err) {
+        error.OutOfMemory => return false,
+        else => return true,
+    };
+    return false;
+}
+
+/// Full serialized size of a block (header, tx count, every tx WITH its
+/// witness), computed without allocating.  Equals the `block` message
+/// payload length for a decoded block; used to account block_buffer bytes.
+pub fn blockSerializedSize(block: *const types.Block) u64 {
+    var sz: u64 = 80 + compactSizeLen(block.transactions.len);
+    for (block.transactions) |*tx| {
+        sz += txBaseSerializeSize(tx);
+        if (tx.hasWitness()) {
+            sz += 2; // marker + flag
+            for (tx.inputs) |inp| {
+                sz += compactSizeLen(inp.witness.len);
+                for (inp.witness) |item| sz += compactSizeLen(item.len) + item.len;
+            }
+        }
+    }
+    return sz;
+}
+
 // ============================================================================
 // Difficulty Validation
 // ============================================================================
