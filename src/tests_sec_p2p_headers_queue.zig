@@ -615,3 +615,45 @@ test "sec_p2p_headers_queue: a heavier extension displaces a pending reorg befor
     try testing.expectEqualSlices(u8, &g4h, &fx.cs.best_hash);
     try testing.expect(!fx.peer.should_ban);
 }
+
+test "sec_p2p_headers_queue: control, a heavier fork that is then refused leaves the pending reorg and its bodies alone" {
+    // A heavier fork now gets past the already_pending gate, so the swap
+    // must wait until it passes every arm check. Here it fails the last one
+    // (the announcer cannot serve witnesses): the pending reorg must keep
+    // its slot and the body it already has, and still complete.
+    var fx: Fx = undefined;
+    try fx.init(testing.allocator, &consensus.REGTEST);
+    defer fx.deinit();
+
+    var b1 = try mineBlock(fx.a, fx.params.genesis_hash, 1, 1);
+    defer serialize.freeBlock(fx.a, &b1);
+    try fx.send(&.{b1.header});
+    try fx.pm.ingestBlockMessage(fx.peer, try cloneBlock(fx.a, &b1));
+
+    var e = try mineEqualFork(&fx);
+    defer for (&e) |*b| serialize.freeBlock(fx.a, b);
+    const eh = eHashes(&e);
+    try fx.send(&.{ e[0].header, e[1].header });
+    try testing.expect(pendingIs(&fx.pm, &eh));
+    try fx.pm.ingestBlockMessage(fx.peer, try cloneBlock(fx.a, &e[0]));
+    try testing.expect(fx.pm.block_buffer.contains(eh[0]));
+
+    var g = try mineHonestFork(&fx);
+    defer for (&g) |*b| serialize.freeBlock(fx.a, b);
+    const services = fx.peer.services;
+    fx.peer.services = p2p.NODE_NETWORK; // no NODE_WITNESS
+    try fx.send(&.{ g[0].header, g[1].header, g[2].header });
+    fx.peer.services = services;
+    try testing.expect(fx.pm.last_arm_result != .armed);
+    try testing.expect(pendingIs(&fx.pm, &eh));
+    try testing.expect(fx.pm.block_buffer.contains(eh[0]));
+    if (@hasField(PeerManager, "pending_reorgs_displaced")) {
+        try testing.expectEqual(@as(u64, 0), fx.pm.pending_reorgs_displaced);
+    }
+
+    try fx.pm.ingestBlockMessage(fx.peer, try cloneBlock(fx.a, &e[1]));
+    try testing.expect(fx.pm.pending_reorg == null);
+    try testing.expectEqual(@as(u32, 2), fx.cs.best_height);
+    try testing.expectEqualSlices(u8, &eh[1], &fx.cs.best_hash);
+    try testing.expect(!fx.peer.should_ban);
+}
