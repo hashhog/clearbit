@@ -1034,6 +1034,7 @@ comptime {
     _ = @import("consensus.zig");
     _ = @import("p2p.zig");
     _ = @import("tests_sec_p2p_headers_pow.zig"); // security audit C2: P2P headers get Core's CheckHeadersPoW
+    _ = @import("tests_sec_p2p_headers_queue.zig"); // security audit C2: pending_reorg timeout + unconnected header queue cap
     _ = @import("address.zig");
     _ = @import("addr_error.zig"); // Core DecodeDestination error text + LocateErrors
     _ = @import("psbt_process.zig"); // descriptor-driven PSBT updater/signer
