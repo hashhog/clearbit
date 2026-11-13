@@ -375,3 +375,118 @@ test "sec_p2p_headers_queue: control, honest header sync continues past the queu
     try testing.expectEqualSlices(u8, &crypto.computeBlockHash(&b[4].header), &fx.cs.best_hash);
     try testing.expect(!fx.peer.should_ban);
 }
+
+test "sec_p2p_headers_queue: a heavier fork whose pending reorg expired is armed again when the same headers are re-sent" {
+    // Warden on clearbit#71: the competing-fork path returns before
+    // maybeArmReorg when `seen_fork_batches` already holds the batch key, and
+    // the key was recorded on the first (arming) announcement. Once that
+    // reorg is given up, a peer re-sending the identical headers (the usual
+    // retry) must be judged on its work again, not ignored as a duplicate.
+    var fx: Fx = undefined;
+    try fx.init(testing.allocator, &consensus.REGTEST);
+    defer fx.deinit();
+    const p = fx.params;
+    const t0 = p.genesis_header.timestamp;
+
+    // Active chain genesis <- b1.
+    var b1 = try mineBlock(fx.a, p.genesis_hash, 1, 1);
+    defer serialize.freeBlock(fx.a, &b1);
+    try fx.send(&.{b1.header});
+    try fx.pm.ingestBlockMessage(fx.peer, try cloneBlock(fx.a, &b1));
+    try testing.expectEqual(@as(u32, 1), fx.cs.best_height);
+
+    // Heavier 3-block fork announced; its bodies are not sent (yet).
+    var g = try mineHonestFork(&fx);
+    defer for (&g) |*b| serialize.freeBlock(fx.a, b);
+    const gh = gHashes(&g);
+    try fx.send(&.{ g[0].header, g[1].header, g[2].header });
+    try testing.expectEqual(peer_mod.ReorgArmResult.armed, fx.pm.last_arm_result);
+    try testing.expect(pendingIs(&fx.pm, &gh));
+
+    // Past the stall timeout. A different fork with equal work (one header
+    // off genesis, same as b1) clears the stale slot but does not arm.
+    age(&fx.pm, 601, 601);
+    const x1 = grind(p, p.genesis_hash, REGTEST_BITS, t0 + 640, 0x5a, true);
+    try fx.send(&.{x1});
+    try testing.expect(fx.pm.last_arm_result != .armed);
+    try testing.expect(fx.pm.pending_reorg == null);
+
+    // The original headers, re-sent unchanged. Pre-fix: dropped as a seen
+    // batch, pending_reorg stays empty and no getdata goes out.
+    fx.pm.last_arm_result = .skipped;
+    try fx.send(&.{ g[0].header, g[1].header, g[2].header });
+    try testing.expectEqual(peer_mod.ReorgArmResult.armed, fx.pm.last_arm_result);
+    try testing.expect(pendingIs(&fx.pm, &gh));
+
+    for (&g) |*b| try fx.pm.ingestBlockMessage(fx.peer, try cloneBlock(fx.a, b));
+    try testing.expect(fx.pm.pending_reorg == null);
+    try testing.expectEqual(@as(u32, 3), fx.cs.best_height);
+    try testing.expectEqualSlices(u8, &gh[2], &fx.cs.best_hash);
+    try testing.expect(!fx.peer.should_ban);
+    for (gh) |h| try testing.expect(!fx.pm.failed_blocks.contains(h));
+}
+
+test "sec_p2p_headers_queue: an expired pending reorg re-armed by its own re-sent headers before any other fork arrives" {
+    // Same retry, but with no other fork in between: the stale slot must
+    // be cleared by the re-announcement itself.
+    var fx: Fx = undefined;
+    try fx.init(testing.allocator, &consensus.REGTEST);
+    defer fx.deinit();
+    const p = fx.params;
+
+    var b1 = try mineBlock(fx.a, p.genesis_hash, 1, 1);
+    defer serialize.freeBlock(fx.a, &b1);
+    try fx.send(&.{b1.header});
+    try fx.pm.ingestBlockMessage(fx.peer, try cloneBlock(fx.a, &b1));
+
+    var g = try mineHonestFork(&fx);
+    defer for (&g) |*b| serialize.freeBlock(fx.a, b);
+    const gh = gHashes(&g);
+    try fx.send(&.{ g[0].header, g[1].header, g[2].header });
+    try testing.expect(pendingIs(&fx.pm, &gh));
+
+    age(&fx.pm, 601, 601);
+    fx.pm.last_arm_result = .skipped;
+    try fx.send(&.{ g[0].header, g[1].header, g[2].header });
+    try testing.expectEqual(peer_mod.ReorgArmResult.armed, fx.pm.last_arm_result);
+    try testing.expect(pendingIs(&fx.pm, &gh));
+    if (@hasField(PendingReorg, "armed_at")) {
+        try testing.expect(std.time.timestamp() - fx.pm.pending_reorg.?.armed_at < 600);
+    }
+
+    for (&g) |*b| try fx.pm.ingestBlockMessage(fx.peer, try cloneBlock(fx.a, b));
+    try testing.expectEqual(@as(u32, 3), fx.cs.best_height);
+    try testing.expectEqualSlices(u8, &gh[2], &fx.cs.best_hash);
+    try testing.expect(!fx.peer.should_ban);
+    for (gh) |h| try testing.expect(!fx.pm.failed_blocks.contains(h));
+}
+
+test "sec_p2p_headers_queue: control, re-sending the headers of a reorg that is still pending does not re-arm or duplicate it" {
+    var fx: Fx = undefined;
+    try fx.init(testing.allocator, &consensus.REGTEST);
+    defer fx.deinit();
+    const p = fx.params;
+
+    var b1 = try mineBlock(fx.a, p.genesis_hash, 1, 1);
+    defer serialize.freeBlock(fx.a, &b1);
+    try fx.send(&.{b1.header});
+    try fx.pm.ingestBlockMessage(fx.peer, try cloneBlock(fx.a, &b1));
+
+    var g = try mineHonestFork(&fx);
+    defer for (&g) |*b| serialize.freeBlock(fx.a, b);
+    const gh = gHashes(&g);
+    try fx.send(&.{ g[0].header, g[1].header, g[2].header });
+    try testing.expect(pendingIs(&fx.pm, &gh));
+    const armed_at_before: i64 = if (@hasField(PendingReorg, "armed_at")) fx.pm.pending_reorg.?.armed_at else 0;
+
+    age(&fx.pm, 100, 100);
+    fx.pm.last_arm_result = .skipped;
+    try fx.send(&.{ g[0].header, g[1].header, g[2].header });
+    // Still the same pending reorg; the duplicate batch was a no-op.
+    try testing.expectEqual(peer_mod.ReorgArmResult.skipped, fx.pm.last_arm_result);
+    try testing.expect(pendingIs(&fx.pm, &gh));
+    if (@hasField(PendingReorg, "armed_at")) {
+        try testing.expect(fx.pm.pending_reorg.?.armed_at <= armed_at_before - 100 + 1);
+    }
+    try testing.expect(!fx.peer.should_ban);
+}
