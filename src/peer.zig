@@ -118,6 +118,16 @@ pub const BLOCK_BUFFER_MAX_BYTES: u64 = 1 << 30;
 /// to a peer that has not answered at all.
 pub const REORG_BODY_RETRY_S: i64 = 30;
 
+/// One entry of PeerManager.reorg_body_requests.
+pub const ReorgBodyRequest = struct {
+    /// When the body was last asked for; 0 = no live request (the copy that
+    /// answered it was dropped by the buffer cap).
+    requested_at: i64,
+    /// Size of the copy the cap dropped (0 = never seen).  A body that is not
+    /// the reorg's next is asked for again only when this many bytes fit.
+    dropped_bytes: u64 = 0,
+};
+
 /// Do not prefetch more headers than the in-memory index can hold minus one
 /// retarget window.  A 16_000 queue with a 10_000 LRU dropped the 2016-block
 /// difficulty ancestor; the next batch then came back `.undecidable` and
@@ -3688,13 +3698,15 @@ pub const PeerManager = struct {
     /// announcements while one is pending are deferred to the next round.
     pending_reorg: ?PendingReorg,
     /// Fork bodies of `pending_reorg` asked for and not yet delivered: hash ->
-    /// request time.  Fork bodies are not in `inflight_block_peer` (the IBD
+    /// request state.  Fork bodies are not in `inflight_block_peer` (the IBD
     /// pipeline never walks them), so without this a fork body dropped by the
     /// block_buffer cap was never asked for again and the reorg stayed
-    /// pending forever (Warden on clearbit#72).  An entry is removed when any
-    /// copy arrives; a missing body with no live entry is re-requested from
-    /// tryFireReorg.  Cleared when a new reorg is armed.
-    reorg_body_requests: std.AutoHashMapUnmanaged(types.Hash256, i64) = .{},
+    /// pending forever (Warden on clearbit#72).  A stored or mutated copy
+    /// removes the entry; a copy the cap drops leaves `requested_at = 0` and
+    /// its size, so tryFireReorg asks for it again only once it would fit or
+    /// it is the body the reorg needs next (never in a drop/re-request loop).
+    /// Cleared when a new reorg is armed.
+    reorg_body_requests: std.AutoHashMapUnmanaged(types.Hash256, ReorgBodyRequest) = .{},
 
     /// Best-known-header chainwork and timestamp for the faithful assumevalid
     /// script-skip gate (Core ConnectBlock:2346-2366 conditions 4 + 5).
@@ -7143,10 +7155,13 @@ pub const PeerManager = struct {
 
     /// Ask again for missing pending-reorg bodies that have no live request
     /// (dropped by the buffer cap on arrival, or unanswered for
-    /// REORG_BODY_RETRY_S).  While the buffer is full only the next missing
-    /// body is asked for (it is the only one the cap would admit); with room,
-    /// up to MAX_BLOCKS_IN_TRANSIT_PER_PEER.  Sent to the announcing peer if
-    /// it is still connected, else to any witness-serving peer.
+    /// REORG_BODY_RETRY_S), up to MAX_BLOCKS_IN_TRANSIT_PER_PEER.  The next
+    /// missing body is always eligible: the cap admits it.  Any other body is
+    /// eligible only if it would be stored: with its dropped size known, only
+    /// when that many bytes fit; never seen, only while the buffer is under
+    /// both caps.  So a body the cap dropped is not re-requested just to be
+    /// dropped again.  Sent to the announcing peer if it is still connected,
+    /// else to any witness-serving peer.
     fn requestMissingReorgBodies(self: *PeerManager) void {
         const pr = self.pending_reorg orelse return;
         var target: ?*Peer = null;
@@ -7169,11 +7184,16 @@ pub const PeerManager = struct {
         for (pr.fork_hashes.items) |h| {
             if (n == invs.len) break;
             if (self.block_buffer.contains(h)) continue;
-            const eligible = first_missing or has_room;
+            const is_next = first_missing;
             first_missing = false;
-            if (!eligible) break;
-            if (self.reorg_body_requests.get(h)) |ts| {
-                if (now - ts < REORG_BODY_RETRY_S) continue;
+            const entry: ?ReorgBodyRequest = self.reorg_body_requests.get(h);
+            if (entry) |e| {
+                if (e.requested_at != 0 and now - e.requested_at < REORG_BODY_RETRY_S) continue;
+            }
+            if (!is_next) {
+                const dropped: u64 = if (entry) |e| e.dropped_bytes else 0;
+                const fits = if (dropped != 0) !self.blockBufferFull(&h, dropped) else has_room;
+                if (!fits) continue;
             }
             invs[n] = .{ .inv_type = .msg_witness_block, .hash = h };
             n += 1;
@@ -7184,7 +7204,7 @@ pub const PeerManager = struct {
             std.log.warn("REORG: fork-body re-request send failed: {}", .{err});
             return;
         };
-        for (invs[0..n]) |inv| self.reorg_body_requests.put(self.allocator, inv.hash, now) catch {};
+        for (invs[0..n]) |inv| self.reorg_body_requests.put(self.allocator, inv.hash, .{ .requested_at = now }) catch {};
         std.log.info("REORG: re-requested {d} missing fork bod{s}", .{ n, if (n == 1) "y" else "ies" });
     }
 
@@ -7716,8 +7736,6 @@ pub const PeerManager = struct {
         // re-issue via pipelineBlockRequests on the next drain.
         self.reorg_body_requests.clearRetainingCapacity();
         if (owned.items.len > 0) {
-            const now_ts = std.time.timestamp();
-            for (owned.items) |h| self.reorg_body_requests.put(self.allocator, h, now_ts) catch {};
             var inv_list = std.ArrayList(p2p.InvVector).init(self.allocator);
             defer inv_list.deinit();
             for (owned.items) |h| {
@@ -7727,9 +7745,14 @@ pub const PeerManager = struct {
                 }) catch break;
             }
             const getdata = p2p.Message{ .getdata = .{ .inventory = inv_list.items } };
-            peer.sendMessage(&getdata) catch |err| {
+            if (peer.sendMessage(&getdata)) |_| {
+                // Recorded only once sent: an unsent request is left for
+                // tryFireReorg to issue on the next drain.
+                const now_ts = std.time.timestamp();
+                for (inv_list.items) |inv| self.reorg_body_requests.put(self.allocator, inv.hash, .{ .requested_at = now_ts }) catch {};
+            } else |err| {
                 std.log.warn("REORG: getdata send failed: {}", .{err});
-            };
+            }
         }
 
         std.log.info(
@@ -8833,10 +8856,6 @@ pub const PeerManager = struct {
                     }
                 }
 
-                // Any copy of a fork body answers its request: a body dropped
-                // below (mutated or over the cap) is then asked for again from tryFireReorg.
-                if (reorg_body) _ = self.reorg_body_requests.remove(block_hash);
-
                 // Core IsBlockMutated on receipt (net_processing.cpp:4785):
                 // a body that does not hash to its header's merkle root (or
                 // whose witness is not committed) is not that block. Drop it
@@ -8846,6 +8865,9 @@ pub const PeerManager = struct {
                 // above). Audit C5: junk ~4 MB bodies for public queued
                 // hashes otherwise sat in the buffer until the connect front.
                 if (self.receivedBlockIsMutated(&block, &block_hash)) {
+                    // A mutated fork body answers its request: no entry, so
+                    // tryFireReorg asks for it again.
+                    if (reorg_body) _ = self.reorg_body_requests.remove(block_hash);
                     std.log.warn("P2P: received mutated block from peer={any}", .{peer.address});
                     peer.misbehaving(100, "mutated block");
                     if (self.download_cursor > self.connect_cursor) {
@@ -8880,7 +8902,10 @@ pub const PeerManager = struct {
                         // the reorg (and, with pending_reorg set, every
                         // later fork is deferred as already_pending).  Drop
                         // the reorg's already-active prefix first so "next"
-                        // is a body that can still arrive.
+                        // is a body that can still arrive.  (tryFireReorg runs
+                        // the same trim under lockChain; here it only reads
+                        // chainstate and edits pending_reorg / block_buffer,
+                        // both owned by this P2P thread.)
                         const is_next_reorg = reorg_body and blk: {
                             self.trimActivePrefixOfPendingReorg();
                             const nm = self.nextMissingReorgBody() orelse break :blk false;
@@ -8899,6 +8924,15 @@ pub const PeerManager = struct {
                             // ~6 blocks/s and wedged the node at 29,953.
                             if (self.download_cursor > self.connect_cursor) {
                                 self.download_cursor = self.connect_cursor;
+                            }
+                            // A dropped fork body: no live request, and its
+                            // size, so it is asked for again only once it fits
+                            // or the reorg needs it next.
+                            if (reorg_body and self.isPendingReorgHash(&block_hash)) {
+                                self.reorg_body_requests.put(self.allocator, block_hash, .{
+                                    .requested_at = 0,
+                                    .dropped_bytes = new_bytes,
+                                }) catch {};
                             }
                             serialize.freeBlock(self.allocator, &block);
                             return;
@@ -8931,6 +8965,11 @@ pub const PeerManager = struct {
                     serialize.freeBlock(self.allocator, &block);
                     return;
                 };
+                // A stored fork body's request is answered.  (A fork body the
+                // cap dropped above recorded its size instead; until then its
+                // entry stays live, so the drain run inside the cap branch
+                // cannot re-request the body being dropped.)
+                if (reorg_body) _ = self.reorg_body_requests.remove(block_hash);
                 // Record which peer supplied this block so drainBlockBuffer can
                 // penalise them if validation rejects it.  Mirrors Core's
                 // mapBlockSource (net_processing.cpp:4805).  Best-effort; OOM

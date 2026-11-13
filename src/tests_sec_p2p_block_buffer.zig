@@ -582,6 +582,118 @@ test "sec_p2p_block_buffer: rework a heavier fork delivered with the buffer at i
     try runReorgUnderCap(.bytes);
 }
 
+// Active chain G-A1-B1 from H, filler bodies buffered, and the byte cap set a
+// few bytes ABOVE what is buffered: the buffer is under both caps ("has
+// room"), yet no fork body fits.  X announces A1-B1x-B2x-B3x.  B3x and B2x
+// arrive out of order and are dropped; neither may be asked for again while
+// it still would not fit (a drop/re-request loop otherwise).  B1x (next) is
+// admitted and only B2x, now next, is re-requested; then B3x; the node
+// reaches B3x.
+test "sec_p2p_block_buffer: rework a fork body the cap dropped is not re-requested while it still would not fit" {
+    const a = testing.allocator;
+    const params = consensus.REGTEST;
+    var pm = peer_mod.PeerManager.init(a, &params);
+    defer pm.deinit();
+    var tmp_dir = testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+    const path = try tmp_dir.dir.realpathAlloc(a, ".");
+    defer a.free(path);
+    var db = try storage.Database.open(path, 64, a);
+    defer db.close();
+    var cs = storage.ChainState.init(&db, 64, a);
+    defer cs.deinit();
+    cs.wireUtxoParent();
+    cs.setNetworkParams(&params);
+    cs.best_hash = params.genesis_hash;
+    cs.initGenesisTimestamp(params.genesis_header.timestamp);
+    pm.chain_state = &cs;
+
+    var h_peer = stubPeer(&params, a);
+    defer h_peer.recv_buffer.deinit();
+    h_peer.address = std.net.Address.initIp4([4]u8{ 127, 0, 0, 3 }, 18444);
+    var fds: [2]i32 = undefined;
+    try testing.expectEqual(@as(usize, 0), std.os.linux.socketpair(std.posix.AF.UNIX, std.posix.SOCK.STREAM, 0, &fds));
+    defer std.posix.close(fds[0]);
+    defer std.posix.close(fds[1]);
+    var x_peer = stubPeer(&params, a);
+    defer x_peer.recv_buffer.deinit();
+    x_peer.address = std.net.Address.initIp4([4]u8{ 127, 0, 0, 2 }, 18444);
+    x_peer.stream = .{ .handle = fds[0] };
+    try pm.peers.append(&h_peer);
+    try pm.peers.append(&x_peer);
+    defer pm.peers.clearRetainingCapacity();
+
+    var a1 = try mineForkBlock(a, &params, params.genesis_hash, 1, 0xA1);
+    defer serialize.freeBlock(a, &a1.block);
+    var b1 = try mineForkBlock(a, &params, a1.hash, 2, 0x11);
+    defer serialize.freeBlock(a, &b1.block);
+    var b1x = try mineForkBlock(a, &params, a1.hash, 2, 0x21);
+    defer serialize.freeBlock(a, &b1x.block);
+    var b2x = try mineForkBlock(a, &params, b1x.hash, 3, 0x22);
+    defer serialize.freeBlock(a, &b2x.block);
+    var b3x = try mineForkBlock(a, &params, b2x.hash, 4, 0x23);
+    defer serialize.freeBlock(a, &b3x.block);
+
+    try sendHdrs(&pm, a, &h_peer, &.{ &a1, &b1 });
+    try sendBody(&pm, a, &h_peer, &a1);
+    try sendBody(&pm, a, &h_peer, &b1);
+    try testing.expectEqual(@as(u32, 2), cs.best_height);
+
+    try queue(&pm, &h_peer, [_]u8{0xF0} ** 32);
+    var i: u32 = 0;
+    while (i < 8) : (i += 1) {
+        var f = try ownedBlock(a, [_]u8{0xAB} ** 32, &.{.{ .coinbase = true, .tag = @truncate(i), .pad = 4096 }});
+        f.header.nonce = i;
+        try queue(&pm, &h_peer, crypto.computeBlockHash(&f.header));
+        try pm.ingestBlockMessage(&h_peer, f);
+    }
+    // Under both caps, but a fork body (~100 bytes) does not fit.
+    if (@hasField(peer_mod.PeerManager, "block_buffer_max_bytes")) pm.block_buffer_max_bytes = pm.block_buffer_bytes + 8;
+
+    try sendHdrs(&pm, a, &x_peer, &.{ &b1x, &b2x, &b3x });
+    try testing.expect(pm.pending_reorg != null);
+    var sent = std.ArrayList(types.Hash256).init(a);
+    defer sent.deinit();
+    try readGetdata(a, fds[1], &sent);
+    try testing.expect(hasHash(sent.items, &b3x.hash));
+
+    // B3x then B2x, out of order: both dropped, and neither re-requested.
+    sent.clearRetainingCapacity();
+    try sendBody(&pm, a, &x_peer, &b3x);
+    try sendBody(&pm, a, &x_peer, &b2x);
+    pm.drainBlockBuffer();
+    pm.drainBlockBuffer();
+    try testing.expect(!pm.block_buffer.contains(b3x.hash));
+    try testing.expect(!pm.block_buffer.contains(b2x.hash));
+    try readGetdata(a, fds[1], &sent);
+    try testing.expect(!hasHash(sent.items, &b3x.hash));
+    try testing.expect(!hasHash(sent.items, &b2x.hash));
+
+    // B1x (next) is admitted; only B2x, now next, is asked for again, once.
+    sent.clearRetainingCapacity();
+    try sendBody(&pm, a, &x_peer, &b1x);
+    pm.drainBlockBuffer();
+    try readGetdata(a, fds[1], &sent);
+    var n_b2x: usize = 0;
+    for (sent.items) |h| {
+        if (std.mem.eql(u8, &h, &b2x.hash)) n_b2x += 1;
+    }
+    try testing.expectEqual(@as(usize, 1), n_b2x);
+    try testing.expect(!hasHash(sent.items, &b3x.hash));
+
+    sent.clearRetainingCapacity();
+    try sendBody(&pm, a, &x_peer, &b2x);
+    try readGetdata(a, fds[1], &sent);
+    try testing.expect(hasHash(sent.items, &b3x.hash));
+    try sendBody(&pm, a, &x_peer, &b3x);
+    try testing.expect(pm.pending_reorg == null);
+    try testing.expectEqual(@as(u32, 4), cs.best_height);
+    try testing.expectEqualSlices(u8, &b3x.hash, &cs.best_hash);
+    for ([_]*const ForkBlock{ &b1x, &b2x, &b3x }) |fb| try testing.expect(!pm.isBlockFailed(&fb.hash));
+    try testing.expect(!x_peer.should_ban);
+    try testing.expect(!h_peer.should_ban);
+}
+
 // --- historical backfill: mutation check before the store --------------------
 
 const BF_FLOOR: u32 = 10;
