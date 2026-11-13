@@ -112,6 +112,12 @@ pub const MAX_HEADER_INDEX: usize = 10_000;
 /// admitted, so the cap cannot wedge the drain.
 pub const BLOCK_BUFFER_MAX_BYTES: u64 = 1 << 30;
 
+/// A pending-reorg fork body asked for this long ago and still missing is
+/// asked for again (from tryFireReorg).  A body that arrives and is dropped
+/// (buffer cap) clears its request at once, so this only paces re-requests
+/// to a peer that has not answered at all.
+pub const REORG_BODY_RETRY_S: i64 = 30;
+
 /// Do not prefetch more headers than the in-memory index can hold minus one
 /// retarget window.  A 16_000 queue with a 10_000 LRU dropped the 2016-block
 /// difficulty ancestor; the next batch then came back `.undecidable` and
@@ -3681,6 +3687,14 @@ pub const PeerManager = struct {
     /// reorgToChain returns.  Only one pending reorg at a time — fork
     /// announcements while one is pending are deferred to the next round.
     pending_reorg: ?PendingReorg,
+    /// Fork bodies of `pending_reorg` asked for and not yet delivered: hash ->
+    /// request time.  Fork bodies are not in `inflight_block_peer` (the IBD
+    /// pipeline never walks them), so without this a fork body dropped by the
+    /// block_buffer cap was never asked for again and the reorg stayed
+    /// pending forever (Warden on clearbit#72).  An entry is removed when any
+    /// copy arrives; a missing body with no live entry is re-requested from
+    /// tryFireReorg.  Cleared when a new reorg is armed.
+    reorg_body_requests: std.AutoHashMapUnmanaged(types.Hash256, i64) = .{},
 
     /// Best-known-header chainwork and timestamp for the faithful assumevalid
     /// script-skip gate (Core ConnectBlock:2346-2366 conditions 4 + 5).
@@ -4108,6 +4122,7 @@ pub const PeerManager = struct {
         self.seen_fork_batches.deinit();
         if (self.pending_reorg) |*pr| pr.deinit();
         self.block_source_peers.deinit();
+        self.reorg_body_requests.deinit(self.allocator);
         self.failed_blocks.deinit();
         self.inflight_block_peer.deinit();
         if (self.asmap_data) |data| self.allocator.free(data);
@@ -7097,12 +7112,80 @@ pub const PeerManager = struct {
     /// :4785-4791).  The witness check needs the segwit context of the
     /// parent; with the parent unknown only the context-free merkle checks
     /// run (Core skips the call entirely there).
-    fn receivedBlockIsMutated(self: *PeerManager, block: *const types.Block) bool {
+    ///
+    /// The segwit context comes from the parent when lookupParentChainWork
+    /// knows it (header index, genesis, active tip), else from the block's
+    /// OWN height in the persisted block index (`height >= segwit_height`).
+    /// The second source covers a historical-backfill body, whose parent is
+    /// only in the block index: without it the witness step was skipped for
+    /// every such body (Warden on clearbit#72).
+    pub fn receivedBlockIsMutated(self: *PeerManager, block: *const types.Block, block_hash: *const types.Hash256) bool {
+        const segwit_height = self.network_params.segwit_height;
         const witness: ?bool = if (self.lookupParentChainWork(&block.header.prev_block)) |parent|
-            parent.height + 1 >= self.network_params.segwit_height
+            parent.height + 1 >= segwit_height
+        else if (self.chain_state) |cs|
+            (if (cs.getBlockHeightByHash(block_hash)) |h| h >= segwit_height else null)
         else
             null;
         return validation.isBlockMutated(block, witness, self.allocator);
+    }
+
+    /// First hash of the pending reorg whose body is not buffered: the one
+    /// the reorg needs next.  The block_buffer cap admits it the way it
+    /// admits the connect-front block, so the cap can never strand a reorg.
+    fn nextMissingReorgBody(self: *const PeerManager) ?types.Hash256 {
+        const pr = self.pending_reorg orelse return null;
+        for (pr.fork_hashes.items) |h| {
+            if (!self.block_buffer.contains(h)) return h;
+        }
+        return null;
+    }
+
+    /// Ask again for missing pending-reorg bodies that have no live request
+    /// (dropped by the buffer cap on arrival, or unanswered for
+    /// REORG_BODY_RETRY_S).  While the buffer is full only the next missing
+    /// body is asked for (it is the only one the cap would admit); with room,
+    /// up to MAX_BLOCKS_IN_TRANSIT_PER_PEER.  Sent to the announcing peer if
+    /// it is still connected, else to any witness-serving peer.
+    fn requestMissingReorgBodies(self: *PeerManager) void {
+        const pr = self.pending_reorg orelse return;
+        var target: ?*Peer = null;
+        for (self.peers.items) |p| {
+            if (p.state != .handshake_complete or !p.canServeWitnesses()) continue;
+            if (pr.source_peer != null and p == pr.source_peer.?) {
+                target = p;
+                break;
+            }
+            if (target == null) target = p;
+        }
+        const tp = target orelse return;
+
+        const now = std.time.timestamp();
+        const has_room = self.block_buffer.count() < 1024 and
+            self.block_buffer_bytes < self.block_buffer_max_bytes;
+        var invs: [MAX_BLOCKS_IN_TRANSIT_PER_PEER]p2p.InvVector = undefined;
+        var n: usize = 0;
+        var first_missing = true;
+        for (pr.fork_hashes.items) |h| {
+            if (n == invs.len) break;
+            if (self.block_buffer.contains(h)) continue;
+            const eligible = first_missing or has_room;
+            first_missing = false;
+            if (!eligible) break;
+            if (self.reorg_body_requests.get(h)) |ts| {
+                if (now - ts < REORG_BODY_RETRY_S) continue;
+            }
+            invs[n] = .{ .inv_type = .msg_witness_block, .hash = h };
+            n += 1;
+        }
+        if (n == 0) return;
+        const getdata = p2p.Message{ .getdata = .{ .inventory = invs[0..n] } };
+        tp.sendMessage(&getdata) catch |err| {
+            std.log.warn("REORG: fork-body re-request send failed: {}", .{err});
+            return;
+        };
+        for (invs[0..n]) |inv| self.reorg_body_requests.put(self.allocator, inv.hash, now) catch {};
+        std.log.info("REORG: re-requested {d} missing fork bod{s}", .{ n, if (n == 1) "y" else "ies" });
     }
 
     fn isPendingReorgHash(self: *const PeerManager, hash: *const types.Hash256) bool {
@@ -7631,7 +7714,10 @@ pub const PeerManager = struct {
         // We send a single getdata containing every fork block hash; the
         // peer is free to dribble them in.  If the peer disconnects we
         // re-issue via pipelineBlockRequests on the next drain.
+        self.reorg_body_requests.clearRetainingCapacity();
         if (owned.items.len > 0) {
+            const now_ts = std.time.timestamp();
+            for (owned.items) |h| self.reorg_body_requests.put(self.allocator, h, now_ts) catch {};
             var inv_list = std.ArrayList(p2p.InvVector).init(self.allocator);
             defer inv_list.deinit();
             for (owned.items) |h| {
@@ -7674,9 +7760,14 @@ pub const PeerManager = struct {
         const pr_ptr = if (self.pending_reorg) |*p| p else return;
         const cs = self.chain_state orelse return;
 
-        // Are all bodies buffered?
+        // Are all bodies buffered?  If not, ask again for any missing body
+        // with no live request (one dropped by the buffer cap is otherwise
+        // never re-requested: the IBD pipeline walks only expected_blocks).
         for (pr_ptr.fork_hashes.items) |h| {
-            if (!self.block_buffer.contains(h)) return; // not yet
+            if (!self.block_buffer.contains(h)) {
+                self.requestMissingReorgBodies();
+                return; // not yet
+            }
         }
 
         // Gate 6 (D1): resolve the fork point's height BEFORE taking the
@@ -8679,6 +8770,19 @@ pub const PeerManager = struct {
                     if (self.historical_backfill) |*bf| {
                         if (self.chain_state) |cs| {
                             if (bf.wantsHash(cs, &block_hash)) {
+                                // Core IsBlockMutated before anything is
+                                // stored (net_processing.cpp:4785-4791).  A
+                                // mutated body is not this header's block:
+                                // punish the sender, keep the hash wanted
+                                // (release the request so it is asked for
+                                // again), never write it, never fail it.
+                                if (self.receivedBlockIsMutated(&block, &block_hash)) {
+                                    std.log.warn("P2P: received mutated historical block from peer={any}", .{peer.address});
+                                    peer.misbehaving(100, "mutated block");
+                                    _ = bf.in_flight.remove(block_hash);
+                                    serialize.freeBlock(self.allocator, &block);
+                                    return;
+                                }
                                 _ = bf.acceptBlock(&block, cs) catch |err| {
                                     std.log.warn("historical backfill: body rejected: {}", .{err});
                                     serialize.freeBlock(self.allocator, &block);
@@ -8729,6 +8833,10 @@ pub const PeerManager = struct {
                     }
                 }
 
+                // Any copy of a fork body answers its request: a body dropped
+                // below (mutated or over the cap) is then asked for again from tryFireReorg.
+                if (reorg_body) _ = self.reorg_body_requests.remove(block_hash);
+
                 // Core IsBlockMutated on receipt (net_processing.cpp:4785):
                 // a body that does not hash to its header's merkle root (or
                 // whose witness is not committed) is not that block. Drop it
@@ -8737,7 +8845,7 @@ pub const PeerManager = struct {
                 // RemoveBlockRequest — the in-flight record was cleared
                 // above). Audit C5: junk ~4 MB bodies for public queued
                 // hashes otherwise sat in the buffer until the connect front.
-                if (self.receivedBlockIsMutated(&block)) {
+                if (self.receivedBlockIsMutated(&block, &block_hash)) {
                     std.log.warn("P2P: received mutated block from peer={any}", .{peer.address});
                     peer.misbehaving(100, "mutated block");
                     if (self.download_cursor > self.connect_cursor) {
@@ -8765,8 +8873,20 @@ pub const PeerManager = struct {
 
                     // If still full, check if this is the critical next block
                     if (self.blockBufferFull(&block_hash, new_bytes)) {
-                        const is_next = self.connect_cursor < self.expected_blocks.items.len and
+                        const is_front = self.connect_cursor < self.expected_blocks.items.len and
                             std.mem.eql(u8, &block_hash, &self.expected_blocks.items[self.connect_cursor]);
+                        // The next body a pending reorg needs is admitted
+                        // like the connect front: refusing it would strand
+                        // the reorg (and, with pending_reorg set, every
+                        // later fork is deferred as already_pending).  Drop
+                        // the reorg's already-active prefix first so "next"
+                        // is a body that can still arrive.
+                        const is_next_reorg = reorg_body and blk: {
+                            self.trimActivePrefixOfPendingReorg();
+                            const nm = self.nextMissingReorgBody() orelse break :blk false;
+                            break :blk std.mem.eql(u8, &nm, &block_hash);
+                        };
+                        const is_next = is_front or is_next_reorg;
                         if (!is_next) {
                             // Rewind download_cursor so pipelineBlockRequests
                             // will re-request this dropped block. The pipeline
