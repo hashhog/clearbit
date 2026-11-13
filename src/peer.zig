@@ -255,6 +255,11 @@ pub const PendingReorg = struct {
     /// PENDING_REORG_TIMEOUT_SECS, or when `armed_at` is older than
     /// pendingReorgLifetimeSecs (so dribbling bodies cannot hold it forever).
     last_progress_at: i64 = 0,
+    /// The competing-fork headers batch that armed this reorg, if any.
+    /// On expiry it is removed from `seen_fork_batches`, so a peer that
+    /// re-sends the same headers (the usual retry) gets the fork judged on
+    /// its work again instead of being dropped as a duplicate batch.
+    batch_key: ?ForkBatchKey = null,
 
     pub fn deinit(self: *PendingReorg) void {
         self.fork_hashes.deinit();
@@ -7269,6 +7274,9 @@ pub const PeerManager = struct {
             }
             _ = self.block_source_peers.remove(fh);
         }
+        // Forget the batch that armed it: re-sent identical headers must be
+        // evaluated again, not dropped by the seen_fork_batches dedupe.
+        if (pr_ptr.batch_key) |k| _ = self.seen_fork_batches.remove(k);
         pr_ptr.deinit();
         self.pending_reorg = null;
         self.pending_reorgs_expired += 1;
@@ -8433,6 +8441,11 @@ pub const PeerManager = struct {
                             .prev = fork_prev,
                             .tip = crypto.computeBlockHash(&hdrs[hdrs.len - 1]),
                         };
+                        // Give up a stale pending reorg BEFORE the dedupe
+                        // below, so re-sending the headers that armed it is
+                        // itself enough to have the fork judged again
+                        // (expiry also drops that batch's key).
+                        _ = self.expireStalePendingReorg(std.time.timestamp());
                         if (self.ignored_fork_roots.contains(fork_prev) or
                             self.seen_fork_batches.contains(batch_key))
                         {
@@ -8505,6 +8518,9 @@ pub const PeerManager = struct {
                             self.last_arm_result = .unresolved;
                         }
                         self.rememberForkBatch(batch_key);
+                        if (self.last_arm_result == .armed) {
+                            if (self.pending_reorg) |*pr| pr.batch_key = batch_key;
+                        }
                         switch (self.last_arm_result) {
                             .refused_too_deep, .no_fork_point, .unresolved => {
                                 self.rememberIgnoredForkRoot(fork_prev);
