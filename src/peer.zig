@@ -3660,6 +3660,8 @@ pub const PeerManager = struct {
     /// Pending reorgs given up after PENDING_REORG_TIMEOUT_SECS without a
     /// fork body (see expireStalePendingReorg).
     pending_reorgs_expired: u64 = 0,
+    /// Pending reorgs replaced by a fork with more work (maybeArmReorg).
+    pending_reorgs_displaced: u64 = 0,
     /// Cap on queued-but-unconnected headers (MAX_UNCONNECTED_HEADERS; a
     /// field so tests can exercise the cap with a few real blocks).
     max_unconnected_headers: usize = MAX_UNCONNECTED_HEADERS,
@@ -7267,20 +7269,31 @@ pub const PeerManager = struct {
             "[REORG] pending fork ({d} block(s)) armed {d}s ago, no new body for {d}s — given up, later forks may arm",
             .{ pr_ptr.fork_hashes.items.len, now - pr_ptr.armed_at, now - pr_ptr.last_progress_at },
         );
-        for (pr_ptr.fork_hashes.items) |fh| {
+        self.dropPendingReorg(&.{});
+        self.pending_reorgs_expired += 1;
+        return true;
+    }
+
+    /// Clear `pending_reorg` without judging the fork: free its buffered
+    /// bodies except those in `keep` (blocks a displacing fork shares with
+    /// it), and forget the headers batch that armed it so re-sent identical
+    /// headers are evaluated again rather than dropped by the
+    /// seen_fork_batches dedupe.  Punishes nobody and marks nothing invalid.
+    fn dropPendingReorg(self: *PeerManager, keep: []const types.Hash256) void {
+        const pr_ptr = if (self.pending_reorg) |*p| p else return;
+        outer: for (pr_ptr.fork_hashes.items) |fh| {
+            for (keep) |k| {
+                if (std.mem.eql(u8, &k, &fh)) continue :outer;
+            }
             if (self.block_buffer.fetchRemove(fh)) |kv| {
                 var b = kv.value;
                 serialize.freeBlock(self.allocator, &b);
             }
             _ = self.block_source_peers.remove(fh);
         }
-        // Forget the batch that armed it: re-sent identical headers must be
-        // evaluated again, not dropped by the seen_fork_batches dedupe.
         if (pr_ptr.batch_key) |k| _ = self.seen_fork_batches.remove(k);
         pr_ptr.deinit();
         self.pending_reorg = null;
-        self.pending_reorgs_expired += 1;
-        return true;
     }
 
     /// Once a header batch has been ingested AND the first header was
@@ -7306,10 +7319,22 @@ pub const PeerManager = struct {
         // A pending reorg whose bodies stopped arriving does not get to block
         // every later fork (security audit 2026-10-29, finding C2).
         _ = self.expireStalePendingReorg(std.time.timestamp());
-        if (self.pending_reorg != null) {
-            // Already arming a reorg — defer this fork until the next round.
-            self.last_arm_result = .already_pending;
-            return;
+        if (self.pending_reorg) |*pr| {
+            // Already arming a reorg.  A fork with strictly MORE work than
+            // the pending one takes the slot (Core always downloads toward
+            // the most-work header chain), but only once it has passed every
+            // check below; the swap happens at the arm point.  Anything else
+            // is deferred.  Without this a withholder could re-send its own
+            // headers right after each expiry and keep a heavier honest fork
+            // out for free; now holding the slot costs real work.
+            const heavier = if (self.header_index.get(fork_tip_hash.*)) |e|
+                cmpChainWorkBE(&e.chain_work, &pr.new_tip_chain_work) > 0
+            else
+                false;
+            if (!heavier) {
+                self.last_arm_result = .already_pending;
+                return;
+            }
         }
         const cs = self.chain_state orelse {
             self.last_arm_result = .skipped;
@@ -7646,6 +7671,13 @@ pub const PeerManager = struct {
             self.last_arm_result = .skipped;
             return;
         };
+        if (self.pending_reorg != null) {
+            // Displaced by this heavier fork (checked at the top).  Bodies
+            // the two forks share stay buffered.
+            std.log.info("[REORG] pending fork displaced by a fork with more work", .{});
+            self.dropPendingReorg(owned.items);
+            self.pending_reorgs_displaced += 1;
+        }
         self.pending_reorg = .{
             .fork_point = fp,
             .fork_hashes = owned,
