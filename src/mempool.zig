@@ -3802,6 +3802,23 @@ pub const Mempool = struct {
         tx: *const types.Transaction,
         spent_scripts: []const []const u8,
     ) MempoolError!void {
+        // Gate 0: BIP54 non-witness sigop limit (Core policy/policy.cpp
+        // CheckSigopsBIP54, the first check in ValidateInputsStandardness).
+        // Per input: scriptSig.GetSigOpCount(true) +
+        // prev.scriptPubKey.GetSigOpCount(scriptSig), i.e. the sigops that run
+        // when THIS tx is validated (P2SH: the redeemScript).  The tx's own
+        // outputs do not count: they run only when a later tx spends them.
+        // Core: "bad-txns-nonstandard-inputs", "non-witness sigops exceed
+        // bip54 limit".
+        var bip54_sigops: u64 = 0;
+        for (tx.inputs, 0..) |input, i| {
+            bip54_sigops += script.getSigOpCount(input.script_sig, true);
+            bip54_sigops += script.getP2SHSigOpCount(spent_scripts[i], input.script_sig);
+            if (bip54_sigops > consensus.MAX_TX_LEGACY_SIGOPS) {
+                return MempoolError.NonStandard;
+            }
+        }
+
         for (tx.inputs, 0..) |input, i| {
             const prevout_script = spent_scripts[i];
             const stype = script.classifyScript(prevout_script);
@@ -4164,20 +4181,10 @@ pub const Mempool = struct {
         //    Reference: Bitcoin Core policy/policy.cpp ValidateInputsStandardness()
         //    line ~254: subscript.GetSigOpCount(true) > MAX_P2SH_SIGOPS.
         //
-        // 2. Per-tx legacy sigop limit (MAX_TX_LEGACY_SIGOPS = 2_500, BIP-54).
-        //    Count accurate scriptSig sigops + output scriptPubKey sigops.
-        //    The spent-output portion of BIP-54 requires UTXO access (done in
-        //    script-validation path); we gate on what's available here.
-        //    Reference: Bitcoin Core policy/policy.cpp CheckSigopsBIP54().
-        {
-            // Legacy sigop count: scriptSig (inaccurate) + outputs (inaccurate).
-            // This mirrors getLegacySigOpCount in validation.zig which uses
-            // inaccurate mode for all scriptSig and output sigops.
-            const legacy_sigops = validation.getLegacySigOpCount(tx);
-            if (legacy_sigops > consensus.MAX_TX_LEGACY_SIGOPS) {
-                return MempoolError.NonStandard;
-            }
-        }
+        // 2. The per-tx BIP54 legacy sigop limit (MAX_TX_LEGACY_SIGOPS = 2_500)
+        //    is NOT checked here: Core's CheckSigopsBIP54 counts the scriptSigs
+        //    and the SPENT scriptPubKeys, never this tx's own outputs, so it
+        //    needs the prevouts.  It runs in validateInputsStandardness.
         for (tx.inputs) |input| {
             // Check if this input has a P2SH-style scriptSig: last push is a
             // redeemScript.  We check any scriptSig that is push-only and
@@ -14564,15 +14571,10 @@ test "checkStandard: P2SH redeemScript with 15 sigops is accepted (= MAX_P2SH_SI
 
 test "checkStandard: MAX_TX_LEGACY_SIGOPS constant and getLegacySigOpCount relationship" {
     // Verify that MAX_TX_LEGACY_SIGOPS constant is 2500 (policy/policy.h:46, BIP-54).
-    // In practice, standard transactions (all output types standard) cannot
-    // reach 2501 legacy sigops without also exceeding MAX_STANDARD_TX_WEIGHT,
-    // but the checkStandard guard is defence-in-depth.
-    //
-    // Note: a non-standard output scriptPubKey is caught first by the per-output
-    // classifyScript check. Standard output types (P2PKH, P2WPKH, P2WSH, P2TR,
-    // P2SH, multisig) have at most 1 sigop each (or 20 for bare multisig inaccurate),
-    // so 2501 sigops from outputs alone requires at least 2501 P2PKH-class outputs,
-    // which would trigger MAX_STANDARD_TX_WEIGHT first. The guard is still correct.
+    // The limit is enforced in validateInputsStandardness over scriptSig +
+    // spent-scriptPubKey sigops (Core CheckSigopsBIP54), not over this tx's
+    // outputs: 126 bare multisig outputs (20 inaccurate sigops each) are
+    // standard.  See src/tests_bip54_sigops.zig.
     try std.testing.expectEqual(@as(u32, 2_500), consensus.MAX_TX_LEGACY_SIGOPS);
 
     // Verify getLegacySigOpCount counts OP_CHECKSIG in outputs (inaccurate mode).
