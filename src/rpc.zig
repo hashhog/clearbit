@@ -9779,56 +9779,12 @@ pub const RpcServer = struct {
         // unbroadcast until a peer requests it (node/transaction.cpp:102).
         self.mempool.addUnbroadcastTx(txid);
 
-        // FIX-73 / W120 BUG-3: when this admission replaced BIP-125 conflicts,
-        // surface the evicted-txids set so wallets watching for confirmation
-        // of replaced txs can detect the replacement directly from the JSON
-        // return. Mirrors Bitcoin Core's `MempoolAcceptResult.m_replaced_transactions`
-        // (validation.h / validation.cpp ~line 1085).
-        //
-        // Shape: Core's `sendrawtransaction` returns just a hex txid string.
-        // We preserve that shape in the common no-replacement path
-        // (backward-compatible for every existing wallet client) and switch
-        // to the object form `{txid, replaces}` only when an RBF replacement
-        // actually happened.
-        if (self.mempool.entries.get(txid)) |entry| {
-            if (entry.replaces) |replaced_set| {
-                if (replaced_set.len > 0) {
-                    self.broadcastTxInv(&txid);
-                    return self.returnTxidWithReplaces(txid, replaced_set, id);
-                }
-            }
-        }
-
+        // Core sendrawtransaction returns the txid hex string for every
+        // accepted tx, replacement or not (rpc/mempool.cpp, RPCResult
+        // STR_HEX).  What a replacement evicted stays on its pool entry
+        // (MempoolEntry.replaces) for submitpackage's replaced-transactions.
         // Transaction accepted - broadcast inv to peers and return txid
         return self.returnTxidAndBroadcast(txid, id);
-    }
-
-    /// FIX-73 / W120 BUG-3: return an object `{"txid":"<hex>","replaces":["<hex>",...]}`
-    /// for the RBF-replacement subset of `sendrawtransaction` admissions.
-    /// Display order: txids reversed (Bitcoin display convention).
-    fn returnTxidWithReplaces(
-        self: *RpcServer,
-        txid: types.Hash256,
-        replaces: []const types.Hash256,
-        id: ?std.json.Value,
-    ) ![]const u8 {
-        var buf = std.ArrayList(u8).init(self.allocator);
-        defer buf.deinit();
-        const writer = buf.writer();
-
-        try writer.writeByte('{');
-        try writer.writeAll("\"txid\":\"");
-        try writeHashHex(writer, &txid);
-        try writer.writeAll("\",\"replaces\":[");
-        for (replaces, 0..) |rtxid, i| {
-            if (i > 0) try writer.writeByte(',');
-            try writer.writeByte('"');
-            try writeHashHex(writer, &rtxid);
-            try writer.writeByte('"');
-        }
-        try writer.writeAll("]}");
-
-        return self.jsonRpcResult(buf.items, id);
     }
 
     /// Check if a transaction is already confirmed in the blockchain.
