@@ -9769,6 +9769,14 @@ pub const RpcServer = struct {
                 mempool_mod.MempoolError.OutOfMemory => self.jsonRpcError(RPC_OUT_OF_MEMORY, "out of memory", id),
                 // Gate 6: not judged (local system fault / latched node).
                 mempool_mod.MempoolError.SystemFault => self.jsonRpcError(RPC_VERIFY_ERROR, "transaction not checked: local system error", id),
+                // Core CheckTxInputs (TX_PREMATURE_SPEND -> MEMPOOL_REJECTED):
+                // the state's ToString, "bad-txns-premature-spend-of-coinbase,
+                // tried to spend coinbase at depth N".
+                mempool_mod.MempoolError.ImmatureCoinbase => {
+                    const details = try self.mempool.immatureCoinbaseDetails(&tx, self.allocator);
+                    defer if (details) |d| self.allocator.free(d);
+                    return self.jsonRpcError(RPC_VERIFY_REJECTED, details orelse "bad-txns-premature-spend-of-coinbase", id);
+                },
                 else => self.jsonRpcError(RPC_VERIFY_REJECTED, "transaction rejected", id),
             };
         };
@@ -15894,6 +15902,16 @@ pub const RpcServer = struct {
                         try writer.writeAll(",\"reject-reason\":\"");
                         try writer.writeAll(reason);
                         try writer.writeByte('"');
+                        // A premature coinbase spend: Core's reject-details is
+                        // CheckTxInputs' ToString, which carries the depth.
+                        if (std.mem.eql(u8, reason, "bad-txns-premature-spend-of-coinbase")) {
+                            if (try self.mempool.immatureCoinbaseDetails(&tx, self.allocator)) |d| {
+                                defer self.allocator.free(d);
+                                try writer.writeAll(",\"reject-details\":\"");
+                                try writer.writeAll(d);
+                                try writer.writeByte('"');
+                            }
+                        }
                         // Core adds reject-details (TxValidationState::ToString)
                         // for every reject except missing-inputs.  ToString is
                         // "<reason>, <debug message>" when Core attaches a debug
