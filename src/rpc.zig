@@ -12110,7 +12110,9 @@ pub const RpcServer = struct {
         // Core rpc/mempool.cpp submitpackage: package_msg is "success" when
         // every tx is in the pool, else the package error ("transaction
         // failed" for per-tx failures).
-        try writer.print("{{\"package_msg\":\"{s}\",\"tx-results\":{{", .{if (result.package_accepted) "success" else "transaction failed"});
+        // A package-level reject (PackageRBFChecks: "too-large-cluster",
+        // "package RBF failed: ...") is reported as itself.
+        try writer.print("{{\"package_msg\":\"{s}\",\"tx-results\":{{", .{if (result.package_accepted) "success" else (result.package_msg orelse "transaction failed")});
 
         // Core groups the txs that needed package evaluation: they share one
         // effective feerate and one effective-includes list.

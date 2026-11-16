@@ -1899,6 +1899,38 @@ pub fn build(b: *std.Build) void {
         test_step.dependOn(&run_mes_tests.step);
     }
 
+    // BIP54 non-witness sigop policy limit counts spent-prevout and scriptSig
+    // sigops, not the tx's own outputs (policy/policy.cpp CheckSigopsBIP54).
+    // Same rig as test-mempool-error-strings; also part of `test`.
+    {
+        const bip54_tests = b.addTest(.{
+            .root_source_file = b.path("tests_bip54_sigops.zig"),
+            .target = target,
+            .optimize = optimize,
+            .filters = &[_][]const u8{"tests_bip54_sigops"},
+        });
+        bip54_tests.linkSystemLibrary("rocksdb");
+        bip54_tests.linkSystemLibrary("secp256k1");
+        bip54_tests.addIncludePath(.{ .cwd_relative = secp256k1_include });
+        bip54_tests.linkLibC();
+        if (target.result.cpu.arch == .x86_64) {
+            bip54_tests.addCSourceFile(.{
+                .file = b.path("src/sha256_shani.c"),
+                .flags = shani_cflags,
+            });
+        }
+        if (minisketch_enabled) {
+            bip54_tests.linkSystemLibrary("minisketch");
+            bip54_tests.addIncludePath(.{ .cwd_relative = minisketch_include });
+        }
+        bip54_tests.root_module.addOptions("build_options", build_options);
+
+        const run_bip54_tests = b.addRunArtifact(bip54_tests);
+        const bip54_step = b.step("test-bip54-sigops", "Run BIP54 sigop policy tests (spent-prevout sigops, package_rbf rows)");
+        bip54_step.dependOn(&run_bip54_tests.step);
+        test_step.dependOn(&run_bip54_tests.step);
+    }
+
     // submitpackage response shape vs Core.  Same rig as test-tma-parity above.
     {
         const sps_tests = b.addTest(.{

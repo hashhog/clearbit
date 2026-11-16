@@ -3802,6 +3802,23 @@ pub const Mempool = struct {
         tx: *const types.Transaction,
         spent_scripts: []const []const u8,
     ) MempoolError!void {
+        // Gate 0: BIP54 non-witness sigop limit (Core policy/policy.cpp
+        // CheckSigopsBIP54, the first check in ValidateInputsStandardness).
+        // Per input: scriptSig.GetSigOpCount(true) +
+        // prev.scriptPubKey.GetSigOpCount(scriptSig), i.e. the sigops that run
+        // when THIS tx is validated (P2SH: the redeemScript).  The tx's own
+        // outputs do not count: they run only when a later tx spends them.
+        // Core: "bad-txns-nonstandard-inputs", "non-witness sigops exceed
+        // bip54 limit".
+        var bip54_sigops: u64 = 0;
+        for (tx.inputs, 0..) |input, i| {
+            bip54_sigops += script.getSigOpCount(input.script_sig, true);
+            bip54_sigops += script.getP2SHSigOpCount(spent_scripts[i], input.script_sig);
+            if (bip54_sigops > consensus.MAX_TX_LEGACY_SIGOPS) {
+                return MempoolError.NonStandard;
+            }
+        }
+
         for (tx.inputs, 0..) |input, i| {
             const prevout_script = spent_scripts[i];
             const stype = script.classifyScript(prevout_script);
@@ -4164,20 +4181,10 @@ pub const Mempool = struct {
         //    Reference: Bitcoin Core policy/policy.cpp ValidateInputsStandardness()
         //    line ~254: subscript.GetSigOpCount(true) > MAX_P2SH_SIGOPS.
         //
-        // 2. Per-tx legacy sigop limit (MAX_TX_LEGACY_SIGOPS = 2_500, BIP-54).
-        //    Count accurate scriptSig sigops + output scriptPubKey sigops.
-        //    The spent-output portion of BIP-54 requires UTXO access (done in
-        //    script-validation path); we gate on what's available here.
-        //    Reference: Bitcoin Core policy/policy.cpp CheckSigopsBIP54().
-        {
-            // Legacy sigop count: scriptSig (inaccurate) + outputs (inaccurate).
-            // This mirrors getLegacySigOpCount in validation.zig which uses
-            // inaccurate mode for all scriptSig and output sigops.
-            const legacy_sigops = validation.getLegacySigOpCount(tx);
-            if (legacy_sigops > consensus.MAX_TX_LEGACY_SIGOPS) {
-                return MempoolError.NonStandard;
-            }
-        }
+        // 2. The per-tx BIP54 legacy sigop limit (MAX_TX_LEGACY_SIGOPS = 2_500)
+        //    is NOT checked here: Core's CheckSigopsBIP54 counts the scriptSigs
+        //    and the SPENT scriptPubKeys, never this tx's own outputs, so it
+        //    needs the prevouts.  It runs in validateInputsStandardness.
         for (tx.inputs) |input| {
             // Check if this input has a P2SH-style scriptSig: last push is a
             // redeemScript.  We check any scriptSig that is push-only and
@@ -11158,6 +11165,10 @@ pub const PackageResult = struct {
     /// `MempoolAcceptResult.m_replaced_transactions`. Empty slice when
     /// no RBF happened. Owned by `allocator`; freed in `deinit`.
     replaced_transactions: []types.Hash256,
+    /// Core's package-level reject reason (PackageValidationState) when it is
+    /// not the generic "transaction failed": e.g. "too-large-cluster" or
+    /// "package RBF failed: ..." from PackageRBFChecks.  Static string.
+    package_msg: ?[]const u8 = null,
     /// Allocator for cleanup.
     allocator: std.mem.Allocator,
 
@@ -11381,6 +11392,301 @@ pub fn getPackageHash(txns: []const types.Transaction, allocator: std.mem.Alloca
     return crypto.sha256(concatenated.items);
 }
 
+/// Core FormatMoney (util/moneystr.cpp): "%d.%08d", then trailing zeros
+/// trimmed while the character two places left is still a digit, so at
+/// least one decimal stays ("0.00006", "1.0").
+fn formatMoney(allocator: std.mem.Allocator, n: i64) ![]u8 {
+    const abs: u64 = @abs(n);
+    var buf: [40]u8 = undefined;
+    const s = try std.fmt.bufPrint(&buf, "{s}{d}.{d:0>8}", .{ if (n < 0) "-" else "", abs / 100_000_000, abs % 100_000_000 });
+    var end = s.len;
+    while (end >= 3 and s[end - 1] == '0' and std.ascii.isDigit(s[end - 3])) end -= 1;
+    return allocator.dupe(u8, s[0..end]);
+}
+
+/// Core CFeeRate(rate_sat_kvb).GetFee(vsize) (policy/feerate.cpp): the fee
+/// for `vsize` rounded UP.  Used only by the package RBF checks below; the
+/// fee estimator and single-tx RBF keep their own (truncating) arithmetic.
+fn feeForVsizeUp(rate_sat_kvb: i64, vsize: u64) i64 {
+    const v: i64 = @intCast(vsize);
+    return @divFloor(rate_sat_kvb * v + 999, 1000);
+}
+
+/// Core policy/rbf.cpp PaysForRBF: null when the replacement pays for the
+/// fees it evicts and for its own relay, else Core's debug message.
+fn paysForRbfMessage(
+    allocator: std.mem.Allocator,
+    original_fees: i64,
+    replacement_fees: i64,
+    replacement_vsize: u64,
+    txid: types.Hash256,
+) !?[]u8 {
+    var disp = txid;
+    std.mem.reverse(u8, &disp);
+    if (replacement_fees < original_fees) {
+        const a = try formatMoney(allocator, replacement_fees);
+        defer allocator.free(a);
+        const b = try formatMoney(allocator, original_fees);
+        defer allocator.free(b);
+        return try std.fmt.allocPrint(allocator, "rejecting replacement {s}, less fees than conflicting txs; {s} < {s}", .{ std.fmt.fmtSliceHexLower(&disp), a, b });
+    }
+    const additional = replacement_fees - original_fees;
+    const relay = feeForVsizeUp(INCREMENTAL_RELAY_FEE, replacement_vsize);
+    if (additional < relay) {
+        const a = try formatMoney(allocator, additional);
+        defer allocator.free(a);
+        const b = try formatMoney(allocator, relay);
+        defer allocator.free(b);
+        return try std.fmt.allocPrint(allocator, "rejecting replacement {s}, not enough additional fees to relay; {s} < {s}", .{ std.fmt.fmtSliceHexLower(&disp), a, b });
+    }
+    return null;
+}
+
+/// The pool entries a replacement would evict: the direct conflicts of every
+/// tx in `txs` and all their descendants (Core GetEntriesForConflicts), with
+/// their summed modified fees and vsize.  `direct` receives the direct
+/// conflicts.  Caller holds the pool lock.
+fn collectConflicts(
+    mempool: *Mempool,
+    txs: []const types.Transaction,
+    direct: *std.ArrayList(types.Hash256),
+    all: *std.ArrayList(types.Hash256),
+) !struct { fees: i64, vsize: u64 } {
+    var seen = std.AutoHashMap(types.Hash256, void).init(mempool.allocator);
+    defer seen.deinit();
+    var fees: i64 = 0;
+    var vsize: u64 = 0;
+    for (txs) |*tx| {
+        for (tx.inputs) |input| {
+            const c = mempool.spenders.get(input.previous_output) orelse continue;
+            var dup = false;
+            for (direct.items) |d| {
+                if (std.mem.eql(u8, &d, &c)) dup = true;
+            }
+            if (!dup) try direct.append(c);
+        }
+    }
+    for (direct.items) |c| {
+        const descs = mempool.getDescendantTxids(c);
+        defer mempool.allocator.free(descs);
+        var walk = std.ArrayList(types.Hash256).init(mempool.allocator);
+        defer walk.deinit();
+        try walk.append(c);
+        try walk.appendSlice(descs);
+        for (walk.items) |t| {
+            if (seen.contains(t)) continue;
+            const e = mempool.entries.get(t) orelse continue;
+            try seen.put(t, {});
+            try all.append(t);
+            fees += mempool.getModifiedFee(e);
+            vsize += @intCast(e.vsize);
+        }
+    }
+    return .{ .fees = fees, .vsize = vsize };
+}
+
+/// Sigop-adjusted vsize of package tx `i` (Core ws.m_vsize =
+/// GetVirtualTransactionSize(weight, sigop_cost, bytes_per_sigop)), running
+/// its script checks against the pool plus `txns[0..i]`.  Caller holds the
+/// pool lock.
+const PkgTxSize = struct { vsize: u64, cluster_weight: u64 };
+
+fn packageTxVsize(mempool: *Mempool, txns: []const types.Transaction, txids: []const types.Hash256, i: usize, fail: *?ScriptFailure) MempoolError!PkgTxSize {
+    mempool.test_package_view = txns[0..i];
+    mempool.test_package_txids = txids[0..i];
+    defer {
+        mempool.test_package_view = &.{};
+        mempool.test_package_txids = &.{};
+    }
+    const sigop_cost = try mempool.verifyInputScriptsDetailed(&txns[i], fail);
+    const weight = computeTxWeight(&txns[i], mempool.allocator) catch return MempoolError.OutOfMemory;
+    const cw = clusterWeightContribution(@intCast(weight), sigop_cost);
+    return .{ .vsize = (cw + 3) / 4, .cluster_weight = cw };
+}
+
+/// Standardness, dust and script checks of package tx `i` (against the pool
+/// plus `txns[0..i]`), then its sigop-adjusted size.
+fn packageTxPrechecks(mempool: *Mempool, txns: []const types.Transaction, txids: []const types.Hash256, i: usize, fail: *?ScriptFailure) MempoolError!PkgTxSize {
+    try mempool.checkStandard(&txns[i]);
+    for (txns[i].outputs) |*o| {
+        if (Mempool.isDust(o)) return MempoolError.DustOutput;
+    }
+    return packageTxVsize(mempool, txns, txids, i, fail);
+}
+
+const PackageRbfVerdict = union(enum) {
+    /// Both txs are in the pool; the evicted txids, Core's order (setEntries:
+    /// ascending by txid bytes).  Owned by the caller's allocator.
+    accepted: []types.Hash256,
+    /// Package-level reject reason (static); the pool is unchanged.
+    rejected: []const u8,
+};
+
+/// Core validation.cpp PackageRBFChecks, for a 1-parent-1-child package whose
+/// txs failed alone because the parent could not pay for its replacement
+/// (TX_RECONSIDERABLE) and the child's parent was then missing.  The
+/// replacement is judged with the package's fees and sigop-adjusted vsize;
+/// on success the conflicts and their descendants are evicted and both txs
+/// admitted, on any failure the pool is left as it was.
+fn packageRbf(
+    mempool: *Mempool,
+    txns: []const types.Transaction,
+    tx_results: []PackageTxResult,
+    allocator: std.mem.Allocator,
+) PackageError!PackageRbfVerdict {
+    std.debug.assert(txns.len == 2);
+    mempool.lockChainThenPool();
+    defer mempool.unlockPoolThenChain();
+
+    const txids = [2]types.Hash256{ tx_results[0].txid, tx_results[1].txid };
+
+    // "If the package has in-mempool parents, we won't consider a package RBF".
+    for (txns, 0..) |*tx, i| {
+        for (tx.inputs) |input| {
+            if (i == 1 and std.mem.eql(u8, &input.previous_output.hash, &txids[0])) continue;
+            if (mempool.entries.contains(input.previous_output.hash))
+                return .{ .rejected = "package RBF failed: new transaction cannot have mempool ancestors" };
+        }
+    }
+
+    // The child's PreChecks never ran (its parent was missing): standardness,
+    // dust and scripts for both, against the pool plus the parent.  A failure
+    // is that tx's own error, as Core's AcceptMultipleTransactions reports it.
+    var vs: [2]u64 = undefined;
+    var cw: [2]u64 = undefined;
+    for (txns, 0..) |*tx, i| {
+        var fail: ?ScriptFailure = null;
+        const v = packageTxPrechecks(mempool, txns, &txids, i, &fail) catch |err| {
+            if (err == MempoolError.OutOfMemory) return PackageError.OutOfMemory;
+            if (tx_results[i].error_message_owned) if (tx_results[i].error_message) |m| allocator.free(m);
+            tx_results[i].error_message_owned = false;
+            tx_results[i].error_message = rejectReasonForError(err);
+            if (err == MempoolError.ScriptVerifyFailed) {
+                if (fail) |f| {
+                    tx_results[i].error_message = f.details(allocator, tx) catch return PackageError.OutOfMemory;
+                    tx_results[i].error_message_owned = true;
+                }
+            }
+            return .{ .rejected = "transaction failed" };
+        };
+        vs[i] = v.vsize;
+        cw[i] = v.cluster_weight;
+    }
+
+    const fees = [2]i64{
+        tx_results[0].fee + mempool.applyDelta(txids[0]),
+        tx_results[1].fee + mempool.applyDelta(txids[1]),
+    };
+    const total_fee = fees[0] + fees[1];
+    const total_vsize = vs[0] + vs[1];
+
+    // Package feerate must meet the pool minimum (Core CheckFeeRate with
+    // m_package_feerates, before PackageRBFChecks).
+    if (total_fee * 1000 < @as(i64, @intCast(mempool.getMinFee())) * @as(i64, @intCast(total_vsize)))
+        return .{ .rejected = "transaction failed" };
+
+    var direct = std.ArrayList(types.Hash256).init(allocator);
+    defer direct.deinit();
+    var all = std.ArrayList(types.Hash256).init(allocator);
+    defer all.deinit();
+    const conflicts = collectConflicts(mempool, txns, &direct, &all) catch return PackageError.OutOfMemory;
+    if (direct.items.len == 0) return .{ .rejected = "transaction failed" };
+
+    // clearbit's BIP125 opt-in gate (checkRBFRules Gate 1), kept so package
+    // and single replacement agree; off under -mempoolfullrbf.
+    if (!mempool.full_rbf) {
+        for (direct.items) |c| {
+            if (mempool.entries.get(c)) |e| if (!e.is_rbf) return .{ .rejected = "transaction failed" };
+        }
+    }
+
+    // Rule 5, not raised for packages: distinct conflicting clusters.
+    const n_clusters = mempool.conflictingClusterCount(direct.items) catch return PackageError.OutOfMemory;
+    if (n_clusters > MAX_REPLACEMENT_EVICTIONS)
+        return .{ .rejected = "package RBF failed: too many potential replacements" };
+
+    // PaysForRBF on the package's fees and size, attributed to the child.
+    if (paysForRbfMessage(allocator, conflicts.fees, total_fee, total_vsize, txids[1]) catch return PackageError.OutOfMemory) |m| {
+        allocator.free(m);
+        return .{ .rejected = "package RBF failed: insufficient anti-DoS fees" };
+    }
+
+    // The package must be a chunk of its own: package feerate > parent feerate.
+    if (@as(i128, total_fee) * vs[0] <= @as(i128, fees[0]) * total_vsize)
+        return .{ .rejected = "package RBF failed: package feerate is less than or equal to parent feerate" };
+
+    // CheckMemPoolPolicyLimits on the staged changeset: no mempool ancestors
+    // and every conflict staged for removal, so the new cluster is the two
+    // package txs alone, sized by sigop-adjusted weight.
+    if (2 > MAX_CLUSTER_SIZE or cw[0] + cw[1] > MAX_CLUSTER_WEIGHT)
+        return .{ .rejected = "too-large-cluster" };
+
+    // ImprovesFeerateDiagram, the same single-chunk comparison checkRBFRules
+    // makes: evicted set vs package.
+    {
+        const old_d = buildSingleChunkDiagram(allocator, conflicts.fees, conflicts.vsize) catch return PackageError.OutOfMemory;
+        defer allocator.free(old_d);
+        const new_d = buildSingleChunkDiagram(allocator, total_fee, total_vsize) catch return PackageError.OutOfMemory;
+        defer allocator.free(new_d);
+        if (compareFeeDiagrams(new_d, old_d) != .gt)
+            return .{ .rejected = "package RBF failed: insufficient feerate: does not improve feerate diagram" };
+    }
+
+    // Commit: evict, then admit parent and child.  Keep the evicted txs
+    // (parents first) so an unexpected admission failure can put them back.
+    var saved = std.ArrayList(*MempoolEntry).init(allocator);
+    defer saved.deinit();
+    for (all.items) |t| if (mempool.entries.get(t)) |e| saved.append(e) catch return PackageError.OutOfMemory;
+    std.mem.sort(*MempoolEntry, saved.items, {}, struct {
+        fn lt(_: void, a: *MempoolEntry, b: *MempoolEntry) bool {
+            return a.ancestor_count < b.ancestor_count;
+        }
+    }.lt);
+    var saved_txs = std.ArrayList(types.Transaction).init(allocator);
+    defer saved_txs.deinit();
+    for (saved.items) |e| saved_txs.append(e.tx) catch return PackageError.OutOfMemory;
+
+    for (direct.items) |c| mempool.removeTransactionWithDescendants(c);
+
+    const pkg_rate: f64 = @as(f64, @floatFromInt(total_fee)) / @as(f64, @floatFromInt(total_vsize));
+    var admitted: usize = 0;
+    for (txns) |tx| {
+        var fail: ?ScriptFailure = null;
+        mempool.addTransactionWithPackageRateDetailed(tx, pkg_rate, &fail) catch |err| {
+            if (admitted > 0) mempool.removeTransactionWithDescendants(txids[0]);
+            const prev_bypass = mempool.bypass_limits;
+            mempool.bypass_limits = true;
+            defer mempool.bypass_limits = prev_bypass;
+            for (saved_txs.items) |stx| mempool.addTransaction(stx) catch {};
+            if (err == MempoolError.OutOfMemory) return PackageError.OutOfMemory;
+            if (tx_results[admitted].error_message_owned) if (tx_results[admitted].error_message) |m| allocator.free(m);
+            tx_results[admitted].error_message_owned = false;
+            tx_results[admitted].error_message = rejectReasonForError(err);
+            return .{ .rejected = "transaction failed" };
+        };
+        admitted += 1;
+    }
+
+    for (tx_results, 0..) |*r, i| {
+        if (r.error_message_owned) if (r.error_message) |m| allocator.free(m);
+        r.error_message_owned = false;
+        r.error_message = null;
+        r.accepted = true;
+        r.fee = fees[i] - mempool.applyDelta(txids[i]);
+        r.vsize = @intCast(vs[i]);
+        r.effective_fee_rate = pkg_rate;
+        r.package_eval = true;
+    }
+
+    const replaced = allocator.dupe(types.Hash256, all.items) catch return PackageError.OutOfMemory;
+    std.mem.sort(types.Hash256, replaced, {}, struct {
+        fn lt(_: void, a: types.Hash256, b: types.Hash256) bool {
+            return std.mem.order(u8, &a, &b) == .lt;
+        }
+    }.lt);
+    return .{ .accepted = replaced };
+}
+
 /// Accept a package of transactions into the mempool.
 /// This function validates the package as a unit, allowing CPFP:
 /// - Individual transactions may have fee rates below minimum
@@ -11544,6 +11850,10 @@ pub fn acceptPackage(
         if (r.error_message_owned) if (r.error_message) |m| allocator.free(m);
     };
     var all_accepted = true;
+    // Each tx's own error, for the package RBF decision below.
+    const tx_errs = allocator.alloc(?MempoolError, txns.len) catch return PackageError.OutOfMemory;
+    defer allocator.free(tx_errs);
+    @memset(tx_errs, null);
     for (txns, 0..) |tx, i| {
         if (already_in_mempool.contains(tx_results[i].txid)) {
             continue; // Already in mempool
@@ -11604,7 +11914,36 @@ pub fn acceptPackage(
                     tx_results[i].error_message_owned = true;
                 }
             }
+            // Core: "insufficient fee, <PaysForRBF message>" (ReplacementChecks,
+            // TxValidationState::ToString), with the tx's sigop-adjusted vsize.
+            if (err == MempoolError.ReplacementFeeTooLow) {
+                if (try rbfFeeErrorMessage(mempool, txns, tx_results, i, allocator)) |m| {
+                    tx_results[i].error_message = m;
+                    tx_results[i].error_message_owned = true;
+                }
+            }
+            tx_errs[i] = err;
             all_accepted = false;
+        }
+    }
+
+    // Core AcceptPackage: a parent that failed alone only because it cannot
+    // pay for its replacement (TX_RECONSIDERABLE), and a child whose parent
+    // is therefore missing, are evaluated together; with conflicts, that is
+    // PackageRBFChecks (validation.cpp).
+    var package_msg: ?[]const u8 = null;
+    var pkg_rbf_replaced: []types.Hash256 = &.{};
+    defer if (pkg_rbf_replaced.len > 0) allocator.free(pkg_rbf_replaced);
+    if (!all_accepted and txns.len == 2 and already_in_mempool.count() == 0 and
+        tx_errs[0] != null and isRbfReconsiderable(tx_errs[0].?) and
+        tx_errs[1] != null and (tx_errs[1].? == MempoolError.MissingInputs or isRbfReconsiderable(tx_errs[1].?)))
+    {
+        switch (try packageRbf(mempool, txns, tx_results, allocator)) {
+            .accepted => |replaced| {
+                all_accepted = true;
+                pkg_rbf_replaced = replaced;
+            },
+            .rejected => |msg| package_msg = msg,
         }
     }
 
@@ -11648,6 +11987,11 @@ pub fn acceptPackage(
             replaced_union.append(txid) catch return PackageError.OutOfMemory;
         }
     }
+    for (pkg_rbf_replaced) |txid| {
+        if (replaced_seen.contains(txid)) continue;
+        replaced_seen.put(txid, {}) catch return PackageError.OutOfMemory;
+        replaced_union.append(txid) catch return PackageError.OutOfMemory;
+    }
     const replaced_owned = replaced_union.toOwnedSlice() catch return PackageError.OutOfMemory;
 
     return PackageResult{
@@ -11658,8 +12002,45 @@ pub fn acceptPackage(
         .total_vsize = total_vsize,
         .package_fee_rate = package_fee_rate,
         .replaced_transactions = replaced_owned,
+        .package_msg = if (all_accepted) null else package_msg,
         .allocator = allocator,
     };
+}
+
+/// Core TX_RECONSIDERABLE replacement failures: the fee-only RBF rejects that
+/// "may change in a package context" (validation.cpp ReplacementChecks).
+fn isRbfReconsiderable(err: MempoolError) bool {
+    return err == MempoolError.ReplacementFeeTooLow or err == MempoolError.DiagramNotImproved;
+}
+
+/// "insufficient fee, <PaysForRBF message>" for package tx `i` judged alone,
+/// or null when the recomputed rules pass (the reject came from elsewhere).
+fn rbfFeeErrorMessage(
+    mempool: *Mempool,
+    txns: []const types.Transaction,
+    tx_results: []const PackageTxResult,
+    i: usize,
+    allocator: std.mem.Allocator,
+) PackageError!?[]u8 {
+    mempool.lockChainThenPool();
+    defer mempool.unlockPoolThenChain();
+    const txids = allocator.alloc(types.Hash256, txns.len) catch return PackageError.OutOfMemory;
+    defer allocator.free(txids);
+    for (tx_results, 0..) |r, j| txids[j] = r.txid;
+    var fail: ?ScriptFailure = null;
+    const v = packageTxVsize(mempool, txns, txids, i, &fail) catch |err| {
+        if (err == MempoolError.OutOfMemory) return PackageError.OutOfMemory;
+        return null;
+    };
+    var direct = std.ArrayList(types.Hash256).init(allocator);
+    defer direct.deinit();
+    var all = std.ArrayList(types.Hash256).init(allocator);
+    defer all.deinit();
+    const c = collectConflicts(mempool, txns[i .. i + 1], &direct, &all) catch return PackageError.OutOfMemory;
+    const fee = tx_results[i].fee + mempool.applyDelta(txids[i]);
+    const msg = (paysForRbfMessage(allocator, c.fees, fee, v.vsize, txids[i]) catch return PackageError.OutOfMemory) orelse return null;
+    defer allocator.free(msg);
+    return std.fmt.allocPrint(allocator, "insufficient fee, {s}", .{msg}) catch return PackageError.OutOfMemory;
 }
 
 // ============================================================================
@@ -14564,15 +14945,10 @@ test "checkStandard: P2SH redeemScript with 15 sigops is accepted (= MAX_P2SH_SI
 
 test "checkStandard: MAX_TX_LEGACY_SIGOPS constant and getLegacySigOpCount relationship" {
     // Verify that MAX_TX_LEGACY_SIGOPS constant is 2500 (policy/policy.h:46, BIP-54).
-    // In practice, standard transactions (all output types standard) cannot
-    // reach 2501 legacy sigops without also exceeding MAX_STANDARD_TX_WEIGHT,
-    // but the checkStandard guard is defence-in-depth.
-    //
-    // Note: a non-standard output scriptPubKey is caught first by the per-output
-    // classifyScript check. Standard output types (P2PKH, P2WPKH, P2WSH, P2TR,
-    // P2SH, multisig) have at most 1 sigop each (or 20 for bare multisig inaccurate),
-    // so 2501 sigops from outputs alone requires at least 2501 P2PKH-class outputs,
-    // which would trigger MAX_STANDARD_TX_WEIGHT first. The guard is still correct.
+    // The limit is enforced in validateInputsStandardness over scriptSig +
+    // spent-scriptPubKey sigops (Core CheckSigopsBIP54), not over this tx's
+    // outputs: 126 bare multisig outputs (20 inaccurate sigops each) are
+    // standard.  See src/tests_bip54_sigops.zig.
     try std.testing.expectEqual(@as(u32, 2_500), consensus.MAX_TX_LEGACY_SIGOPS);
 
     // Verify getLegacySigOpCount counts OP_CHECKSIG in outputs (inaccurate mode).
