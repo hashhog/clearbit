@@ -1989,6 +1989,38 @@ pub fn build(b: *std.Build) void {
         sre_step.dependOn(&run_sre_tests.step);
     }
 
+    // Premature coinbase spend: Core's "tried to spend coinbase at depth N"
+    // in testmempoolaccept reject-details and the sendrawtransaction message.
+    // Same rig as test-mempool-error-strings; also part of `test`.
+    {
+        const mrd_tests = b.addTest(.{
+            .root_source_file = b.path("tests_maturity_reject_details.zig"),
+            .target = target,
+            .optimize = optimize,
+            .filters = &[_][]const u8{"tests_maturity_reject_details"},
+        });
+        mrd_tests.linkSystemLibrary("rocksdb");
+        mrd_tests.linkSystemLibrary("secp256k1");
+        mrd_tests.addIncludePath(.{ .cwd_relative = secp256k1_include });
+        mrd_tests.linkLibC();
+        if (target.result.cpu.arch == .x86_64) {
+            mrd_tests.addCSourceFile(.{
+                .file = b.path("src/sha256_shani.c"),
+                .flags = shani_cflags,
+            });
+        }
+        if (minisketch_enabled) {
+            mrd_tests.linkSystemLibrary("minisketch");
+            mrd_tests.addIncludePath(.{ .cwd_relative = minisketch_include });
+        }
+        mrd_tests.root_module.addOptions("build_options", build_options);
+
+        const run_mrd_tests = b.addRunArtifact(mrd_tests);
+        const mrd_step = b.step("test-maturity-reject-details", "Run premature coinbase spend reject-details tests (depth message)");
+        mrd_step.dependOn(&run_mrd_tests.step);
+        test_step.dependOn(&run_mrd_tests.step);
+    }
+
     // setmocktime suite: regtest-only clock override RPC.
     {
         const mocktime_tests = b.addTest(.{
