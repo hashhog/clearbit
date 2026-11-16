@@ -1867,6 +1867,37 @@ pub fn build(b: *std.Build) void {
         test_step.dependOn(&run_tmp_tests.step);
     }
 
+    // sendrawtransaction of a replacement returns the txid string (Core
+    // rpc/mempool.cpp).  Same rig as test-tma-package; also part of `test`.
+    {
+        const srt_tests = b.addTest(.{
+            .root_source_file = b.path("tests_sendrawtx_replacement_txid.zig"),
+            .target = target,
+            .optimize = optimize,
+            .filters = &[_][]const u8{"tests_sendrawtx_replacement_txid"},
+        });
+        srt_tests.linkSystemLibrary("rocksdb");
+        srt_tests.linkSystemLibrary("secp256k1");
+        srt_tests.addIncludePath(.{ .cwd_relative = secp256k1_include });
+        srt_tests.linkLibC();
+        if (target.result.cpu.arch == .x86_64) {
+            srt_tests.addCSourceFile(.{
+                .file = b.path("src/sha256_shani.c"),
+                .flags = shani_cflags,
+            });
+        }
+        if (minisketch_enabled) {
+            srt_tests.linkSystemLibrary("minisketch");
+            srt_tests.addIncludePath(.{ .cwd_relative = minisketch_include });
+        }
+        srt_tests.root_module.addOptions("build_options", build_options);
+
+        const run_srt_tests = b.addRunArtifact(srt_tests);
+        const srt_step = b.step("test-sendrawtx-replacement-txid", "Run sendrawtransaction replacement result tests (txid string)");
+        srt_step.dependOn(&run_srt_tests.step);
+        test_step.dependOn(&run_srt_tests.step);
+    }
+
     // Core's script-check and per-tx error strings in package results
     // (testmempoolaccept multi-tx, submitpackage).  Same rig as
     // test-tma-parity; also part of `test`.
