@@ -9758,8 +9758,10 @@ pub const RpcServer = struct {
                 // fee". Keep the bare token so it normalizes identically to the
                 // testmempoolaccept reject-reason and matches Core's category.
                 mempool_mod.MempoolError.ReplacementFeeTooLow => self.jsonRpcError(RPC_VERIFY_REJECTED, "insufficient fee", id),
-                // BIP-125 Rule 8 (ImprovesFeerateDiagram): also an insufficient-fee category reject.
-                mempool_mod.MempoolError.DiagramNotImproved => self.jsonRpcError(RPC_VERIFY_REJECTED, "insufficient fee", id),
+                // ImprovesFeerateDiagram: Core's message is the state's
+                // ToString, "replacement-failed, insufficient feerate: does
+                // not improve feerate diagram" (validation.cpp ReplacementChecks).
+                mempool_mod.MempoolError.DiagramNotImproved => self.jsonRpcError(RPC_VERIFY_REJECTED, mempool_mod.DIAGRAM_REJECT_DETAILS, id),
                 // BIP-125 Rule 2 (EntriesAndTxidsDisjoint): replacement adds a new unconfirmed input.
                 mempool_mod.MempoolError.ReplacementSpendsConflicting => self.jsonRpcError(RPC_VERIFY_REJECTED, "replacement-adds-unconfirmed", id),
                 mempool_mod.MempoolError.TooManyEvictions => self.jsonRpcError(RPC_VERIFY_REJECTED, "too many potential replacements", id),
@@ -15904,6 +15906,11 @@ pub const RpcServer = struct {
                         if (rejectDetailsEqualReason(reason)) {
                             try writer.writeAll(",\"reject-details\":\"");
                             try writer.writeAll(reason);
+                            try writer.writeByte('"');
+                        } else if (std.mem.eql(u8, reason, mempool_mod.DIAGRAM_REJECT_REASON)) {
+                            // ImprovesFeerateDiagram's constant debug message.
+                            try writer.writeAll(",\"reject-details\":\"");
+                            try writer.writeAll(mempool_mod.DIAGRAM_REJECT_DETAILS);
                             try writer.writeByte('"');
                         }
                     }

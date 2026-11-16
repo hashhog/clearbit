@@ -1931,6 +1931,37 @@ pub fn build(b: *std.Build) void {
         test_step.dependOn(&run_bip54_tests.step);
     }
 
+    // RBF feerate-diagram reject reason vs Core (replacement-failed).
+    // Same rig as test-mempool-error-strings; also part of `test`.
+    {
+        const rdr_tests = b.addTest(.{
+            .root_source_file = b.path("tests_rbf_diagram_reason.zig"),
+            .target = target,
+            .optimize = optimize,
+            .filters = &[_][]const u8{"tests_rbf_diagram_reason"},
+        });
+        rdr_tests.linkSystemLibrary("rocksdb");
+        rdr_tests.linkSystemLibrary("secp256k1");
+        rdr_tests.addIncludePath(.{ .cwd_relative = secp256k1_include });
+        rdr_tests.linkLibC();
+        if (target.result.cpu.arch == .x86_64) {
+            rdr_tests.addCSourceFile(.{
+                .file = b.path("src/sha256_shani.c"),
+                .flags = shani_cflags,
+            });
+        }
+        if (minisketch_enabled) {
+            rdr_tests.linkSystemLibrary("minisketch");
+            rdr_tests.addIncludePath(.{ .cwd_relative = minisketch_include });
+        }
+        rdr_tests.root_module.addOptions("build_options", build_options);
+
+        const run_rdr_tests = b.addRunArtifact(rdr_tests);
+        const rdr_step = b.step("test-rbf-diagram-reason", "Run RBF feerate-diagram reject reason tests (replacement-failed)");
+        rdr_step.dependOn(&run_rdr_tests.step);
+        test_step.dependOn(&run_rdr_tests.step);
+    }
+
     // submitpackage response shape vs Core.  Same rig as test-tma-parity above.
     {
         const sps_tests = b.addTest(.{

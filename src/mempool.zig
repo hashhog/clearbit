@@ -389,10 +389,22 @@ pub const MempoolError = error{
     WitnessStripped,
     /// RBF Gate 8 (ImprovesFeerateDiagram, Core 28.0+): the replacement
     /// does not strictly improve the mempool feerate diagram.
-    /// Core reject code: "insufficient feerate: does not improve feerate diagram"
-    /// (policy/rbf.cpp::ImprovesFeerateDiagram).
+    /// Core: state.Invalid(TX_RECONSIDERABLE, "replacement-failed",
+    /// "insufficient feerate: does not improve feerate diagram")
+    /// (validation.cpp ReplacementChecks, policy/rbf.cpp::ImprovesFeerateDiagram).
+    /// See DIAGRAM_REJECT_REASON / DIAGRAM_REJECT_DETAILS.
     DiagramNotImproved,
 };
+
+/// Core's reject reason for a replacement that does not improve the feerate
+/// diagram (validation.cpp ReplacementChecks: TX_RECONSIDERABLE,
+/// "replacement-failed").
+pub const DIAGRAM_REJECT_REASON = "replacement-failed";
+/// Core's TxValidationState::ToString for that reject: the reason, then
+/// ImprovesFeerateDiagram's FAILURE message (policy/rbf.cpp).  The message is
+/// constant, so this is exact.  testmempoolaccept reports it as
+/// reject-details; sendrawtransaction as the error message.
+pub const DIAGRAM_REJECT_DETAILS = DIAGRAM_REJECT_REASON ++ ", insufficient feerate: does not improve feerate diagram";
 
 /// Map a `validation.checkTransactionSanity` ValidationError to the specific
 /// MempoolError variant that carries its exact Core reject token.
@@ -447,6 +459,7 @@ fn rejectReasonForError(err: MempoolError) []const u8 {
         MempoolError.ReplacementFeeTooLow => "insufficient fee",
         MempoolError.ReplacementSpendsConflicting => "replacement-adds-unconfirmed",
         MempoolError.TooManyEvictions => "too many potential replacements",
+        MempoolError.DiagramNotImproved => DIAGRAM_REJECT_REASON,
         MempoolError.MempoolFull => "mempool full",
         MempoolError.NonStandard => "non-standard",
         MempoolError.NonStandardVersion => "version",
@@ -2040,7 +2053,7 @@ pub const Mempool = struct {
                     MempoolError.ReplacementFeeTooLow => "insufficient fee",
                     MempoolError.ReplacementSpendsConflicting => "replacement-adds-unconfirmed",
                     MempoolError.TooManyEvictions => "too many potential replacements",
-                    MempoolError.DiagramNotImproved => "insufficient fee",
+                    MempoolError.DiagramNotImproved => DIAGRAM_REJECT_REASON,
                     MempoolError.ReplacementDisallowed => "bip125-replacement-disallowed",
                     // Input-existence + finality gates (added to checkTestAcceptPolicy
                     // to match Core PreChecks). testmempoolaccept reports these with
