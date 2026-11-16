@@ -344,8 +344,9 @@ test "w120 G12: replacement-feerate — no helper exported (PARTIAL)" {
 // (direct conflicts ∪ all descendants) on `MempoolEntry.replaces` at
 // admission. The new-tx entry is then queryable for its `replaces` slice
 // from any RPC handler. `sendrawtransaction` reads the field and either:
-//   - returns the bare hex txid string (Core-compat) when no RBF happened,
-//   - returns `{"txid":"<hex>","replaces":["<hex>",...]}` when RBF did.
+//   - returned the bare hex txid string (Core-compat) when no RBF happened,
+//   - returned `{"txid":"<hex>","replaces":["<hex>",...]}` when RBF did
+//     (since removed: Core returns the txid string in both cases).
 
 // BUG-3 (MEDIUM) FIXED in FIX-73 (W120 follow-up):
 // sendrawtransaction now surfaces the evicted-txids array on the RBF
@@ -711,7 +712,8 @@ test "w120 G17: error codes — all four BIP-125 variants exist in enum" {
 //
 // FIX-73 wired the `replaces` field on three RPC paths:
 //   - `sendrawtransaction`: object form `{"txid":"<hex>","replaces":[...]}`
-//     when RBF replacement happened; bare hex string otherwise (Core-compat).
+//     when RBF replacement happened (since removed: Core returns the bare
+//     txid string in every case).
 //   - `submitpackage`: `replaced-transactions:[...]` top-level array, union
 //     across every admitted package tx; was previously hardcoded `[]`.
 //   - `getmempoolentry`: `replaces:[...]` array of the txids THIS entry
@@ -734,16 +736,15 @@ test "w120 G18 (FIX-73): getmempoolentry handler no longer emits replaces array"
     try testing.expect(std.mem.indexOf(u8, src, emit_marker) == null);
 }
 
-test "w120 G18 (FIX-73): sendrawtransaction emits replaces on RBF replacement" {
-    // Source-level guard. The handler now switches to object-form return on
-    // RBF replacement via `returnTxidWithReplaces`. Pin the new helper +
-    // call site so a future revert that strips replacement-aware output
-    // fails FIRST.
+test "w120 G18: sendrawtransaction returns the txid string on RBF replacement" {
+    // Core's sendrawtransaction returns only the txid hex (rpc/mempool.cpp,
+    // RPCResult STR_HEX); the FIX-73 object form {txid, replaces} was a
+    // Core regtest mismatch (rbf/broadcast/simple-replacement:$). The
+    // end-to-end check is tests_sendrawtx_replacement_txid.zig; this pins
+    // that the object-form helper stays gone.
     const src = @embedFile("rpc.zig");
     const helper_decl = "fn returnTxidWithReplaces(";
-    try testing.expect(std.mem.indexOf(u8, src, helper_decl) != null);
-    const call_marker = "return self.returnTxidWithReplaces(txid, replaced_set, id);";
-    try testing.expect(std.mem.indexOf(u8, src, call_marker) != null);
+    try testing.expect(std.mem.indexOf(u8, src, helper_decl) == null);
 }
 
 // End-to-end RPC dispatch test for `getmempoolentry` — proves the wire-format
