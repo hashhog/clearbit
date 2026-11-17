@@ -5357,6 +5357,8 @@ pub const Mempool = struct {
                 if (r.reject_reason) |reason| {
                     if (std.mem.eql(u8, reason, "min relay fee not met")) {
                         results[i].reject_details = try self.minRelayFeeDetails(&tx, txids[i], allocator);
+                    } else if (std.mem.eql(u8, reason, "bad-txns-premature-spend-of-coinbase")) {
+                        results[i].reject_details = try self.immatureCoinbaseDetails(&tx, allocator);
                     }
                 }
                 return;
@@ -5388,6 +5390,32 @@ pub const Mempool = struct {
             };
             results[i].state = .allowed;
         }
+    }
+
+    /// Core CheckTxInputs' TxValidationState::ToString for a premature
+    /// coinbase spend:
+    ///   "bad-txns-premature-spend-of-coinbase, tried to spend coinbase at depth <N>"
+    /// with N = nSpendHeight - coin.nHeight and nSpendHeight = tip + 1 for
+    /// the mempool (consensus/tx_verify.cpp, validation.cpp PreChecks).  The
+    /// first immature coinbase input in input order, as Core's loop.  Null
+    /// when no input is an immature coinbase (the chain moved since the
+    /// reject).  Owned by `allocator`.
+    pub fn immatureCoinbaseDetails(self: *Mempool, tx: *const types.Transaction, allocator: std.mem.Allocator) error{OutOfMemory}!?[]u8 {
+        const cs = self.chain_state orelse return null;
+        self.lockChainThenPool();
+        defer self.unlockPoolThenChain();
+        for (tx.inputs) |input| {
+            // A pool output is never a coinbase.
+            if (self.getOutputFromMempool(&input.previous_output) != null) continue;
+            const utxo = cs.utxo_set.get(&input.previous_output) catch return null;
+            var u = utxo orelse continue;
+            defer u.deinit(self.allocator);
+            if (coinbaseImmatureAtNextBlock(cs, &u)) {
+                const depth: i64 = @as(i64, cs.best_height) + 1 - @as(i64, u.height);
+                return try std.fmt.allocPrint(allocator, "bad-txns-premature-spend-of-coinbase, tried to spend coinbase at depth {d}", .{depth});
+            }
+        }
+        return null;
     }
 
     /// Core CheckFeeRate's debug message for "min relay fee not met":
