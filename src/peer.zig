@@ -11800,6 +11800,11 @@ pub const PeerManager = struct {
 
     /// Compute the median-time-past (GetMedianTimePast) OF block at `height`.
     ///
+    /// NOT the BIP-68 nCoinTime source any more: it resolves `height` through
+    /// the H: index, which is sparse (tip-at-flush only), and answers 0 on a
+    /// miss.  Block validation uses `CoinMtpWalk`, which walks the connecting
+    /// block's own ancestor chain and fails closed.
+    ///
     /// Core: `GetAncestor(height)->GetMedianTimePast()` includes the block at
     /// `height` itself plus up to 10 preceding blocks.
     ///
@@ -11898,16 +11903,131 @@ pub const PeerManager = struct {
         return self.computeMtpAtHeight(h);
     }
 
-    /// Gate 6: MTP-at-height context with its OWN read-error slot, for
-    /// callers outside the P2P thread (submitblock).  After acceptBlock a
-    /// non-null `err` voids the result (BlockIndexReadError).
-    pub const MtpSink = struct {
-        pm: *PeerManager,
-        err: ?anyerror = null,
+    /// One ancestor's nTime and parent hash, for the BIP-68 coin-MTP walk.
+    const AncestorLink = struct { timestamp: u32, prev: types.Hash256 };
 
+    /// Header of `hash` from every place a connected (or connecting) block's
+    /// header lives: the in-memory header_index, the bodies connected since
+    /// the last flush (pending_block_writes, not yet in the DB), the persisted
+    /// block index (CF_BLOCK_INDEX, written for each body at flush), then the
+    /// body itself (CF_BLOCKS).  Null = not known here.  A storage error is
+    /// recorded in `sink`.
+    fn ancestorLink(self: *PeerManager, hash: *const types.Hash256, sink: *?anyerror) ?AncestorLink {
+        if (self.header_index.get(hash.*)) |e| return .{ .timestamp = e.timestamp, .prev = e.prev_hash };
+        const cs = self.chain_state orelse return null;
+        for (cs.pending_block_writes.items) |bw| {
+            if (!std.mem.eql(u8, &bw.hash, hash)) continue;
+            var r = serialize.Reader{ .data = bw.bytes };
+            const hdr = serialize.readBlockHeader(&r) catch {
+                if (sink.* == null) sink.* = error.CorruptData;
+                return null;
+            };
+            return .{ .timestamp = hdr.timestamp, .prev = hdr.prev_block };
+        }
+        if (noteReadInto(?types.BlockHeader, cs.getPersistedHeaderChecked(hash), sink)) |hdr|
+            return .{ .timestamp = hdr.timestamp, .prev = hdr.prev_block };
+        if (noteReadInto(?types.BlockHeader, cs.getBlockHeaderFromBodyChecked(hash), sink)) |hdr|
+            return .{ .timestamp = hdr.timestamp, .prev = hdr.prev_block };
+        return null;
+    }
+
+    /// BIP-68 nCoinTime source for ONE block being validated: the MTP of the
+    /// ancestor at a given height, read from that block's OWN ancestor chain
+    /// (Core CalculateSequenceLocks, consensus/tx_verify.cpp:
+    /// `block.GetAncestor(std::max(nCoinHeight-1, 0))->GetMedianTimePast()`).
+    ///
+    /// It walks prev-hash links down from the block's parent, never the
+    /// H:<height>->hash index.  That index is written only for the tip height
+    /// at each flush (plus a reorg's queue), and IBD / catch-up flush once
+    /// every 128 blocks, so most heights have no entry; the old lookup
+    /// answered 0 for them, every time lock then looked expired, and a block
+    /// spending a coin whose lock had not expired was accepted.
+    ///
+    /// Missing ancestors FAIL CLOSED: `err` is set and the caller voids the
+    /// block's result (a local fault, not a verdict: not marked invalid, the
+    /// sender not punished, retried), exactly as for an ancestor read error.
+    /// The one exception is the assumeutxo trust that was already there: an
+    /// ancestor below a snapshot base the walk passed through (or below the
+    /// base this process booted from), whose header a snapshot-bootstrapped
+    /// datadir does not have, answers 0 (the lock is not re-checked for a coin
+    /// the snapshot vouches for).
+    ///
+    /// Timestamps are memoized per block (ts[i] = nTime at parent_height - i),
+    /// so several time-locked inputs cost one walk to the deepest coin.
+    pub const CoinMtpWalk = struct {
+        pm: *PeerManager,
+        /// First storage error or missing ancestor.  Non-null voids the result.
+        err: ?anyerror = null,
+        parent_height: u32,
+        /// Hash of the ancestor at height parent_height - ts.items.len.
+        cursor: types.Hash256,
+        ts: std.ArrayListUnmanaged(u32) = .{},
+        /// Set once the walk has passed a known snapshot base.
+        passed_snapshot_base: bool = false,
+
+        pub fn init(pm: *PeerManager, parent_hash: types.Hash256, parent_height: u32) CoinMtpWalk {
+            return .{ .pm = pm, .parent_height = parent_height, .cursor = parent_hash };
+        }
+
+        pub fn deinit(self: *CoinMtpWalk) void {
+            self.ts.deinit(self.pm.allocator);
+        }
+
+        fn fail(self: *CoinMtpWalk, e: anyerror) u32 {
+            if (self.err == null) self.err = e;
+            return 0;
+        }
+
+        fn isSnapshotBase(self: *const CoinMtpWalk, hash: *const types.Hash256, height: u32) bool {
+            const np = self.pm.network_params;
+            for (np.assume_utxo) |e| {
+                if (e.height == height and std.mem.eql(u8, &e.block_hash, hash)) return true;
+            }
+            for (np.snapshot_bootstrap) |e| {
+                if (e.height == height and std.mem.eql(u8, &e.block_hash, hash)) return true;
+            }
+            return false;
+        }
+
+        /// MTP of the ancestor at height `h` (Core GetMedianTimePast: that
+        /// block and up to 10 before it).
+        pub fn mtpAt(self: *CoinMtpWalk, h: u32) u32 {
+            // A coin from the chain is at most the parent's height, so h
+            // (coin height - 1) is below it; anything else has no ancestor.
+            if (h > self.parent_height) return self.fail(error.CoinAncestorMissing);
+            const want: usize = @min(@as(usize, 11), @as(usize, h) + 1);
+            const off: usize = self.parent_height - h;
+            const need: usize = off + want;
+            const np = self.pm.network_params;
+            while (self.ts.items.len < need) {
+                const cur_height: u32 = self.parent_height - @as(u32, @intCast(self.ts.items.len));
+                if (std.mem.eql(u8, &self.cursor, &np.genesis_hash)) {
+                    // Genesis has no stored header here; its nTime is in the
+                    // params.  It must sit at height 0, or the links lied.
+                    if (cur_height != 0) return self.fail(error.CoinAncestorMissing);
+                    self.ts.append(self.pm.allocator, np.genesis_header.timestamp) catch
+                        return self.fail(error.OutOfMemory);
+                    continue;
+                }
+                if (cur_height == 0) return self.fail(error.CoinAncestorMissing);
+                if (self.isSnapshotBase(&self.cursor, cur_height)) self.passed_snapshot_base = true;
+                const link = self.pm.ancestorLink(&self.cursor, &self.err) orelse {
+                    if (self.err != null) return 0;
+                    const base = self.pm.snapshot_base_height;
+                    if (self.passed_snapshot_base or (base != 0 and cur_height < base)) return 0;
+                    return self.fail(error.CoinAncestorMissing);
+                };
+                self.ts.append(self.pm.allocator, link.timestamp) catch
+                    return self.fail(error.OutOfMemory);
+                self.cursor = link.prev;
+            }
+            return validation.medianTimePast(self.ts.items[off .. off + want]);
+        }
+
+        /// For IBDValidationContext.getMtpAtHeightFn / AcceptBlockOptions.
         pub fn trampoline(ctx_ptr: *anyopaque, h: u32) u32 {
-            const sink: *MtpSink = @ptrCast(@alignCast(ctx_ptr));
-            return sink.pm.computeMtpAtHeightSink(h, &sink.err);
+            const self: *CoinMtpWalk = @ptrCast(@alignCast(ctx_ptr));
+            return self.mtpAt(h);
         }
     };
 
@@ -12780,6 +12900,9 @@ pub const PeerManager = struct {
             block.header.timestamp,
         );
 
+        var coin_mtp = CoinMtpWalk.init(self, block.header.prev_block, if (height > 0) height - 1 else 0);
+        defer coin_mtp.deinit();
+
         const accept_res = validation.acceptBlock(
             block,
             block_hash,
@@ -12794,11 +12917,11 @@ pub const PeerManager = struct {
                 .current_time = current_time,
                 .force_skip_scripts = skip_scripts,
                 .expected_bits = expected_bits_val,
-                // BIP-68 time-based enforcement: wire the MTP-at-height callback
-                // so validateBlockForIBD can look up the prior-block MTP for each
-                // spent UTXO.  PeerManager is long-lived; safe to pass self here.
-                .getMtpAtHeightFn = PeerManager.getMtpAtHeightTrampoline,
-                .getMtpAtHeightCtx = @ptrCast(self),
+                // BIP-68 time-based enforcement: each coin's nCoinTime is
+                // the MTP of its ancestor on THIS block's chain (CoinMtpWalk,
+                // from the block's parent), not the sparse H: index.
+                .getMtpAtHeightFn = CoinMtpWalk.trampoline,
+                .getMtpAtHeightCtx = @ptrCast(&coin_mtp),
                 // BIP-34-active / BIP-30 gate: resolve the BIP-34 anchor hash via a
                 // CF_BLOCKS prev-walk when the in-memory active_chain is empty
                 // (post-restart), so BIP-30 is not wrongly enforced and a block
@@ -12829,9 +12952,11 @@ pub const PeerManager = struct {
             self.last_block_reject_err = error.UtxoReadError;
             return false;
         }
-        // Gate 6: same for an ancestor read failure (MTP window): the time
-        // checks ran against a waived/wrong MTP, so the result is void.
-        if (self.ancestor_read_err) |rerr| {
+        // Gate 6: same for an ancestor read failure (MTP window) or a coin
+        // ancestor the BIP-68 walk could not reach: the time checks ran
+        // against a waived/wrong MTP, so the result is void.
+        const anc_err: ?anyerror = if (self.ancestor_read_err) |e| e else coin_mtp.err;
+        if (anc_err) |rerr| {
             std.debug.print(
                 "P2P: BLOCK INDEX READ FAILED validating block height={d} ({}) — NOT a block verdict: not marked, sender not punished, will retry\n",
                 .{ height, rerr },

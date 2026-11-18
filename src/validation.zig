@@ -1975,10 +1975,20 @@ pub fn validateBlockForIBD(
                 }) catch return ValidationError.OutOfMemory;
                 // BIP-68: nCoinTime = MTP at max(coinHeight-1, 0).
                 // Core tx_verify.cpp:74: GetAncestor(std::max(nCoinHeight-1, 0))->GetMedianTimePast()
-                const coin_mtp: u32 = if (ctx.getMtpAtHeightFn) |getMtp|
-                    getMtp(ctx.getMtpAtHeightCtx.?, if (info.height > 0) info.height - 1 else 0)
-                else
-                    0; // not available; time-based locks skipped (height-only check below)
+                // Core reads it only for an input whose TIME-based relative
+                // lock is in force (CalculateSequenceLocks: tx version >= 2,
+                // CSV active, disable flag clear, type flag set).  Ask the
+                // callback only then: it walks the connecting block's
+                // ancestor chain, which costs a read per block of depth, and
+                // calculateSequenceLocks reads utxo_info.mtp for no other input.
+                const coin_mtp: u32 = blk: {
+                    const getMtp = ctx.getMtpAtHeightFn orelse break :blk 0; // height-only check below
+                    const seq = input.sequence;
+                    if (height < params.csv_height or !bip68VersionActive(tx.version) or
+                        (seq & consensus.SEQUENCE_LOCKTIME_DISABLE_FLAG) != 0 or
+                        (seq & consensus.SEQUENCE_LOCKTIME_TYPE_FLAG) == 0) break :blk 0;
+                    break :blk getMtp(ctx.getMtpAtHeightCtx.?, if (info.height > 0) info.height - 1 else 0);
+                };
                 seq_lock_utxo_info.put(key, .{
                     .height = info.height,
                     .mtp = coin_mtp,
