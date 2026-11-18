@@ -2924,10 +2924,14 @@ test "tests_reorg_p2p: gate6 — a chainstate write failing twice halts the node
     try runG6WriteFault(2);
 }
 
-/// BIP-68 time lock whose coin MTP needs a block-index read: block 3 spends a
+/// BIP-68 time lock whose coin MTP needs a block-index read: block 14 spends a
 /// coin created at height 2 with a ~388-day relative time lock, so the true
-/// verdict is SequenceLockNotSatisfied.  `fault`: the CF_DEFAULT (height ->
-/// hash) read fails while the coin's MTP is computed.
+/// verdict is SequenceLockNotSatisfied.  The coin's nCoinTime is MTP(1), read
+/// by walking block 14's own ancestors (Core GetAncestor); heights 1 and 2 are
+/// dropped from the in-memory header_index so the walk must read them from
+/// the block index.  The parent's own MTP window (heights 3..13) stays in
+/// memory, so only the coin walk touches the store.  `fault`: CF_BLOCK_INDEX
+/// and CF_BLOCKS reads fail while the coin's MTP is computed.
 fn runG6MtpReadFault(fault: bool) !void {
     fatal.resetForTest();
     defer fatal.resetForTest();
@@ -2937,37 +2941,49 @@ fn runG6MtpReadFault(fault: bool) !void {
     try n.init(&params);
     defer n.deinit();
 
-    var a1 = try mineIbBlock(allocator, &params, params.genesis_hash, 1, 0, 0xD1);
-    defer serialize.freeBlock(allocator, &a1.block);
-    var a2 = try mineIbBlock(allocator, &params, a1.hash, 2, 0, 0xD2);
-    defer serialize.freeBlock(allocator, &a2.block);
-    try sendHeaders(&n.pm, allocator, n.h_peer, &.{ &a1, &a2 });
-    try sendBlock(&n.pm, allocator, n.h_peer, &a1);
-    try sendBlock(&n.pm, allocator, n.h_peer, &a2);
-    try testing.expectEqual(@as(u32, 2), n.cs.best_height);
+    var chain: [14]IbBlock = undefined;
+    var prev = params.genesis_hash;
+    var h: u32 = 1;
+    while (h <= 13) : (h += 1) {
+        chain[h] = try mineIbBlock(allocator, &params, prev, h, 0, 0xC0 + @as(u8, @intCast(h)));
+        prev = chain[h].hash;
+    }
+    defer {
+        var k: usize = 1;
+        while (k <= 13) : (k += 1) serialize.freeBlock(allocator, &chain[k].block);
+    }
+    h = 1;
+    while (h <= 13) : (h += 1) {
+        try sendHeaders(&n.pm, allocator, n.h_peer, &.{&chain[h]});
+        try sendBlock(&n.pm, allocator, n.h_peer, &chain[h]);
+    }
+    try testing.expectEqual(@as(u32, 13), n.cs.best_height);
+    _ = n.pm.header_index.remove(chain[1].hash);
+    _ = n.pm.header_index.remove(chain[2].hash);
 
     const coin = ghostOutpoint(0xD7);
     try n.cs.utxo_set.add(&coin, &types.TxOut{ .value = 50_000, .script_pubkey = &[_]u8{0x51} }, 2, false);
     // nVersion 2, sequence: type flag (time) | 0xFFFF units of 512 s.
     const spend = try g6SpendTx(allocator, coin, 2, (1 << 22) | 0xFFFF);
-    var b3 = try g6MineWithTx(allocator, &params, a2.hash, 3, 0xD7, spend);
-    defer serialize.freeBlock(allocator, &b3.block);
+    var b14 = try g6MineWithTx(allocator, &params, chain[13].hash, 14, 0xD7, spend);
+    defer serialize.freeBlock(allocator, &b14.block);
 
-    try sendHeaders(&n.pm, allocator, n.x_peer, &.{&b3});
-    if (fault) n.db.fault_get_cf_mask = @as(u32, 1) << @intCast(storage.CF_DEFAULT);
+    try sendHeaders(&n.pm, allocator, n.x_peer, &.{&b14});
+    if (fault) n.db.fault_get_cf_mask = (@as(u32, 1) << @intCast(storage.CF_BLOCK_INDEX)) |
+        (@as(u32, 1) << @intCast(storage.CF_BLOCKS));
     defer n.db.fault_get_cf_mask = 0;
-    try sendBlock(&n.pm, allocator, n.x_peer, &b3);
+    try sendBlock(&n.pm, allocator, n.x_peer, &b14);
 
-    // Never accepted: pre-fix the read error made the coin's MTP 0, which
-    // WAIVED the time lock and connected block 3.
-    try testing.expectEqual(@as(u32, 2), n.cs.best_height);
+    // Never accepted: a read error must not make the coin's MTP 0, which
+    // would WAIVE the time lock and connect block 14.
+    try testing.expectEqual(@as(u32, 13), n.cs.best_height);
     if (fault) {
-        try testing.expect(!n.pm.isBlockFailed(&b3.hash));
+        try testing.expect(!n.pm.isBlockFailed(&b14.hash));
         try testing.expect(!n.x_peer.should_ban);
         try testing.expectEqualStrings("BlockIndexReadError", @errorName(n.pm.last_block_reject_err orelse return error.NoRejectRecorded));
     } else {
         // CONTROL: the lock is real and enforced without the fault.
-        try testing.expect(n.pm.isBlockFailed(&b3.hash));
+        try testing.expect(n.pm.isBlockFailed(&b14.hash));
         try testing.expect(n.x_peer.should_ban);
         try testing.expectEqualStrings("SequenceLockNotSatisfied", @errorName(n.pm.last_block_reject_err orelse return error.NoRejectRecorded));
     }
