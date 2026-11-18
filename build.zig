@@ -2083,6 +2083,37 @@ pub fn build(b: *std.Build) void {
         test_step.dependOn(&run_mrd_tests.step);
     }
 
+    // Script-check cache key commits to the whole witness (Core keys
+    // m_script_execution_cache on the wtxid). Also part of `test`.
+    {
+        const sck_tests = b.addTest(.{
+            .root_source_file = b.path("tests_script_cache_key_wtxid.zig"),
+            .target = target,
+            .optimize = optimize,
+            .filters = &[_][]const u8{"tests_script_cache_key_wtxid"},
+        });
+        sck_tests.linkSystemLibrary("rocksdb");
+        sck_tests.linkSystemLibrary("secp256k1");
+        sck_tests.addIncludePath(.{ .cwd_relative = secp256k1_include });
+        sck_tests.linkLibC();
+        if (target.result.cpu.arch == .x86_64) {
+            sck_tests.addCSourceFile(.{
+                .file = b.path("src/sha256_shani.c"),
+                .flags = shani_cflags,
+            });
+        }
+        if (minisketch_enabled) {
+            sck_tests.linkSystemLibrary("minisketch");
+            sck_tests.addIncludePath(.{ .cwd_relative = minisketch_include });
+        }
+        sck_tests.root_module.addOptions("build_options", build_options);
+
+        const run_sck_tests = b.addRunArtifact(sck_tests);
+        const sck_step = b.step("test-script-cache-key-wtxid", "Run script-check cache key (wtxid / full witness) tests");
+        sck_step.dependOn(&run_sck_tests.step);
+        test_step.dependOn(&run_sck_tests.step);
+    }
+
     // setmocktime suite: regtest-only clock override RPC.
     {
         const mocktime_tests = b.addTest(.{
