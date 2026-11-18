@@ -2542,3 +2542,214 @@ test "messageHash matches Bitcoin Core formatting" {
     outer.final(&outer_out);
     try std.testing.expectEqualSlices(u8, &outer_out, &got);
 }
+
+// ---------------------------------------------------------------------------
+// Lax DER: long-form INTEGER lengths (pre-BIP66 consensus path).
+//
+// Below bip66_height DERSIG is off and signatures reach verifyEcdsaChecked
+// unchecked, so the lax parser IS consensus there.  Core's
+// ecdsa_signature_parse_der_lax (pubkey.cpp) decodes a long-form R/S length
+// (`0x80 | n` followed by n big-endian length bytes, leading zero bytes
+// skipped, at most 3 significant bytes).  These tests build each case from a
+// real low-S signature and assert Core's verdict.
+// ---------------------------------------------------------------------------
+
+/// Re-encode a short-form DER signature with the R and/or S length bytes
+/// replaced by `r_len_enc` / `s_len_enc` (null = keep the original byte).
+fn laxDerReencode(
+    der: []const u8,
+    r_len_enc: ?[]const u8,
+    s_len_enc: ?[]const u8,
+    out: *[96]u8,
+) []const u8 {
+    // der = 30 L 02 rl R 02 sl S  (all short form, as libsecp256k1 emits)
+    const rl: usize = der[3];
+    const r = der[4 .. 4 + rl];
+    const sl: usize = der[5 + rl];
+    const s = der[6 + rl .. 6 + rl + sl];
+    var p: usize = 2;
+    out[p] = 0x02;
+    p += 1;
+    const re = r_len_enc orelse &[_]u8{der[3]};
+    @memcpy(out[p .. p + re.len], re);
+    p += re.len;
+    @memcpy(out[p .. p + r.len], r);
+    p += r.len;
+    out[p] = 0x02;
+    p += 1;
+    const se = s_len_enc orelse &[_]u8{der[5 + rl]};
+    @memcpy(out[p .. p + se.len], se);
+    p += se.len;
+    @memcpy(out[p .. p + s.len], s);
+    p += s.len;
+    out[0] = 0x30;
+    out[1] = @intCast(p - 2);
+    return out[0..p];
+}
+
+const LaxDerFixture = struct { der: DerSig, pubkey: [33]u8, hash: [32]u8 };
+
+fn laxDerFixture() !LaxDerFixture {
+    const ctx = secp_ctx() orelse return error.NoSecpCtx;
+    var seckey: [32]u8 = [_]u8{0} ** 32;
+    seckey[31] = 0x07;
+    var f: LaxDerFixture = undefined;
+    f.hash = sha256("clearbit lax-der long-form length");
+    f.der = ecdsaSignDer(&f.hash, &seckey) orelse return error.SignFailed;
+    var pk: secp256k1.secp256k1_pubkey = undefined;
+    if (secp256k1.secp256k1_ec_pubkey_create(ctx, &pk, &seckey) != 1) return error.KeyFailed;
+    var pk_len: usize = 33;
+    _ = secp256k1.secp256k1_ec_pubkey_serialize(ctx, &f.pubkey, &pk_len, &pk, secp256k1.SECP256K1_EC_COMPRESSED);
+    return f;
+}
+
+test "laxDer long-form: R length 0x81 len verifies (Core accepts)" {
+    if (!initSecp256k1()) return error.SkipZigTest;
+    defer deinitSecp256k1();
+    const f = try laxDerFixture();
+    const der = f.der.bytes[0..f.der.len];
+    // Control: the unmodified signature verifies.
+    try std.testing.expect(try verifyEcdsaChecked(der, &f.pubkey, &f.hash));
+    var buf: [96]u8 = undefined;
+    const rl = der[3];
+    const sig = laxDerReencode(der, &[_]u8{ 0x81, rl }, null, &buf);
+    try std.testing.expectEqual(@as(u8, 0x81), sig[3]);
+    try std.testing.expect(try verifyEcdsaChecked(sig, &f.pubkey, &f.hash));
+    // Negative control: same encoding, different message, must not verify.
+    const other = sha256("some other message");
+    try std.testing.expect(!(try verifyEcdsaChecked(sig, &f.pubkey, &other)));
+}
+
+test "laxDer long-form: S length and both lengths long-form verify (Core accepts)" {
+    if (!initSecp256k1()) return error.SkipZigTest;
+    defer deinitSecp256k1();
+    const f = try laxDerFixture();
+    const der = f.der.bytes[0..f.der.len];
+    const rl = der[3];
+    const sl = der[5 + @as(usize, rl)];
+    var buf: [96]u8 = undefined;
+    try std.testing.expect(try verifyEcdsaChecked(
+        laxDerReencode(der, null, &[_]u8{ 0x81, sl }, &buf),
+        &f.pubkey,
+        &f.hash,
+    ));
+    try std.testing.expect(try verifyEcdsaChecked(
+        laxDerReencode(der, &[_]u8{ 0x82, 0x00, rl }, &[_]u8{ 0x81, sl }, &buf),
+        &f.pubkey,
+        &f.hash,
+    ));
+}
+
+test "laxDer long-form: leading zero length bytes are skipped (Core accepts 0x84 00 00 00 len)" {
+    if (!initSecp256k1()) return error.SkipZigTest;
+    defer deinitSecp256k1();
+    const f = try laxDerFixture();
+    const der = f.der.bytes[0..f.der.len];
+    const rl = der[3];
+    var buf: [96]u8 = undefined;
+    // Four length bytes, three of them leading zeros: after skipping the
+    // zeros one significant byte remains (< 4), so Core decodes it.
+    try std.testing.expect(try verifyEcdsaChecked(
+        laxDerReencode(der, &[_]u8{ 0x84, 0x00, 0x00, 0x00, rl }, null, &buf),
+        &f.pubkey,
+        &f.hash,
+    ));
+    // 0x80 = long form with zero length bytes -> rlen 0 -> R is empty.
+    // Core parses it (R = 0) and the signature then fails to verify.
+    try std.testing.expect(!(try verifyEcdsaChecked(
+        laxDerReencode(der, &[_]u8{0x80}, null, &buf),
+        &f.pubkey,
+        &f.hash,
+    )));
+}
+
+test "laxDer long-form: malformed lengths are rejected (Core returns 0)" {
+    if (!initSecp256k1()) return error.SkipZigTest;
+    defer deinitSecp256k1();
+    const f = try laxDerFixture();
+    const der = f.der.bytes[0..f.der.len];
+    const rl = der[3];
+    var buf: [96]u8 = undefined;
+    const bad = [_][]const u8{
+        // Decoded length overruns the buffer.
+        &[_]u8{ 0x81, 0xff },
+        // 0x0120 = 288: a parser that truncated the decoded length to its
+        // low byte would read 0x20 here and wrongly accept the signature.
+        &[_]u8{ 0x82, 0x01, rl },
+        // Four significant length bytes: Core rejects (lenbyte >= 4) even
+        // though the low byte is the right length.
+        &[_]u8{ 0x84, 0x01, 0x00, 0x00, rl },
+    };
+    for (bad) |enc| {
+        try std.testing.expect(!(try verifyEcdsaChecked(
+            laxDerReencode(der, enc, null, &buf),
+            &f.pubkey,
+            &f.hash,
+        )));
+    }
+    // More length bytes announced than remain in the buffer.
+    const trunc = [_]u8{ 0x30, 0x06, 0x02, 0x85, 0x00, 0x00, 0x00, 0x20 };
+    try std.testing.expect(!(try verifyEcdsaChecked(&trunc, &f.pubkey, &f.hash)));
+    // S length overrun.
+    try std.testing.expect(!(try verifyEcdsaChecked(
+        laxDerReencode(der, null, &[_]u8{ 0x81, 0x7f }, &buf),
+        &f.pubkey,
+        &f.hash,
+    )));
+}
+
+// Core's overflow branch: an R/S longer than 32 bytes after stripping zeros,
+// or one >= the curve order, makes ecdsa_signature_parse_der_lax return 1 with
+// an all-zero signature.  That signature never verifies, and CheckLowS
+// (IsLowDERSignature) calls it low-S because normalize leaves s=0 alone.  Both
+// shapes are reachable behind strict DER (BIP66 allows R up to 65 bytes as
+// long as it is not padded with a needless 0x00).
+test "laxDer overflow: R longer than 32 bytes is Core's zero signature (low-S, never verifies)" {
+    if (!initSecp256k1()) return error.SkipZigTest;
+    defer deinitSecp256k1();
+    const f = try laxDerFixture();
+    // 30 26 02 21 01 <32 x 0x11> 02 01 01 : R is 33 significant bytes.
+    var sig: [40]u8 = undefined;
+    sig[0] = 0x30;
+    sig[1] = 0x26;
+    sig[2] = 0x02;
+    sig[3] = 0x21;
+    sig[4] = 0x01;
+    @memset(sig[5..37], 0x11);
+    sig[37] = 0x02;
+    sig[38] = 0x01;
+    sig[39] = 0x01;
+    try std.testing.expect(try isLowDERSignatureChecked(&sig));
+    try std.testing.expect(!(try verifyEcdsaChecked(&sig, &f.pubkey, &f.hash)));
+}
+
+test "laxDer overflow: R >= curve order is Core's zero signature (low-S, never verifies)" {
+    if (!initSecp256k1()) return error.SkipZigTest;
+    defer deinitSecp256k1();
+    const f = try laxDerFixture();
+    // 30 26 02 21 00 <32 x 0xff> 02 01 01 : R = 2^256-1 >= n.
+    var sig: [40]u8 = undefined;
+    sig[0] = 0x30;
+    sig[1] = 0x26;
+    sig[2] = 0x02;
+    sig[3] = 0x21;
+    sig[4] = 0x00;
+    @memset(sig[5..37], 0xff);
+    sig[37] = 0x02;
+    sig[38] = 0x01;
+    sig[39] = 0x01;
+    try std.testing.expect(try isLowDERSignatureChecked(&sig));
+    try std.testing.expect(!(try verifyEcdsaChecked(&sig, &f.pubkey, &f.hash)));
+    // Control: a genuinely high S (n/2 < S < n) is still reported as high.
+    // 30 25 02 01 01 02 20 <32 x 0xee>
+    var hs: [39]u8 = undefined;
+    hs[0] = 0x30;
+    hs[1] = 0x25;
+    hs[2] = 0x02;
+    hs[3] = 0x01;
+    hs[4] = 0x01;
+    hs[5] = 0x02;
+    hs[6] = 0x20;
+    @memset(hs[7..39], 0xee); // < n (n starts 0xff..fe ba ae), > n/2
+    try std.testing.expect(!(try isLowDERSignatureChecked(&hs)));
+}
