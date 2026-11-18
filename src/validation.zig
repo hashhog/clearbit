@@ -3607,9 +3607,9 @@ fn verifyScriptJob(job: *ScriptCheckJob, allocator: std.mem.Allocator, cache: *s
     //
     // Targeted fix: synthesise a 32-byte per-input sighash-proxy that binds
     // all data the actual sighash is a function of from this input's side
-    // (outpoint, input_index, prevout amount, sequence) PLUS the txid (which
+    // (outpoint, input_index, prevout amount, sequence) PLUS the wtxid (which
     // collapses hashPrevouts / hashSequence / hashOutputs for the tx as a
-    // whole). Two different inputs of the same tx now derive DIFFERENT cache
+    // whole, and its witnesses; see below). Two different inputs of the same tx now derive DIFFERENT cache
     // keys; two different SIGHASH_NONE/SINGLE branches on the same input
     // produce different sig_bytes (the sighash_type byte is the trailing
     // byte of the signature in script_sig/witness) and so also derive
