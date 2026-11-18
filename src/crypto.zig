@@ -773,73 +773,109 @@ pub fn isSecp256k1Available() bool {
     return secp.isInitialized();
 }
 
+/// Decode one lax-DER INTEGER length at `pos.*`, exactly as Core's
+/// ecdsa_signature_parse_der_lax (pubkey.cpp) does for R and S:
+/// short form is the byte itself; long form `0x80 | n` is followed by n
+/// big-endian length bytes, of which leading zeros are skipped and fewer than
+/// 4 may remain.  Returns null where Core returns 0.  The decoded length is
+/// also checked against the bytes that remain.
+fn laxDerIntLen(input: []const u8, pos: *usize) ?usize {
+    if (pos.* == input.len) return null;
+    var lenbyte: usize = input[pos.*];
+    pos.* += 1;
+    var len: usize = undefined;
+    if (lenbyte & 0x80 != 0) {
+        lenbyte -= 0x80;
+        if (lenbyte > input.len - pos.*) return null;
+        while (lenbyte > 0 and input[pos.*] == 0) {
+            pos.* += 1;
+            lenbyte -= 1;
+        }
+        if (lenbyte >= 4) return null;
+        len = 0;
+        while (lenbyte > 0) {
+            len = (len << 8) + input[pos.*];
+            pos.* += 1;
+            lenbyte -= 1;
+        }
+    } else {
+        len = lenbyte;
+    }
+    if (len > input.len - pos.*) return null;
+    return len;
+}
+
 /// Lax DER signature parsing - extracts R and S values from a loosely-encoded
 /// DER signature and packs them into a 64-byte compact format for libsecp256k1.
-/// This matches Bitcoin Core's ecdsa_signature_parse_der_lax() behavior.
-fn laxDerParse(sig_der: []const u8, compact: *[64]u8) bool {
-    @memset(compact, 0);
-
-    if (sig_der.len < 1) return false;
+/// A port of Bitcoin Core's ecdsa_signature_parse_der_lax() (pubkey.cpp), step
+/// for step: returns false exactly where Core returns 0.  Where Core sets
+/// `overflow` (R or S longer than 32 bytes after stripping leading zeros, or
+/// R/S >= the curve order so parse_compact refuses it) it still returns 1 with
+/// an all-zero signature, which never verifies and which CheckLowS calls
+/// low-S; this does the same (true + all-zero `sig`).
+fn laxDerParse(ctx: *secp.Context, input: []const u8, sig: *secp256k1.secp256k1_ecdsa_signature) bool {
+    var compact: [64]u8 = [_]u8{0} ** 64;
     var pos: usize = 0;
 
-    // Sequence tag
-    if (sig_der[pos] != 0x30) return false;
+    // Sequence tag byte
+    if (pos == input.len or input[pos] != 0x30) return false;
     pos += 1;
 
-    // Sequence length (skip, don't validate strictly)
-    if (pos >= sig_der.len) return false;
-    if (sig_der[pos] & 0x80 != 0) {
-        // Long form length
-        const len_bytes = sig_der[pos] & 0x7f;
-        pos += 1;
-        pos += @as(usize, len_bytes);
+    // Sequence length bytes (value ignored; long form just skipped)
+    if (pos == input.len) return false;
+    var lenbyte: usize = input[pos];
+    pos += 1;
+    if (lenbyte & 0x80 != 0) {
+        lenbyte -= 0x80;
+        if (lenbyte > input.len - pos) return false;
+        pos += lenbyte;
+    }
+
+    // Integer tag byte + length for R
+    if (pos == input.len or input[pos] != 0x02) return false;
+    pos += 1;
+    var rlen = laxDerIntLen(input, &pos) orelse return false;
+    var rpos = pos;
+    pos += rlen;
+
+    // Integer tag byte + length for S
+    if (pos == input.len or input[pos] != 0x02) return false;
+    pos += 1;
+    var slen = laxDerIntLen(input, &pos) orelse return false;
+    var spos = pos;
+
+    var overflow = false;
+
+    // Ignore leading zeroes in R, then copy it right-aligned.
+    while (rlen > 0 and input[rpos] == 0) {
+        rlen -= 1;
+        rpos += 1;
+    }
+    if (rlen > 32) {
+        overflow = true;
     } else {
-        pos += 1;
+        @memcpy(compact[32 - rlen .. 32], input[rpos .. rpos + rlen]);
     }
 
-    // R integer
-    if (pos >= sig_der.len or sig_der[pos] != 0x02) return false;
-    pos += 1;
-
-    if (pos >= sig_der.len) return false;
-    const r_len: usize = sig_der[pos];
-    pos += 1;
-
-    if (pos + r_len > sig_der.len) return false;
-    var r_data = sig_der[pos .. pos + r_len];
-    pos += r_len;
-
-    // Strip leading zeros from R
-    while (r_data.len > 0 and r_data[0] == 0) {
-        r_data = r_data[1..];
+    // Ignore leading zeroes in S, then copy it right-aligned.
+    while (slen > 0 and input[spos] == 0) {
+        slen -= 1;
+        spos += 1;
     }
-    if (r_data.len > 32) return false;
-
-    // Copy R right-aligned into first 32 bytes
-    const r_offset = 32 - r_data.len;
-    @memcpy(compact[r_offset .. r_offset + r_data.len], r_data);
-
-    // S integer
-    if (pos >= sig_der.len or sig_der[pos] != 0x02) return false;
-    pos += 1;
-
-    if (pos >= sig_der.len) return false;
-    const s_len: usize = sig_der[pos];
-    pos += 1;
-
-    if (pos + s_len > sig_der.len) return false;
-    var s_data = sig_der[pos .. pos + s_len];
-
-    // Strip leading zeros from S
-    while (s_data.len > 0 and s_data[0] == 0) {
-        s_data = s_data[1..];
+    if (slen > 32) {
+        overflow = true;
+    } else {
+        @memcpy(compact[64 - slen .. 64], input[spos .. spos + slen]);
     }
-    if (s_data.len > 32) return false;
 
-    // Copy S right-aligned into last 32 bytes
-    const s_offset = 32 + 32 - s_data.len;
-    @memcpy(compact[s_offset .. s_offset + s_data.len], s_data);
-
+    if (!overflow) {
+        overflow = secp256k1.secp256k1_ecdsa_signature_parse_compact(ctx, sig, &compact) != 1;
+    }
+    if (overflow) {
+        // Core: overwrite with a correctly-parsed but invalid signature.
+        @memset(&compact, 0);
+        _ = secp256k1.secp256k1_ecdsa_signature_parse_compact(ctx, sig, &compact);
+    }
     return true;
 }
 
@@ -871,19 +907,9 @@ pub fn verifyEcdsaChecked(sig_der: []const u8, pubkey_bytes: []const u8, msg_has
         return false;
     }
 
-    // Lax DER parse: extract R/S into compact format
-    var compact: [64]u8 = undefined;
-    if (!laxDerParse(sig_der, &compact)) {
-        return false;
-    }
-
-    // Parse compact signature
+    // Lax DER parse (Core: ecdsa_signature_parse_der_lax)
     var sig: secp256k1.secp256k1_ecdsa_signature = undefined;
-    if (secp256k1.secp256k1_ecdsa_signature_parse_compact(
-        ctx,
-        &sig,
-        &compact,
-    ) != 1) {
+    if (!laxDerParse(ctx, sig_der, &sig)) {
         return false;
     }
 
@@ -904,18 +930,10 @@ pub fn isLowDERSignature(sig_der: []const u8) bool {
 pub fn isLowDERSignatureChecked(sig_der: []const u8) SecpError!bool {
     const ctx = secp_ctx() orelse return error.SecpContextUnavailable;
 
-    // Use lax DER parsing to extract R/S into compact format
-    var compact: [64]u8 = undefined;
-    if (!laxDerParse(sig_der, &compact)) {
-        return false;
-    }
-
+    // Core: CPubKey::CheckLowS -- lax DER parse, then "already normalized".
+    // An overflowing R/S parses to Core's all-zero signature, which is low-S.
     var sig: secp256k1.secp256k1_ecdsa_signature = undefined;
-    if (secp256k1.secp256k1_ecdsa_signature_parse_compact(
-        ctx,
-        &sig,
-        &compact,
-    ) != 1) {
+    if (!laxDerParse(ctx, sig_der, &sig)) {
         return false;
     }
 
