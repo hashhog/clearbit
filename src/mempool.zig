@@ -2341,6 +2341,8 @@ pub const Mempool = struct {
             // (Core: CBlockPolicyEstimator::processBlockTx via MempoolTransactionsRemovedForBlock).
             self.fee_estimator.confirmTransaction(tx_hash, block_height);
             self.removeTransaction(tx_hash);
+            // Core removeForBlock: ClearPrioritisation(tx) for every block tx.
+            _ = self.map_deltas.remove(tx_hash);
             // Core CTxMemPool::removeForBlock -> removeConflicts: any OTHER
             // mempool tx spending an input this block tx spends is now a
             // double spend of a confirmed coin; it goes with all its
@@ -2351,6 +2353,8 @@ pub const Mempool = struct {
             for (tx.inputs) |input| {
                 if (self.spenders.get(input.previous_output)) |conflict| {
                     if (!std.mem.eql(u8, &conflict, &tx_hash) and self.entries.contains(conflict)) {
+                        // Core removeConflicts: ClearPrioritisation(conflict).
+                        _ = self.map_deltas.remove(conflict);
                         self.removeTransactionWithDescendants(conflict);
                     }
                 }
@@ -5557,7 +5561,8 @@ pub const Mempool = struct {
         return if (total < 0) 0 else @intCast(total);
     }
 
-    /// True when `dynamicMemoryUsage() > limit`.  The cluster correction is
+    /// True when `dynamicMemoryUsage() > limit`.  Callers hold `mutex` (the
+    /// fast path reads counters without it).  The cluster correction is
     /// at most CLUSTER_CORRECTION_MAX_PER_TX per transaction, so a pool whose
     /// singleton sum plus that bound is under `limit` skips the cluster walk.
     pub fn usageExceeds(self: *Mempool, limit: usize) bool {
@@ -5572,7 +5577,7 @@ pub const Mempool = struct {
     /// Bound on the cluster correction per transaction.  For a cluster of
     /// k >= 2 the correction is coreClusterUsage(k) + chunks * MallocUsage(40)
     /// - k * (coreClusterUsage(1) + MallocUsage(40)) <= 2*(4k+31) + (32k+31)
-    /// + 136 - 72k < 165, i.e. below 83 per transaction.
+    /// + 136 - 72k < 165, i.e. below 83 per transaction; 96 leaves headroom.
     const CLUSTER_CORRECTION_MAX_PER_TX: usize = 96;
 
     /// `total_usage` charges every transaction as a singleton cluster with one
@@ -16807,6 +16812,43 @@ test "getmempoolinfo usage: Core's 4,773,160 for the chain plus 12 of 14 800-inp
     mempool.removeTransaction(txids[1]);
     try std.testing.expectEqual(@as(usize, 14), mempool.entries.count());
     try std.testing.expectEqual(@as(usize, 4_773_160 + 96), mempool.stats().usage);
+}
+
+test "getmempoolinfo usage: removeForBlock clears the prioritisation of confirmed and conflicting txs" {
+    // Core CTxMemPool::removeForBlock calls ClearPrioritisation for every
+    // block transaction and, in removeConflicts, for every conflict it
+    // evicts (txmempool.cpp).  DynamicMemoryUsage charges each mapDeltas node,
+    // so a delta left behind would keep `usage` 96 bytes above Core's.
+    const allocator = std.testing.allocator;
+    var mempool = Mempool.init(null, null, allocator);
+    defer mempool.deinit();
+
+    var ci = [_]types.TxIn{usageTestInput([_]u8{0x06} ** 32, 0, &usage_p2wpkh_witness)};
+    var co = [_]types.TxOut{.{ .value = 1000, .script_pubkey = &usage_p2wpkh_spk }};
+    const confirmed = types.Transaction{ .version = 2, .inputs = &ci, .outputs = &co, .lock_time = 0 };
+    _ = try mempool.prioritiseTransaction(try crypto.computeTxid(&confirmed, allocator), 5_000);
+    try mempool.addTransaction(confirmed);
+
+    // A pool tx spending 0x07..:0, and a block tx spending the same coin.
+    var pi = [_]types.TxIn{usageTestInput([_]u8{0x07} ** 32, 0, &usage_p2wpkh_witness)};
+    var po = [_]types.TxOut{.{ .value = 1000, .script_pubkey = &usage_p2wpkh_spk }};
+    const loser = types.Transaction{ .version = 2, .inputs = &pi, .outputs = &po, .lock_time = 0 };
+    _ = try mempool.prioritiseTransaction(try crypto.computeTxid(&loser, allocator), 5_000);
+    try mempool.addTransaction(loser);
+    var wo = [_]types.TxOut{.{ .value = 900, .script_pubkey = &usage_p2wsh_spk }};
+    const winner = types.Transaction{ .version = 2, .inputs = &pi, .outputs = &wo, .lock_time = 0 };
+    try std.testing.expectEqual(@as(usize, 2), mempool.map_deltas.count());
+
+    const block = types.Block{
+        .header = std.mem.zeroes(types.BlockHeader),
+        .transactions = &[_]types.Transaction{ confirmed, winner },
+    };
+    mempool.removeForBlock(&block);
+
+    try std.testing.expectEqual(@as(usize, 0), mempool.entries.count());
+    try std.testing.expectEqual(@as(usize, 0), mempool.map_deltas.count());
+    // Only txns_randomized's retained capacity is left: MallocUsage(2 * 40).
+    try std.testing.expectEqual(@as(usize, 96), mempool.stats().usage);
 }
 
 // ============================================================================
