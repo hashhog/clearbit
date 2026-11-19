@@ -3617,16 +3617,38 @@ fn verifyScriptJob(job: *ScriptCheckJob, allocator: std.mem.Allocator, cache: *s
     //
     // Targeted fix: synthesise a 32-byte per-input sighash-proxy that binds
     // all data the actual sighash is a function of from this input's side
-    // (outpoint, input_index, prevout amount, sequence) PLUS the txid (which
+    // (outpoint, input_index, prevout amount, sequence) PLUS the wtxid (which
     // collapses hashPrevouts / hashSequence / hashOutputs for the tx as a
-    // whole). Two different inputs of the same tx now derive DIFFERENT cache
+    // whole, and its witnesses; see below). Two different inputs of the same tx now derive DIFFERENT cache
     // keys; two different SIGHASH_NONE/SINGLE branches on the same input
     // produce different sig_bytes (the sighash_type byte is the trailing
     // byte of the signature in script_sig/witness) and so also derive
     // different keys. The catastrophic short-circuit is closed.
+    //
+    // The digest commits to the WTXID, not the txid: Core's CheckInputScripts
+    // keys m_script_execution_cache on tx.GetWitnessHash() + flags.  With the
+    // txid, a witness malleation (an extra empty item: [sig,pk] vs
+    // [sig,pk,""], or any change past the bounded sig_material below) kept
+    // the key of the already-verified valid witness and a cache hit returned
+    // OK without running the interpreter.  The wtxid commits to every byte
+    // of every input's scriptSig and witness with their counts and lengths.
+    // The job also carries its own witness slice (what engine.verify runs),
+    // so that is hashed too, count- and length-prefixed, together with the
+    // full scriptSig.
     var sighash_hasher = std.crypto.hash.sha2.Sha256.init(.{});
-    const txid = crypto.computeTxidStreaming(&tx);
-    sighash_hasher.update(&txid);
+    const wtxid = crypto.computeWtxidStreaming(&tx);
+    sighash_hasher.update(&wtxid);
+    var len_le: [8]u8 = undefined;
+    std.mem.writeInt(u64, &len_le, input.script_sig.len, .little);
+    sighash_hasher.update(&len_le);
+    sighash_hasher.update(input.script_sig);
+    std.mem.writeInt(u64, &len_le, job.witness.len, .little);
+    sighash_hasher.update(&len_le);
+    for (job.witness) |item| {
+        std.mem.writeInt(u64, &len_le, item.len, .little);
+        sighash_hasher.update(&len_le);
+        sighash_hasher.update(item);
+    }
     var idx_le: [8]u8 = undefined;
     std.mem.writeInt(u64, &idx_le, job.input_index, .little);
     sighash_hasher.update(&idx_le);
@@ -3646,10 +3668,10 @@ fn verifyScriptJob(job: *ScriptCheckJob, allocator: std.mem.Allocator, cache: *s
     const flags_u32: u32 = @intCast(@as(u21, @bitCast(job.flags)));
 
     // Assemble witness bytes: flatten the witness stack items into a single
-    // contiguous buffer so the key covers all witness material. NOTE: the
-    // 4096-byte truncation tracked separately as W160 BUG-19 is preserved
-    // here; bounding to a per-input synthetic sighash means a truncation
-    // collision can no longer cross input boundaries.
+    // contiguous buffer. This copy is bounded at 4096 bytes and carries no
+    // item counts or lengths, so it is NOT what makes the key unique: the
+    // wtxid and the length-prefixed witness hashed into per_input_sighash
+    // above are (W160 BUG-19).
     var witness_buf: [4096]u8 = undefined;
     var witness_len: usize = 0;
     for (job.witness) |item| {
