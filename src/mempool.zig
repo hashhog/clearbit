@@ -938,34 +938,77 @@ fn mallocUsage(alloc: usize) usize {
     return ((alloc + 31) >> 4) << 4;
 }
 
-/// Estimate of Core's mempool memory for one entry: RecursiveDynamicUsage(tx)
-/// (core_memusage.h, which becomes CTxMemPoolEntry::nUsageSize) plus the
-/// mapNextTx node per input and a fixed allowance for the entry, index and graph
-/// bookkeeping (CTxMemPool::DynamicMemoryUsage, txmempool.cpp:778).
-/// Calibrated against Core v31.1 regtest: a 1-in/1-out P2WPKH spend reports
-/// usage 1,176 (estimate 1,178) and 12 transactions of 800 P2WSH inputs plus two
-/// such small ones report 4,773,160 (about 397,500 each by estimate).  The limit
-/// only has to evict the same transactions as Core, so exactness is not required.
-pub fn txDynamicUsage(tx: *const types.Transaction) usize {
-    const SIZEOF_TXIN = 112;
-    const MAP_NEXT_TX_NODE = 48; // stl_tree_node<pair<const COutPoint*, const CTransaction*>>
-    const SIZEOF_TXOUT = 40;
-    const SCRIPT_INLINE = 28; // prevector<28> stores up to 28 bytes inline
-    const WITNESS_VEC_ELEM = 24; // sizeof(std::vector<uint8_t>)
-    const PER_TX_OVERHEAD = 650;
-    var mem: usize = PER_TX_OVERHEAD;
-    mem += mallocUsage(tx.inputs.len * SIZEOF_TXIN);
-    mem += tx.inputs.len * mallocUsage(MAP_NEXT_TX_NODE);
-    mem += mallocUsage(tx.outputs.len * SIZEOF_TXOUT);
+// x86_64 / libstdc++ / glibc `sizeof` of the Core v31.1 objects that
+// CTxMemPool::DynamicMemoryUsage (txmempool.cpp) charges.  CScript is
+// prevector<36, uint8_t>: a script of up to 36 bytes lives inline.
+const CORE_SIZEOF_TXIN: usize = 112;
+const CORE_SIZEOF_TXOUT: usize = 48;
+const CORE_SCRIPT_INLINE: usize = 36;
+const CORE_SIZEOF_TX: usize = 128;
+const CORE_SIZEOF_SHARED_COUNTER: usize = 24;
+const CORE_SIZEOF_WITNESS_ITEM_VEC: usize = 24;
+/// mapTx node: sizeof(CTxMemPoolEntry) + 9 pointers (txmempool.cpp).
+const CORE_MAPTX_ELEM: usize = 136 + 9 * 8;
+/// mapNextTx node: stl_tree_node<pair<const COutPoint*, const CTransaction*>>.
+const CORE_MAP_NEXT_NODE: usize = 48;
+/// mapDeltas node: stl_tree_node<pair<const Txid, CAmount>>.
+const CORE_MAP_DELTA_NODE: usize = 72;
+/// txns_randomized element: pair<Wtxid, txiter>.
+const CORE_RAND_PAIR: usize = 40;
+/// sizeof(TxGraphImpl::Entry).
+const CORE_GRAPH_ENTRY: usize = 80;
+/// m_main_chunkindex node: stl_tree_node<ChunkData>.
+const CORE_CHUNK_NODE: usize = 40;
+const CORE_SINGLETON_CLUSTER: usize = 48;
+const CORE_GENERIC_CLUSTER: usize = 104;
+const CORE_UNIQUE_PTR: usize = 8;
+/// DepGraph::Entry for BitSet<64>: FeeFrac 16 + two 8-byte sets.
+const CORE_DEP_ENTRY: usize = 32;
+/// GraphIndex / DepGraphIndex (uint32_t).
+const CORE_INDEX: usize = 4;
+
+fn coreScriptHeap(len: usize) usize {
+    return if (len <= CORE_SCRIPT_INLINE) 0 else mallocUsage(len);
+}
+
+/// Core RecursiveDynamicUsage(CTransactionRef) (core_memusage.h): the
+/// shared_ptr control block, the CTransaction object, and the vin / vout /
+/// script / witness allocations.  This is CTxMemPoolEntry::nUsageSize, summed
+/// into cachedInnerUsage.
+pub fn txInnerUsage(tx: *const types.Transaction) usize {
+    var mem: usize = mallocUsage(tx.inputs.len * CORE_SIZEOF_TXIN) +
+        mallocUsage(tx.outputs.len * CORE_SIZEOF_TXOUT);
     for (tx.inputs) |in| {
-        if (in.script_sig.len > SCRIPT_INLINE) mem += mallocUsage(in.script_sig.len);
-        mem += mallocUsage(in.witness.len * WITNESS_VEC_ELEM);
+        mem += coreScriptHeap(in.script_sig.len);
+        // The witness stack vector is reserved to its item count on unserialize.
+        mem += mallocUsage(in.witness.len * CORE_SIZEOF_WITNESS_ITEM_VEC);
         for (in.witness) |item| mem += mallocUsage(item.len);
     }
-    for (tx.outputs) |out| {
-        if (out.script_pubkey.len > SCRIPT_INLINE) mem += mallocUsage(out.script_pubkey.len);
-    }
-    return mem;
+    for (tx.outputs) |out| mem += coreScriptHeap(out.script_pubkey.len);
+    return mem + mallocUsage(CORE_SIZEOF_TX) + mallocUsage(CORE_SIZEOF_SHARED_COUNTER);
+}
+
+/// Core TxGraph cluster memory for a cluster of `n` transactions
+/// (txgraph.cpp {Singleton,Generic}ClusterImpl::TotalMemoryUsage, after
+/// Compact, so every vector's capacity equals the transaction count).
+fn coreClusterUsage(n: usize) usize {
+    if (n == 0) return 0;
+    if (n == 1) return mallocUsage(CORE_SINGLETON_CLUSTER) + CORE_UNIQUE_PTR;
+    return mallocUsage(n * CORE_INDEX) + mallocUsage(n * CORE_INDEX) +
+        mallocUsage(n * CORE_DEP_ENTRY) + mallocUsage(CORE_GENERIC_CLUSTER) + CORE_UNIQUE_PTR;
+}
+
+/// The part of Core's CTxMemPool::DynamicMemoryUsage that one transaction adds
+/// when it sits in a singleton cluster: its mapTx node, one mapNextTx node per
+/// input, its TxGraph entry, a singleton cluster with one chunk-index node, and
+/// RecursiveDynamicUsage(tx).  `Mempool.total_usage` is the sum of these;
+/// `Mempool.dynamicMemoryUsage` adds the multi-transaction cluster correction,
+/// txns_randomized and mapDeltas.
+pub fn txDynamicUsage(tx: *const types.Transaction) usize {
+    return mallocUsage(CORE_MAPTX_ELEM) +
+        tx.inputs.len * mallocUsage(CORE_MAP_NEXT_NODE) +
+        CORE_GRAPH_ENTRY + coreClusterUsage(1) + mallocUsage(CORE_CHUNK_NODE) +
+        txInnerUsage(tx);
 }
 
 /// A mempool transaction entry with metadata.
@@ -1096,10 +1139,20 @@ pub const Mempool = struct {
     /// Total mempool size in virtual bytes.
     total_size: usize,
 
-    /// Estimated dynamic memory usage of all entries (Core CTxMemPool::DynamicMemoryUsage
-    /// analogue).  `max_size` is enforced against THIS, not against vsize, as in
-    /// Core's TrimToSize (txmempool.cpp:868).
+    /// Sum of `txDynamicUsage` over the entries: Core's per-transaction memory
+    /// as if every transaction were a singleton cluster.  The reported and
+    /// enforced figure is `dynamicMemoryUsage()`, which adds the cluster
+    /// correction, txns_randomized and mapDeltas; `max_size` is enforced
+    /// against that, as in Core's TrimToSize (txmempool.cpp).
     total_usage: usize = 0,
+
+    /// Length and capacity of Core's `txns_randomized`
+    /// (vector<pair<Wtxid, txiter>>).  libstdc++ grows a full vector to
+    /// size + max(size, 1); removing the last entry takes the `clear()` branch,
+    /// which keeps the capacity.  DynamicMemoryUsage charges
+    /// MallocUsage(capacity * 40), so an emptied pool still reports 64.
+    txns_randomized_len: usize = 0,
+    txns_randomized_cap: usize = 0,
 
     /// Size limit in bytes (Core `-maxmempool` * 1,000,000, kernel/mempool_options.h
     /// max_size_bytes).  Defaults to MAX_MEMPOOL_SIZE; main.zig applies --maxmempool.
@@ -1764,10 +1817,11 @@ pub const Mempool = struct {
 
         self.total_size += vsize;
         self.total_usage += txDynamicUsage(&tx);
+        self.noteRandomizedAdded();
 
         // Core LimitMempoolSize then `if (!m_pool.exists(hash)) "mempool full"`
         // (validation.cpp Finalize).
-        if (!self.bypass_limits and self.total_usage > self.max_size) {
+        if (!self.bypass_limits and self.usageExceeds(self.max_size)) {
             self.trimToSize(self.max_size, &.{tx_hash});
             if (!self.entries.contains(tx_hash)) return MempoolError.MempoolFull;
         }
@@ -2235,6 +2289,7 @@ pub const Mempool = struct {
 
             self.total_size -|= entry.vsize;
             self.total_usage -|= txDynamicUsage(&entry.tx);
+            self.noteRandomizedRemoved();
             // FIX-73 / W120 BUG-3+5+8: free the heap-owned `replaces` slice
             // captured at admission (BIP-125 RBF evicted txids).
             if (entry.replaces) |rs| self.allocator.free(rs);
@@ -3014,7 +3069,7 @@ pub const Mempool = struct {
         _ = self.removeForReorg();
         // Core LimitMempoolSize: the bypass_limits re-adds may have pushed
         // the pool over its size limit.
-        if (self.total_usage > self.max_size) self.trimToSize(self.max_size, &.{});
+        if (self.usageExceeds(self.max_size)) self.trimToSize(self.max_size, &.{});
     }
 
     /// Post-reorg / post-disconnect re-check of every mempool entry against the
@@ -4747,7 +4802,7 @@ pub const Mempool = struct {
     /// Evict at least `needed_bytes` of memory usage, worst chunk first
     /// (see `trimToSize`).
     fn evict(self: *Mempool, needed_bytes: usize) !void {
-        self.trimToSize(self.total_usage -| needed_bytes, &.{});
+        self.trimToSize(self.dynamicMemoryUsage() -| needed_bytes, &.{});
     }
 
     /// Core CTxMemPool::TrimToSize (txmempool.cpp:861-911): while usage exceeds
@@ -4762,7 +4817,7 @@ pub const Mempool = struct {
         self.mutex.lock();
         defer self.mutex.unlock();
         self.updateMiningScores() catch {};
-        while (self.total_usage > limit and self.entries.count() > 0) {
+        while (self.entries.count() > 0 and self.usageExceeds(limit)) {
             if (!self.evictWorstChunk(newcomers)) break;
         }
     }
@@ -5465,6 +5520,119 @@ pub const Mempool = struct {
         return entries_list.toOwnedSlice();
     }
 
+    /// Core `txns_randomized.emplace_back` (txmempool.cpp addNewTransaction).
+    fn noteRandomizedAdded(self: *Mempool) void {
+        const old = self.txns_randomized_len;
+        // libstdc++ _M_check_len: size + max(size, 1).
+        if (old + 1 > self.txns_randomized_cap) self.txns_randomized_cap = old + @max(old, 1);
+        self.txns_randomized_len = old + 1;
+    }
+
+    /// Core removeUnchecked's txns_randomized update: while more than one
+    /// entry remains, swap with the back, pop_back, and shrink_to_fit when
+    /// size * 2 < capacity; the last entry takes the clear() branch, which
+    /// keeps the capacity.
+    fn noteRandomizedRemoved(self: *Mempool) void {
+        if (self.txns_randomized_len > 1) {
+            self.txns_randomized_len -= 1;
+            if (self.txns_randomized_len * 2 < self.txns_randomized_cap) {
+                self.txns_randomized_cap = self.txns_randomized_len;
+            }
+        } else {
+            self.txns_randomized_len = 0;
+        }
+    }
+
+    /// Core CTxMemPool::DynamicMemoryUsage (txmempool.cpp) for x86_64 /
+    /// libstdc++ / glibc: mapTx, mapNextTx, mapDeltas, txns_randomized,
+    /// TxGraph::GetMainMemoryUsage and cachedInnerUsage.  This is what
+    /// getmempoolinfo / REST report as `usage` and what -maxmempool trims to.
+    pub fn dynamicMemoryUsage(self: *Mempool) usize {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        const base: i64 = @intCast(self.total_usage +
+            mallocUsage(self.txns_randomized_cap * CORE_RAND_PAIR) +
+            mallocUsage(CORE_MAP_DELTA_NODE) * self.map_deltas.count());
+        const total = base + self.clusterUsageCorrection();
+        return if (total < 0) 0 else @intCast(total);
+    }
+
+    /// True when `dynamicMemoryUsage() > limit`.  The cluster correction is
+    /// at most CLUSTER_CORRECTION_MAX_PER_TX per transaction, so a pool whose
+    /// singleton sum plus that bound is under `limit` skips the cluster walk.
+    pub fn usageExceeds(self: *Mempool, limit: usize) bool {
+        const upper = self.total_usage +
+            mallocUsage(self.txns_randomized_cap * CORE_RAND_PAIR) +
+            mallocUsage(CORE_MAP_DELTA_NODE) * self.map_deltas.count() +
+            CLUSTER_CORRECTION_MAX_PER_TX * self.entries.count();
+        if (upper <= limit) return false;
+        return self.dynamicMemoryUsage() > limit;
+    }
+
+    /// Bound on the cluster correction per transaction.  For a cluster of
+    /// k >= 2 the correction is coreClusterUsage(k) + chunks * MallocUsage(40)
+    /// - k * (coreClusterUsage(1) + MallocUsage(40)) <= 2*(4k+31) + (32k+31)
+    /// + 136 - 72k < 165, i.e. below 83 per transaction.
+    const CLUSTER_CORRECTION_MAX_PER_TX: usize = 96;
+
+    /// `total_usage` charges every transaction as a singleton cluster with one
+    /// chunk.  For each cluster of two or more transactions (connected through
+    /// in-pool parent links, as Core's TxGraph groups them) replace that with
+    /// the generic cluster's memory plus one chunk-index node per chunk of
+    /// Core's optimal minimal-chunk linearization.
+    fn clusterUsageCorrection(self: *Mempool) i64 {
+        const a = self.allocator;
+        var visited = std.AutoHashMap(types.Hash256, void).init(a);
+        defer visited.deinit();
+        var members = std.ArrayList(types.Hash256).init(a);
+        defer members.deinit();
+        const singleton: i64 = @intCast(coreClusterUsage(1) + mallocUsage(CORE_CHUNK_NODE));
+        var correction: i64 = 0;
+        var it = self.entries.iterator();
+        while (it.next()) |kv| {
+            const start = kv.key_ptr.*;
+            if (visited.contains(start)) continue;
+            if (!self.hasInPoolNeighbor(kv.value_ptr.*)) continue;
+            members.clearRetainingCapacity();
+            visited.put(start, {}) catch return correction;
+            members.append(start) catch return correction;
+            var i: usize = 0;
+            while (i < members.items.len) : (i += 1) {
+                const cur = members.items[i];
+                const e = self.entries.get(cur) orelse continue;
+                for (e.tx.inputs) |inp| {
+                    const p = inp.previous_output.hash;
+                    if (!self.entries.contains(p) or visited.contains(p)) continue;
+                    visited.put(p, {}) catch return correction;
+                    members.append(p) catch return correction;
+                }
+                if (self.children.get(cur)) |kids| for (kids.items) |c| {
+                    if (!self.entries.contains(c) or visited.contains(c)) continue;
+                    visited.put(c, {}) catch return correction;
+                    members.append(c) catch return correction;
+                };
+            }
+            const k = members.items.len;
+            if (k < 2) continue;
+            // A cluster past MAX_CLUSTER_SIZE only exists transiently; charge
+            // one chunk per transaction for it.
+            const chunks = self.optimalChunkPartition(members.items, a, null) catch k;
+            correction += @as(i64, @intCast(coreClusterUsage(k) + chunks * mallocUsage(CORE_CHUNK_NODE))) -
+                @as(i64, @intCast(k)) * singleton;
+        }
+        return correction;
+    }
+
+    fn hasInPoolNeighbor(self: *Mempool, e: *const MempoolEntry) bool {
+        for (e.tx.inputs) |inp| {
+            if (self.entries.contains(inp.previous_output.hash)) return true;
+        }
+        if (self.children.get(e.txid)) |kids| for (kids.items) |c| {
+            if (self.entries.contains(c)) return true;
+        };
+        return false;
+    }
+
     /// Get mempool statistics.
     pub fn stats(self: *Mempool) struct { count: usize, size: usize, usage: usize, total_fee: i64 } {
         self.mutex.lock();
@@ -5477,7 +5645,7 @@ pub const Mempool = struct {
         return .{
             .count = self.entries.count(),
             .size = self.total_size,
-            .usage = self.total_usage,
+            .usage = self.dynamicMemoryUsage(),
             .total_fee = total_fee,
         };
     }
@@ -5531,9 +5699,10 @@ pub const Mempool = struct {
         if (now > self.last_rolling_fee_update + 10) {
             var halflife: f64 = ROLLING_FEE_HALFLIFE;
             // Accelerate decay when mempool is mostly empty.
-            if (self.total_usage < self.max_size / 4) {
+            const usage = self.dynamicMemoryUsage();
+            if (usage < self.max_size / 4) {
                 halflife /= 4.0;
-            } else if (self.total_usage < self.max_size / 2) {
+            } else if (usage < self.max_size / 2) {
                 halflife /= 2.0;
             }
 
@@ -5862,6 +6031,7 @@ pub const Mempool = struct {
 
         self.total_size += vsize;
         self.total_usage += txDynamicUsage(&tx);
+        self.noteRandomizedAdded();
 
         // Feed the fee estimator using the package fee rate (Core: processTransaction
         // uses effective/package rate for CPFP child txs).
@@ -6359,10 +6529,18 @@ pub const Mempool = struct {
     /// larger cluster returns error.ClusterTooLarge. The caller owns the
     /// returned slice, indexed like `cluster`.
     pub fn optimalChunkInfos(self: *Mempool, cluster: []const types.Hash256, allocator: std.mem.Allocator) ![]ChunkInfo {
-        const n = cluster.len;
-        const out = try allocator.alloc(ChunkInfo, n);
+        const out = try allocator.alloc(ChunkInfo, cluster.len);
         errdefer allocator.free(out);
-        if (n == 0) return out;
+        _ = try self.optimalChunkPartition(cluster, allocator, out);
+        return out;
+    }
+
+    /// The chunk partition behind `optimalChunkInfos`: returns the number of
+    /// chunks and, when `out` is given (indexed like `cluster`), fills in each
+    /// transaction's chunk totals.
+    fn optimalChunkPartition(self: *Mempool, cluster: []const types.Hash256, allocator: std.mem.Allocator, out: ?[]ChunkInfo) !usize {
+        const n = cluster.len;
+        if (n == 0) return 0;
         if (n > 64) return error.ClusterTooLarge;
 
         var fees: [64]i64 = undefined;
@@ -6390,19 +6568,23 @@ pub const Mempool = struct {
         defer allocator.free(flow_buf);
 
         var remaining: u64 = if (n == 64) std.math.maxInt(u64) else (@as(u64, 1) << @intCast(n)) - 1;
+        var chunks: usize = 0;
         while (remaining != 0) {
             const chunk = solver.nextChunk(remaining, flow_buf);
             if (chunk == 0) return error.ClusterTooLarge; // unreachable: a non-empty set always has a best subset
-            const info = ChunkInfo{ .fee = solver.feeOf(chunk), .weight = solver.sizeOf(chunk) };
-            var bits = chunk;
-            while (bits != 0) {
-                const b = @ctz(bits);
-                out[b] = info;
-                bits &= bits - 1;
+            chunks += 1;
+            if (out) |o| {
+                const info = ChunkInfo{ .fee = solver.feeOf(chunk), .weight = solver.sizeOf(chunk) };
+                var bits = chunk;
+                while (bits != 0) {
+                    const b = @ctz(bits);
+                    o[b] = info;
+                    bits &= bits - 1;
+                }
             }
             remaining &= ~chunk;
         }
-        return out;
+        return chunks;
     }
 
     /// Exact max-feerate closure search over one cluster of at most 64
@@ -11990,7 +12172,7 @@ pub fn acceptPackage(
 
     // Core SubmitPackage: LimitMempoolSize once the whole package is in, then
     // any package tx trimmed out is "mempool full" (validation.cpp).
-    if (!mempool.bypass_limits and mempool.total_usage > mempool.max_size) {
+    if (!mempool.bypass_limits and mempool.usageExceeds(mempool.max_size)) {
         var added = std.ArrayList(types.Hash256).init(allocator);
         defer added.deinit();
         for (tx_results, 0..) |r, i| {
@@ -16344,14 +16526,15 @@ test "maxmempool: configured size limit evicts and raises the rolling minimum fe
     }};
 
     try mempool.addTransaction(.{ .version = 2, .inputs = &inputs1, .outputs = &outputs, .lock_time = 0 });
-    // Room for one byte more than the first tx's usage: the second cannot fit.
-    mempool.max_size = mempool.total_usage + 1;
+    // Room for the first tx plus txns_randomized growing from capacity 1 to 2
+    // (MallocUsage 64 -> 96, as in Core), but not for a second transaction.
+    mempool.max_size = mempool.dynamicMemoryUsage() + 64;
     try std.testing.expectError(MempoolError.MempoolFull, mempool.addTransaction(.{ .version = 2, .inputs = &inputs2, .outputs = &outputs, .lock_time = 0 }));
 
     try std.testing.expectEqual(@as(usize, 1), mempool.entries.count());
     // Both pay 0: on the tie the newcomer is the one refused, the first stays.
     try std.testing.expect(mempool.contains(try crypto.computeTxid(&types.Transaction{ .version = 2, .inputs = &inputs1, .outputs = &outputs, .lock_time = 0 }, allocator)));
-    try std.testing.expect(mempool.total_usage <= mempool.max_size);
+    try std.testing.expect(mempool.dynamicMemoryUsage() <= mempool.max_size);
     try std.testing.expect(mempool.rolling_minimum_fee_rate >= @as(f64, @floatFromInt(INCREMENTAL_RELAY_FEE)));
 }
 
@@ -16387,7 +16570,7 @@ test "maxmempool: a newcomer at or below the worst chunk feerate is refused and 
     const worse = maxmempoolTestTx(&wi, &wo, [_]u8{0x02} ** 32, 50_000);
     const worse_id = try crypto.computeTxid(&worse, allocator);
     _ = try mempool.prioritiseTransaction(worse_id, 1 * 82);
-    mempool.max_size = mempool.total_usage + txDynamicUsage(&worse) - 1;
+    mempool.max_size = mempool.dynamicMemoryUsage() + txDynamicUsage(&worse) - 1;
 
     try std.testing.expectError(MempoolError.MempoolFull, mempool.addTransaction(worse));
     try std.testing.expect(mempool.contains(resident_id));
@@ -16415,7 +16598,7 @@ test "maxmempool: a newcomer at or below the worst chunk feerate is refused and 
     try mempool.addTransaction(better);
     try std.testing.expect(mempool.contains(better_id));
     try std.testing.expect(!mempool.contains(resident_id));
-    try std.testing.expect(mempool.total_usage <= mempool.max_size);
+    try std.testing.expect(mempool.dynamicMemoryUsage() <= mempool.max_size);
     try std.testing.expectApproxEqAbs(@as(f64, 50_100.0), mempool.rolling_minimum_fee_rate, 1e-6);
 }
 
@@ -16445,13 +16628,13 @@ test "maxmempool: eviction removes the whole worst chunk with descendants and bu
     const newcomer_id = try crypto.computeTxid(&newcomer, allocator);
     _ = try mempool.prioritiseTransaction(newcomer_id, 20 * 82);
     // Dropping either A (with B) or B alone would make room; Core drops the chunk.
-    mempool.max_size = mempool.total_usage + txDynamicUsage(&newcomer) - 1;
+    mempool.max_size = mempool.dynamicMemoryUsage() + txDynamicUsage(&newcomer) - 1;
     try mempool.addTransaction(newcomer);
 
     try std.testing.expect(mempool.contains(newcomer_id));
     try std.testing.expect(!mempool.contains(parent_id));
     try std.testing.expect(!mempool.contains(child_id));
-    try std.testing.expect(mempool.total_usage <= mempool.max_size);
+    try std.testing.expect(mempool.dynamicMemoryUsage() <= mempool.max_size);
     // 5 sat/vB chunk + 100 sat/kvB incremental = 5100 sat/kvB, not either tx's own rate.
     try std.testing.expectApproxEqAbs(@as(f64, 5100.0), mempool.rolling_minimum_fee_rate, 1e-6);
 }
@@ -16487,7 +16670,7 @@ test "maxmempool: a low-fee CPFP parent is kept when the package chunk beats the
     const child = maxmempoolTestTx(&ci, &co, parent_id, 1_000_000 - 1 - 3279);
     const child_id = try crypto.computeTxid(&child, allocator);
 
-    mempool.max_size = mempool.total_usage + txDynamicUsage(&parent) + txDynamicUsage(&child) - 1;
+    mempool.max_size = mempool.dynamicMemoryUsage() + txDynamicUsage(&parent) + txDynamicUsage(&child) - 1;
     var result = try acceptPackage(&mempool, &[_]types.Transaction{ parent, child }, allocator);
     defer result.deinit();
 
@@ -16496,30 +16679,134 @@ test "maxmempool: a low-fee CPFP parent is kept when the package chunk beats the
     try std.testing.expect(mempool.contains(child_id));
     try std.testing.expect(mempool.contains(funding_id));
     try std.testing.expect(!mempool.contains(resident_id));
-    try std.testing.expect(mempool.total_usage <= mempool.max_size);
+    try std.testing.expect(mempool.dynamicMemoryUsage() <= mempool.max_size);
     try std.testing.expectApproxEqAbs(@as(f64, 10_100.0), mempool.rolling_minimum_fee_rate, 1e-6);
 }
 
-test "txDynamicUsage matches Core's calibration for an 800-input P2WSH spend" {
-    const allocator = std.testing.allocator;
-    const n = 800;
-    const inputs = try allocator.alloc(types.TxIn, n);
-    defer allocator.free(inputs);
-    const item80 = [_]u8{0x11} ** 80;
-    const witness = [_][]const u8{ &item80, &item80, &[_]u8{ 0x75, 0x75, 0x51 } };
-    for (inputs) |*in| in.* = .{
-        .previous_output = .{ .hash = [_]u8{0x01} ** 32, .index = 0 },
+// ----------------------------------------------------------------------------
+// getmempoolinfo `usage` = Core v31.1 CTxMemPool::DynamicMemoryUsage.
+// Expected numbers are Core's own answers in the core-regtest
+// warden_invalidated_submit group (tools/core-regtest, -maxmempool=5):
+// tip100-info 1176, usage-drained 64, usage-2in2out 1624, usage-heavy 1272,
+// usage-chain 2456, pressure/info 4,773,160.  Shapes match the harness: a
+// P2WPKH witness is a 72-byte signature and a 33-byte key; outputs pay a
+// 22-byte P2WPKH or 34-byte P2WSH script; a "drop" input carries two 80-byte
+// items and the 3-byte OP_DROP OP_DROP OP_TRUE script.
+// ----------------------------------------------------------------------------
+
+const usage_sig = [_]u8{0x30} ** 72;
+const usage_key = [_]u8{0x02} ** 33;
+const usage_p2wpkh_witness = [_][]const u8{ &usage_sig, &usage_key };
+const usage_item_a = [_]u8{0x11} ** 80;
+const usage_item_b = [_]u8{0x22} ** 80;
+const usage_drop_script = [_]u8{ 0x75, 0x75, 0x51 };
+const usage_drop_witness = [_][]const u8{ &usage_item_a, &usage_item_b, &usage_drop_script };
+const usage_p2wpkh_spk = [_]u8{ 0x00, 0x14 } ++ [_]u8{0x33} ** 20;
+const usage_p2wsh_spk = [_]u8{ 0x00, 0x20 } ++ [_]u8{0x44} ** 32;
+
+fn usageTestInput(prev: types.Hash256, vout: u32, witness: []const []const u8) types.TxIn {
+    return .{
+        .previous_output = .{ .hash = prev, .index = vout },
         .script_sig = &[_]u8{},
         .sequence = 0xFFFFFFFD,
-        .witness = &witness,
+        .witness = witness,
     };
-    const script_pubkey = [_]u8{ 0x00, 0x14 } ++ [_]u8{0x11} ** 20;
-    const outputs = [_]types.TxOut{.{ .value = 1, .script_pubkey = &script_pubkey }};
-    const tx = types.Transaction{ .version = 2, .inputs = inputs, .outputs = &outputs, .lock_time = 0 };
-    // Core v31.1 regtest: 12 of these plus two small transactions report
-    // usage 4,773,160, i.e. about 397,567 each.
-    const usage = txDynamicUsage(&tx);
-    try std.testing.expect(usage > 394_000 and usage < 401_000);
+}
+
+test "getmempoolinfo usage: Core's DynamicMemoryUsage for each transaction shape" {
+    const allocator = std.testing.allocator;
+    var mempool = Mempool.init(null, null, allocator);
+    defer mempool.deinit();
+
+    // tip100-info: one 1-in/1-out P2WPKH spend.
+    var si = [_]types.TxIn{usageTestInput([_]u8{0x01} ** 32, 0, &usage_p2wpkh_witness)};
+    var so = [_]types.TxOut{.{ .value = 1000, .script_pubkey = &usage_p2wpkh_spk }};
+    const spend = types.Transaction{ .version = 2, .inputs = &si, .outputs = &so, .lock_time = 0 };
+    try mempool.addTransaction(spend);
+    try std.testing.expectEqual(@as(usize, 1176), mempool.stats().usage);
+
+    // usage-drained: the pool is empty again, but txns_randomized keeps its
+    // capacity (Core removeUnchecked's clear() branch): MallocUsage(1 * 40).
+    mempool.removeTransaction(try crypto.computeTxid(&spend, allocator));
+    try std.testing.expectEqual(@as(usize, 0), mempool.entries.count());
+    try std.testing.expectEqual(@as(usize, 64), mempool.stats().usage);
+
+    // usage-2in2out: two P2WPKH inputs, a P2WPKH and a P2WSH output.
+    var ti = [_]types.TxIn{
+        usageTestInput([_]u8{0x02} ** 32, 0, &usage_p2wpkh_witness),
+        usageTestInput([_]u8{0x03} ** 32, 0, &usage_p2wpkh_witness),
+    };
+    var to = [_]types.TxOut{
+        .{ .value = 1000, .script_pubkey = &usage_p2wpkh_spk },
+        .{ .value = 1000, .script_pubkey = &usage_p2wsh_spk },
+    };
+    const two = types.Transaction{ .version = 2, .inputs = &ti, .outputs = &to, .lock_time = 0 };
+    try mempool.addTransaction(two);
+    try std.testing.expectEqual(@as(usize, 1624), mempool.stats().usage);
+    mempool.removeTransaction(try crypto.computeTxid(&two, allocator));
+
+    // usage-heavy: one drop-script P2WSH input, one P2WPKH output.
+    var hi = [_]types.TxIn{usageTestInput([_]u8{0x04} ** 32, 0, &usage_drop_witness)};
+    var ho = [_]types.TxOut{.{ .value = 1000, .script_pubkey = &usage_p2wpkh_spk }};
+    const heavy = types.Transaction{ .version = 2, .inputs = &hi, .outputs = &ho, .lock_time = 0 };
+    try mempool.addTransaction(heavy);
+    try std.testing.expectEqual(@as(usize, 1272), mempool.stats().usage);
+    mempool.removeTransaction(try crypto.computeTxid(&heavy, allocator));
+
+    // usage-chain: parent and child form one two-transaction cluster with
+    // two chunks, and txns_randomized grows to capacity 2.  The harness
+    // parent pays twice the child's fee, so it is a chunk of its own; with no
+    // chain state here the parent's fee is a prioritisetransaction delta, and
+    // Core charges that mapDeltas node too: MallocUsage(72) = 96.
+    var pi = [_]types.TxIn{usageTestInput([_]u8{0x05} ** 32, 0, &usage_p2wpkh_witness)};
+    var po = [_]types.TxOut{.{ .value = 100_000, .script_pubkey = &usage_p2wpkh_spk }};
+    const parent = types.Transaction{ .version = 2, .inputs = &pi, .outputs = &po, .lock_time = 0 };
+    _ = try mempool.prioritiseTransaction(try crypto.computeTxid(&parent, allocator), 200_000);
+    try mempool.addTransaction(parent);
+    var ci = [_]types.TxIn{usageTestInput(try crypto.computeTxid(&parent, allocator), 0, &usage_p2wpkh_witness)};
+    var co = [_]types.TxOut{.{ .value = 99_000, .script_pubkey = &usage_p2wsh_spk }};
+    const child = types.Transaction{ .version = 2, .inputs = &ci, .outputs = &co, .lock_time = 0 };
+    try mempool.addTransaction(child);
+    try std.testing.expectEqual(@as(usize, 2), mempool.entries.count());
+    try std.testing.expectEqual(@as(usize, 2456 + 96), mempool.stats().usage);
+}
+
+test "getmempoolinfo usage: Core's 4,773,160 for the chain plus 12 of 14 800-input drop spends" {
+    const allocator = std.testing.allocator;
+    var mempool = Mempool.init(null, null, allocator);
+    defer mempool.deinit();
+    mempool.bypass_limits = true;
+
+    // Parent outpays child (its fee is a delta here: + MallocUsage(72) = 96).
+    var pi = [_]types.TxIn{usageTestInput([_]u8{0x05} ** 32, 0, &usage_p2wpkh_witness)};
+    var po = [_]types.TxOut{.{ .value = 100_000, .script_pubkey = &usage_p2wpkh_spk }};
+    const parent = types.Transaction{ .version = 2, .inputs = &pi, .outputs = &po, .lock_time = 0 };
+    _ = try mempool.prioritiseTransaction(try crypto.computeTxid(&parent, allocator), 200_000);
+    try mempool.addTransaction(parent);
+    var ci = [_]types.TxIn{usageTestInput(try crypto.computeTxid(&parent, allocator), 0, &usage_p2wpkh_witness)};
+    var co = [_]types.TxOut{.{ .value = 99_000, .script_pubkey = &usage_p2wsh_spk }};
+    try mempool.addTransaction(.{ .version = 2, .inputs = &ci, .outputs = &co, .lock_time = 0 });
+
+    // The pressure phase sends 14 spends of 800 drop inputs each; Core keeps
+    // 12.  txns_randomized grew to capacity 16 and does not shrink at 14.
+    const n_in = 800;
+    var txids: [14]types.Hash256 = undefined;
+    const inputs = try allocator.alloc(types.TxIn, 14 * n_in);
+    defer allocator.free(inputs);
+    var outs: [14][1]types.TxOut = undefined;
+    for (0..14) |t| {
+        var prev = [_]u8{0xA0} ** 32;
+        prev[0] = @intCast(t);
+        for (0..n_in) |i| inputs[t * n_in + i] = usageTestInput(prev, @intCast(i), &usage_drop_witness);
+        outs[t][0] = .{ .value = 1000, .script_pubkey = &usage_p2wpkh_spk };
+        const tx = types.Transaction{ .version = 2, .inputs = inputs[t * n_in .. (t + 1) * n_in], .outputs = &outs[t], .lock_time = 0 };
+        txids[t] = try crypto.computeTxid(&tx, allocator);
+        try mempool.addTransaction(tx);
+    }
+    mempool.removeTransaction(txids[0]);
+    mempool.removeTransaction(txids[1]);
+    try std.testing.expectEqual(@as(usize, 14), mempool.entries.count());
+    try std.testing.expectEqual(@as(usize, 4_773_160 + 96), mempool.stats().usage);
 }
 
 // ============================================================================
