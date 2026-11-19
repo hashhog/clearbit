@@ -1993,6 +1993,37 @@ pub fn build(b: *std.Build) void {
         test_step.dependOn(&run_rdr_tests.step);
     }
 
+    // BIP-68 coin nCoinTime from the connecting block's ancestor chain (not
+    // the sparse H: index).  Same rig as test-rbf-diagram-reason; part of `test`.
+    {
+        const b68_tests = b.addTest(.{
+            .root_source_file = b.path("tests_bip68_coin_mtp_ancestor.zig"),
+            .target = target,
+            .optimize = optimize,
+            .filters = &[_][]const u8{"tests_bip68_coin_mtp_ancestor"},
+        });
+        b68_tests.linkSystemLibrary("rocksdb");
+        b68_tests.linkSystemLibrary("secp256k1");
+        b68_tests.addIncludePath(.{ .cwd_relative = secp256k1_include });
+        b68_tests.linkLibC();
+        if (target.result.cpu.arch == .x86_64) {
+            b68_tests.addCSourceFile(.{
+                .file = b.path("src/sha256_shani.c"),
+                .flags = shani_cflags,
+            });
+        }
+        if (minisketch_enabled) {
+            b68_tests.linkSystemLibrary("minisketch");
+            b68_tests.addIncludePath(.{ .cwd_relative = minisketch_include });
+        }
+        b68_tests.root_module.addOptions("build_options", build_options);
+
+        const run_b68_tests = b.addRunArtifact(b68_tests);
+        const b68_step = b.step("test-bip68-coin-mtp-ancestor", "Run BIP-68 coin-MTP ancestor-walk tests (bad-txns-nonfinal)");
+        b68_step.dependOn(&run_b68_tests.step);
+        test_step.dependOn(&run_b68_tests.step);
+    }
+
     // submitpackage response shape vs Core.  Same rig as test-tma-parity above.
     {
         const sps_tests = b.addTest(.{

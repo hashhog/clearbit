@@ -10999,9 +10999,16 @@ pub const RpcServer = struct {
             }
         };
         var adapter = Adapter{ .cs_ptr = self.chain_state, .alloc = self.allocator };
-        // Ancestor (MTP) reads get their own error slot (this is the RPC
-        // thread; the P2P thread owns PeerManager.ancestor_read_err).
-        var mtp_sink = peer_mod.PeerManager.MtpSink{ .pm = self.peer_manager };
+        // BIP-68 nCoinTime from THIS block's ancestor chain (walk from its
+        // parent; never the sparse H: index).  It carries its own error slot
+        // (this is the RPC thread; the P2P thread owns
+        // PeerManager.ancestor_read_err).
+        var coin_mtp = peer_mod.PeerManager.CoinMtpWalk.init(
+            self.peer_manager,
+            block.header.prev_block,
+            if (height > 0) height - 1 else 0,
+        );
+        defer coin_mtp.deinit();
         var anc_err: ?anyerror = null;
 
         // ── Stage split: CheckBlockHeader (high-hash) BEFORE the contextual gate ─
@@ -11076,8 +11083,8 @@ pub const RpcServer = struct {
             .current_time = current_time_val,
             .force_skip_scripts = false,
             .expected_bits = expected_bits_val,
-            .getMtpAtHeightFn = peer_mod.PeerManager.MtpSink.trampoline,
-            .getMtpAtHeightCtx = @ptrCast(&mtp_sink),
+            .getMtpAtHeightFn = peer_mod.PeerManager.CoinMtpWalk.trampoline,
+            .getMtpAtHeightCtx = @ptrCast(&coin_mtp),
             .getBlockHashByHeightFn = peer_mod.PeerManager.getBlockHashByHeightTrampoline,
             .getBlockHashByHeightCtx = @ptrCast(self.peer_manager),
             .is_requested = true,
@@ -11104,7 +11111,7 @@ pub const RpcServer = struct {
         // concluded (a coin it could not read looked missing; a window it
         // could not read waived a time lock).  Not a verdict.
         if (adapter.read_err) |e| return .{ .system_fault = e };
-        if (mtp_sink.err) |e| return .{ .system_fault = e };
+        if (coin_mtp.err) |e| return .{ .system_fault = e };
         if (anc_err) |e| return .{ .system_fault = e };
         accept_res catch |err| {
             if (validation.isSystemValidationError(err)) return .{ .system_fault = err };
@@ -11130,7 +11137,7 @@ pub const RpcServer = struct {
                     connect_failed = true;
                 } else |_| {}
                 if (adapter.read_err) |e| return .{ .system_fault = e };
-                if (mtp_sink.err) |e| return .{ .system_fault = e };
+                if (coin_mtp.err) |e| return .{ .system_fault = e };
             }
             return .{ .reject = bip22, .connect_failed = connect_failed };
         };
