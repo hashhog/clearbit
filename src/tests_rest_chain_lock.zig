@@ -483,11 +483,10 @@ test "tests_rest_chain_lock: every REST endpoint waits for the chain lock" {
 // 3. /rest/blockfilterheaders must NOT hold cs_main for its filter walk
 // ====================================================================
 //
-// The handler recomputes every filter from genesis to the requested block.
-// Run under cs_main, one unauthenticated GET at mainnet height would stall
-// block connection for the whole walk.  It must collect the hashes it needs
-// under the lock and release it for the filter work: a P2P block connect
-// must complete while the REST request is parked inside the walk.
+// The handler collects the <count> active-chain hashes under cs_main and then
+// reads one persisted filter header per block from the BlockFilterIndex.
+// Those reads touch only RocksDB, so they run with cs_main released: a P2P
+// block connect must complete while the REST request is parked inside them.
 
 test "tests_rest_chain_lock: REST blockfilterheaders releases the chain lock for its filter walk" {
     // The park point exists only once the walk runs in a lock-free window.
@@ -524,6 +523,13 @@ test "tests_rest_chain_lock: REST blockfilterheaders releases the chain lock for
     cm.active_tip = a1_entry;
     fx.server.setChainManager(&cm);
 
+    // Index on, with a known header persisted for a1 (the handler answers
+    // from CF_BLOCK_FILTER_HEADER, Core LookupFilterHeader).
+    fx.cs.blockfilterindex_enabled = true;
+    defer fx.cs.blockfilterindex_enabled = false;
+    const sentinel: types.Hash256 = [_]u8{0x5A} ** 32;
+    try fx.db.put(storage.CF_BLOCK_FILTER_HEADER, &a1.hash, &sentinel);
+
     const bh = hashHexDisplay(a1.hash);
     const path = try std.fmt.allocPrint(allocator, "/rest/blockfilterheaders/basic/1/{s}.json", .{bh});
     defer allocator.free(path);
@@ -554,24 +560,12 @@ test "tests_rest_chain_lock: REST blockfilterheaders releases the chain lock for
     try testing.expectEqual(@as(u32, 2), fx.cs.best_height);
     try testing.expect(std.mem.startsWith(u8, resp, "HTTP/1.1 200"));
 
-    // The reply is still right: the one header (block a1) equals the
-    // `header` that JSON-RPC getblockfilter computes for a1 by its own,
-    // unchanged walk.
+    // The reply is still right: the one header is the persisted a1 entry.
     const body_at = (std.mem.indexOf(u8, resp, "\r\n\r\n") orelse return error.NoBody) + 4;
     const rest_body = resp[body_at..];
-    const rpc_req = try std.fmt.allocPrint(allocator, "{{\"jsonrpc\":\"1.0\",\"id\":1,\"method\":\"getblockfilter\",\"params\":[\"{s}\"]}}", .{bh});
-    defer allocator.free(rpc_req);
-    // getblockfilter refuses without the index flag; no filter is persisted,
-    // so it still computes every filter on demand, as the REST call did.
-    fx.cs.blockfilterindex_enabled = true;
-    const rpc_resp = try fx.server.dispatch(rpc_req);
-    fx.cs.blockfilterindex_enabled = false;
-    defer allocator.free(rpc_resp);
-    const hk = "\"header\":\"";
-    const hi = (std.mem.indexOf(u8, rpc_resp, hk) orelse return error.NoHeaderField) + hk.len;
-    const want_header = rpc_resp[hi .. hi + 64];
+    const want_header = hashHexDisplay(sentinel);
     const want_body = try std.fmt.allocPrint(allocator, "[\"{s}\"]", .{want_header});
     defer allocator.free(want_body);
-    std.debug.print("[REST-filterheaders] rest={s} getblockfilter.header={s}\n", .{ rest_body, want_header });
+    std.debug.print("[REST-filterheaders] rest={s} persisted={s}\n", .{ rest_body, want_header });
     try testing.expectEqualStrings(want_body, rest_body);
 }
