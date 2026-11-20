@@ -3523,7 +3523,6 @@ pub const RpcServer = struct {
         return try self.allocator.dupe(u8, encoded);
     }
 
-    /// Dispatch a JSON-RPC request to the appropriate handler.
     /// Where an HTTP JSON-RPC body came from, for per-request wallet routing.
     pub const RequestCtx = struct {
         /// The request URI path (`/` or `/wallet/<name>`).
@@ -3533,8 +3532,8 @@ pub const RpcServer = struct {
         serve_locked: bool,
     };
 
-    /// Dispatch a body with no HTTP context (internal REST sub-calls and
-    /// tests).  The caller is responsible for `current_wallet` and locking.
+    /// Dispatch a JSON-RPC body to the appropriate handler, with no HTTP
+    /// context (internal REST sub-calls and tests).  The caller is responsible for `current_wallet` and locking.
     pub fn dispatch(self: *RpcServer, body: []const u8) ![]const u8 {
         return self.dispatchFor(body, null);
     }
@@ -3607,16 +3606,6 @@ pub const RpcServer = struct {
             return try self.jsonRpcError(RPC_MISC_ERROR, "Wrong number of arguments", id);
         }
 
-        // The chain lock (cs_main).  Every handler below reads or writes state
-        // the P2P thread mutates — the coin cache (a gettxout read-through can
-        // insert, evict and FLUSH), the tip, the block and header index, the
-        // mempool, the peer list and address book — so the whole call runs
-        // under it, the way Core's handlers open with LOCK(cs_main) (and
-        // LOCK2(cs_main, mempool.cs)).  Before 2026-10-07 no RPC reader took it
-        // (audit CB-1..CB-13).  Exceptions: the waitfor* family sleeps on the
-        // tip notifier and must not hold it (waitForTip locks per check), and
-        // handlers that do long or blocking work release it themselves
-        // (scantxoutset's walk, addnode's DNS) through chain_lock.IoWindow.
         // Per-request wallet routing (Core GetWalletForJSONRPCRequest).  The
         // wait family touches no wallet and must not hold serve_mutex while
         // it sleeps; every other method holds it (taking it here when the
@@ -3642,6 +3631,16 @@ pub const RpcServer = struct {
             self.current_wallet = null;
         };
 
+        // The chain lock (cs_main).  Every handler below reads or writes state
+        // the P2P thread mutates — the coin cache (a gettxout read-through can
+        // insert, evict and FLUSH), the tip, the block and header index, the
+        // mempool, the peer list and address book — so the whole call runs
+        // under it, the way Core's handlers open with LOCK(cs_main) (and
+        // LOCK2(cs_main, mempool.cs)).  Before 2026-10-07 no RPC reader took it
+        // (audit CB-1..CB-13).  Exceptions: the waitfor* family sleeps on the
+        // tip notifier and must not hold it (waitForTip locks per check), and
+        // handlers that do long or blocking work release it themselves
+        // (scantxoutset's walk, addnode's DNS) through chain_lock.IoWindow.
         const chain_locked = !is_wait;
         if (chain_locked) self.chain_state.connect_mutex.lock();
         defer if (chain_locked) self.chain_state.connect_mutex.unlock();

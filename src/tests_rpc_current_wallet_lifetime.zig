@@ -184,11 +184,11 @@ test "current_wallet a waitfor batch to /wallet/w runs its wallet call on w even
 
     const Waiter = struct {
         fn run(l: *Live, out: *?[]u8) void {
-            // Height far above the tip, 1.5 s timeout: the wait times out and
+            // Height far above the tip, 4 s timeout: the wait times out and
             // the batch then runs getwalletinfo, all on the wait thread.
             out.* = l.post(
                 "/wallet/w",
-                "[{\"id\":1,\"method\":\"waitforblockheight\",\"params\":[1000000,1500]},{\"id\":2,\"method\":\"getwalletinfo\",\"params\":[]}]",
+                "[{\"id\":1,\"method\":\"waitforblockheight\",\"params\":[1000000,4000]},{\"id\":2,\"method\":\"getwalletinfo\",\"params\":[]}]",
             ) catch null;
         }
     };
