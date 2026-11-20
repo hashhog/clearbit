@@ -5106,6 +5106,19 @@ pub const PeerManager = struct {
         try self.ban_list.banAddress(address, duration, reason);
     }
 
+    /// Write the ban-list entry for a peer whose should_ban verdict is being
+    /// acted on, unless it is local. Core MaybeDiscourageAndDisconnect
+    /// (net_processing.cpp): a local peer is disconnected only and never
+    /// discouraged. misbehaving() still sets should_ban on a local peer to
+    /// force the disconnect, so every site that acts on should_ban must come
+    /// through here; banning a loopback address refuses every later inbound
+    /// loopback connection (local proxy, tooling) for DEFAULT_BAN_DURATION.
+    /// The caller removes the peer.
+    fn discourageMisbehavingPeer(self: *PeerManager, peer_obj: *const Peer) void {
+        if (peer_obj.isLocalAddress()) return;
+        self.banIP(peer_obj.address, DEFAULT_BAN_DURATION, "misbehavior threshold reached") catch {};
+    }
+
     /// Unban an IP address.
     pub fn unbanIP(self: *PeerManager, address: std.net.Address) bool {
         return self.ban_list.unbanAddress(address);
@@ -6192,8 +6205,9 @@ pub const PeerManager = struct {
                     // a local/loopback peer is DISCONNECT-ONLY — no discourage
                     // (ban-list) entry is ever written.  misbehaving() documents
                     // this exemption but still sets should_ban to force the
-                    // disconnect, so the ban-list write MUST be suppressed here
-                    // or the exemption is defeated.  Without this guard a single
+                    // disconnect, so the ban-list write MUST be suppressed
+                    // (discourageMisbehavingPeer does, for all three should_ban
+                    // sites) or the exemption is defeated.  Without this guard a single
                     // misbehaving() on a 127.0.0.1 peer persisted a loopback ban
                     // to banlist.json (written relative to cwd, shared across
                     // datadirs incl. mainnet) which then RST'd every subsequent
@@ -6201,9 +6215,7 @@ pub const PeerManager = struct {
                     // "retry: handshake never completes" half of the P2P-reorg
                     // wedge, and a footgun that could brick the mainnet node's
                     // local RPC/consensus-diff tooling.
-                    if (!peer_obj.isLocalAddress()) {
-                        self.banIP(peer_obj.address, DEFAULT_BAN_DURATION, "misbehavior threshold reached") catch {};
-                    }
+                    self.discourageMisbehavingPeer(peer_obj);
                     self.removePeerByIndex(i);
                     continue;
                 }
@@ -6390,7 +6402,7 @@ pub const PeerManager = struct {
 
                     // Check if should be banned after misbehavior
                     if (peer_obj.should_ban) {
-                        self.banIP(peer_obj.address, DEFAULT_BAN_DURATION, "misbehavior threshold reached") catch {};
+                        self.discourageMisbehavingPeer(peer_obj);
                         self.removePeerByIndex(i);
                         break;
                     }
@@ -6405,9 +6417,7 @@ pub const PeerManager = struct {
                 // Up to 256 more 2000-header batches then re-logged
                 // REORG-CANDIDATE and re-validated on the only P2P thread.
                 if (peer_obj.should_ban) {
-                    if (!peer_obj.isLocalAddress()) {
-                        self.banIP(peer_obj.address, DEFAULT_BAN_DURATION, "misbehavior threshold reached") catch {};
-                    }
+                    self.discourageMisbehavingPeer(peer_obj);
                     self.removePeerByIndex(i);
                     break;
                 }
