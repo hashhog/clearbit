@@ -729,6 +729,66 @@ fn preScanTapscript(script: []const u8) ?u8 {
 // Script Engine
 // ============================================================================
 
+/// Script condition stack (OP_IF / OP_NOTIF / OP_ELSE / OP_ENDIF), a port of
+/// Bitcoin Core's `ConditionStack` (script/interpreter.cpp). Core never stores
+/// the individual booleans: only "true" entries above the first "false" can
+/// matter for execution, so the stack is fully described by its size and the
+/// position of the first false entry. Every operation is O(1).
+///
+/// This matters for tapscript: BIP-342 drops MAX_SCRIPT_SIZE and
+/// MAX_OPS_PER_SCRIPT, so a leaf of D nested `OP_1 OP_IF` would cost O(D^2)
+/// with a per-opcode scan of a bool list.
+pub const ConditionStack = struct {
+    const NO_FALSE: u32 = std.math.maxInt(u32);
+
+    /// Number of entries on the stack.
+    stack_size: u32 = 0,
+    /// Position of the first false entry, or NO_FALSE if all are true.
+    first_false_pos: u32 = NO_FALSE,
+
+    pub fn empty(self: *const ConditionStack) bool {
+        return self.stack_size == 0;
+    }
+
+    pub fn allTrue(self: *const ConditionStack) bool {
+        return self.first_false_pos == NO_FALSE;
+    }
+
+    pub fn pushBack(self: *ConditionStack, f: bool) void {
+        if (self.first_false_pos == NO_FALSE and !f) {
+            // The stack consists of all true values, and a false is added.
+            // The first false value will appear at the current size.
+            self.first_false_pos = self.stack_size;
+        }
+        self.stack_size += 1;
+    }
+
+    /// Caller must check `empty()` first (Core asserts).
+    pub fn popBack(self: *ConditionStack) void {
+        std.debug.assert(self.stack_size > 0);
+        self.stack_size -= 1;
+        if (self.first_false_pos == self.stack_size) {
+            // When popping off the first false value, everything becomes true.
+            self.first_false_pos = NO_FALSE;
+        }
+    }
+
+    /// Caller must check `empty()` first (Core asserts).
+    pub fn toggleTop(self: *ConditionStack) void {
+        std.debug.assert(self.stack_size > 0);
+        if (self.first_false_pos == NO_FALSE) {
+            // The current stack is all true values; the first false will be the top.
+            self.first_false_pos = self.stack_size - 1;
+        } else if (self.first_false_pos == self.stack_size - 1) {
+            // The top is the first false value; toggling it will make everything true.
+            self.first_false_pos = NO_FALSE;
+        } else {
+            // There is a false value, but not on top. No action is needed as
+            // toggling anything but the first false value is unobservable.
+        }
+    }
+};
+
 pub const ScriptEngine = struct {
     stack: std.ArrayList([]const u8),
     alt_stack: std.ArrayList([]const u8),
@@ -893,8 +953,10 @@ pub const ScriptEngine = struct {
         // committed to the tapscript sigmsg (Core interpreter.cpp:1055, 1565).
         // Every opcode — including push-data ops — increments this counter once.
         var opcode_pos: u32 = 0;
-        var exec_stack = std.ArrayList(bool).init(self.allocator);
-        defer exec_stack.deinit();
+        // Core-style ConditionStack (interpreter.cpp): O(1) per operation.
+        // Tapscript has no size or op-count limit, so a per-opcode scan of
+        // the condition entries would be quadratic in the leaf length.
+        var exec_stack = ConditionStack{};
 
         while (pc < script.len) {
             const opcode_byte = script[pc];
@@ -909,7 +971,7 @@ pub const ScriptEngine = struct {
             if (opcode_byte >= 0x01 and opcode_byte <= 0x4b) {
                 const n = @as(usize, opcode_byte);
                 if (pc + n > script.len) return ScriptError.InvalidScript;
-                if (self.isExecuting(&exec_stack)) {
+                if (exec_stack.allTrue()) {
                     const push_data = script[pc .. pc + n];
                     if (self.flags.verify_minimaldata and !checkMinimalPush(push_data, opcode_byte)) {
                         return ScriptError.MinimalData;
@@ -959,7 +1021,7 @@ pub const ScriptEngine = struct {
                 if (pc + n > script.len) return ScriptError.InvalidScript;
                 // Push size limit applies even in unexecuted branches
                 if (n > MAX_PUSH_SIZE) return ScriptError.PushSizeExceeded;
-                if (self.isExecuting(&exec_stack)) {
+                if (exec_stack.allTrue()) {
                     const push_data = script[pc .. pc + n];
                     if (self.flags.verify_minimaldata and !checkMinimalPush(push_data, opcode_byte)) {
                         return ScriptError.MinimalData;
@@ -996,21 +1058,21 @@ pub const ScriptEngine = struct {
                 return ScriptError.ConstScriptCode;
             }
 
-            if (!self.isExecuting(&exec_stack)) {
-                // Skip non-executing branch but track if/else/endif
+            if (!exec_stack.allTrue()) {
+                // Skip non-executing branch but track if/else/endif.
+                // Core toggles the top unconditionally (vfExec.toggle_top());
+                // while an outer entry is false the branch stays unexecuted
+                // either way, and ConditionStack.toggleTop leaves the
+                // first-false position alone in that case.
                 switch (opcode) {
-                    .op_if, .op_notif => exec_stack.append(false) catch return ScriptError.OutOfMemory,
+                    .op_if, .op_notif => exec_stack.pushBack(false),
                     .op_else => {
-                        if (exec_stack.items.len == 0) return ScriptError.UnbalancedConditional;
-                        const idx = exec_stack.items.len - 1;
-                        // Only flip if parent is executing
-                        if (idx == 0 or exec_stack.items[idx - 1]) {
-                            exec_stack.items[idx] = !exec_stack.items[idx];
-                        }
+                        if (exec_stack.empty()) return ScriptError.UnbalancedConditional;
+                        exec_stack.toggleTop();
                     },
                     .op_endif => {
-                        if (exec_stack.items.len == 0) return ScriptError.UnbalancedConditional;
-                        _ = exec_stack.pop();
+                        if (exec_stack.empty()) return ScriptError.UnbalancedConditional;
+                        exec_stack.popBack();
                     },
                     else => {},
                 }
@@ -1034,7 +1096,7 @@ pub const ScriptEngine = struct {
             }
         }
 
-        if (exec_stack.items.len != 0) return ScriptError.UnbalancedConditional;
+        if (!exec_stack.empty()) return ScriptError.UnbalancedConditional;
     }
 
     /// Verify a complete transaction input.
@@ -1581,20 +1643,12 @@ pub const ScriptEngine = struct {
         }
     }
 
-    fn isExecuting(self: *ScriptEngine, exec_stack: *std.ArrayList(bool)) bool {
-        _ = self;
-        for (exec_stack.items) |executing| {
-            if (!executing) return false;
-        }
-        return true;
-    }
-
     fn executeOpcode(
         self: *ScriptEngine,
         opcode: Opcode,
         script: []const u8,
         pc: *usize,
-        exec_stack: *std.ArrayList(bool),
+        exec_stack: *ConditionStack,
         op_count: *usize,
         opcode_pos: u32,
     ) ScriptError!void {
@@ -1625,7 +1679,7 @@ pub const ScriptEngine = struct {
 
             .op_if => {
                 var execute_branch = false;
-                if (self.isExecuting(exec_stack)) {
+                if (exec_stack.allTrue()) {
                     const data = try self.pop();
                     // BIP-342 (tapscript): MINIMALIF is a CONSENSUS rule — the
                     // argument must be exactly empty (false) or exactly
@@ -1648,12 +1702,12 @@ pub const ScriptEngine = struct {
                     }
                     execute_branch = self.stackToBool(data);
                 }
-                exec_stack.append(execute_branch) catch return ScriptError.OutOfMemory;
+                exec_stack.pushBack(execute_branch);
             },
 
             .op_notif => {
                 var execute_branch = false;
-                if (self.isExecuting(exec_stack)) {
+                if (exec_stack.allTrue()) {
                     const data = try self.pop();
                     // BIP-342 (tapscript): consensus MINIMALIF. See OP_IF above.
                     if (self.sig_version == .tapscript) {
@@ -1667,18 +1721,17 @@ pub const ScriptEngine = struct {
                     }
                     execute_branch = !self.stackToBool(data);
                 }
-                exec_stack.append(execute_branch) catch return ScriptError.OutOfMemory;
+                exec_stack.pushBack(execute_branch);
             },
 
             .op_else => {
-                if (exec_stack.items.len == 0) return ScriptError.UnbalancedConditional;
-                const idx = exec_stack.items.len - 1;
-                exec_stack.items[idx] = !exec_stack.items[idx];
+                if (exec_stack.empty()) return ScriptError.UnbalancedConditional;
+                exec_stack.toggleTop();
             },
 
             .op_endif => {
-                if (exec_stack.items.len == 0) return ScriptError.UnbalancedConditional;
-                _ = exec_stack.pop();
+                if (exec_stack.empty()) return ScriptError.UnbalancedConditional;
+                exec_stack.popBack();
             },
 
             .op_verify => {
