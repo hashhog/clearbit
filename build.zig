@@ -2145,6 +2145,37 @@ pub fn build(b: *std.Build) void {
         test_step.dependOn(&run_sck_tests.step);
     }
 
+    // Tapscript condition stack is O(1) per opcode (Core ConditionStack):
+    // 50k nested OP_IF must not cost quadratic time. Also part of `test`.
+    {
+        const tcs_tests = b.addTest(.{
+            .root_source_file = b.path("tests_tapscript_condition_stack.zig"),
+            .target = target,
+            .optimize = optimize,
+            .filters = &[_][]const u8{"tests_tapscript_condition_stack"},
+        });
+        tcs_tests.linkSystemLibrary("rocksdb");
+        tcs_tests.linkSystemLibrary("secp256k1");
+        tcs_tests.addIncludePath(.{ .cwd_relative = secp256k1_include });
+        tcs_tests.linkLibC();
+        if (target.result.cpu.arch == .x86_64) {
+            tcs_tests.addCSourceFile(.{
+                .file = b.path("src/sha256_shani.c"),
+                .flags = shani_cflags,
+            });
+        }
+        if (minisketch_enabled) {
+            tcs_tests.linkSystemLibrary("minisketch");
+            tcs_tests.addIncludePath(.{ .cwd_relative = minisketch_include });
+        }
+        tcs_tests.root_module.addOptions("build_options", build_options);
+
+        const run_tcs_tests = b.addRunArtifact(tcs_tests);
+        const tcs_step = b.step("test-tapscript-condition-stack", "Run tapscript condition-stack O(1) cost tests (Core ConditionStack)");
+        tcs_step.dependOn(&run_tcs_tests.step);
+        test_step.dependOn(&run_tcs_tests.step);
+    }
+
     // setmocktime suite: regtest-only clock override RPC.
     {
         const mocktime_tests = b.addTest(.{
