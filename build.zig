@@ -354,6 +354,36 @@ pub fn build(b: *std.Build) void {
         test_step.dependOn(&run_cb7_tests.step);
     }
 
+    // REST handlers must run under the chain lock (cs_main) like every
+    // JSON-RPC handler.  Real HTTP against an ephemeral-port server.  Folded
+    // into `test`: on a build without the lock these fail on assertions, they
+    // do not crash.
+    {
+        const rest_cl_tests = b.addTest(.{
+            .root_source_file = b.path("tests_rest_chain_lock.zig"),
+            .target = target,
+            .optimize = optimize,
+            .filters = &[_][]const u8{"tests_rest_chain_lock"},
+        });
+        rest_cl_tests.linkSystemLibrary("rocksdb");
+        rest_cl_tests.linkSystemLibrary("secp256k1");
+        rest_cl_tests.addIncludePath(.{ .cwd_relative = secp256k1_include });
+        rest_cl_tests.linkLibC();
+        if (target.result.cpu.arch == .x86_64) {
+            rest_cl_tests.addCSourceFile(.{ .file = b.path("src/sha256_shani.c"), .flags = shani_cflags });
+        }
+        if (minisketch_enabled) {
+            rest_cl_tests.linkSystemLibrary("minisketch");
+            rest_cl_tests.addIncludePath(.{ .cwd_relative = minisketch_include });
+        }
+        rest_cl_tests.root_module.addOptions("build_options", build_options);
+        const run_rest_cl_tests = b.addRunArtifact(rest_cl_tests);
+        run_rest_cl_tests.has_side_effects = true;
+        const rest_cl_step = b.step("test-rest-chain-lock", "REST handlers must hold the chain lock");
+        rest_cl_step.dependOn(&run_rest_cl_tests.step);
+        test_step.dependOn(&run_rest_cl_tests.step);
+    }
+
     // Reorg disconnect -> spent-coin RESTORE persistence tests.  Dedicated
     // root (imports storage.zig only) with a name-substring filter so it does
     // not drag in drifted inline tests from heavier modules.
