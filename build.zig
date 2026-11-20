@@ -1219,6 +1219,40 @@ pub fn build(b: *std.Build) void {
         r5_cw_step.dependOn(&run_r5_cw_tests.step);
     }
 
+    // walletpassphrase timeout must relock: signing after the unlock window
+    // is -13, the key is wiped (Core wallet/rpc/encrypt.cpp RelockWallet).
+    {
+        const relock_tests = b.addTest(.{
+            .root_source_file = b.path("tests_walletpassphrase_relock.zig"),
+            .target = target,
+            .optimize = optimize,
+            .filters = &[_][]const u8{"tests_walletpassphrase_relock"},
+        });
+        relock_tests.linkSystemLibrary("rocksdb");
+        relock_tests.linkSystemLibrary("secp256k1");
+        relock_tests.addIncludePath(.{ .cwd_relative = secp256k1_include });
+        relock_tests.linkLibC();
+        if (target.result.cpu.arch == .x86_64) {
+            relock_tests.addCSourceFile(.{
+                .file = b.path("src/sha256_shani.c"),
+                .flags = shani_cflags,
+            });
+        }
+        if (minisketch_enabled) {
+            relock_tests.linkSystemLibrary("minisketch");
+            relock_tests.addIncludePath(.{ .cwd_relative = minisketch_include });
+        }
+        relock_tests.root_module.addOptions("build_options", build_options);
+
+        const run_relock_tests = b.addRunArtifact(relock_tests);
+        const relock_step = b.step(
+            "test-walletpassphrase-relock",
+            "Run walletpassphrase timeout relock tests",
+        );
+        relock_step.dependOn(&run_relock_tests.step);
+        test_step.dependOn(&run_relock_tests.step);
+    }
+
     // CONTROL for QUEUES.md T3 getwalletinfo txcount / shape / wrong-arity.
     // Same project-root package layout as tests_r5_createwallet.zig.
     {
