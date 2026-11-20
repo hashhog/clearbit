@@ -1993,6 +1993,38 @@ pub fn build(b: *std.Build) void {
         test_step.dependOn(&run_rdr_tests.step);
     }
 
+    // RBF evictions are applied only after the TRUC, cluster and dust gates
+    // pass (Core's staged changeset). Same rig as test-rbf-diagram-reason;
+    // also part of `test`.
+    {
+        const reag_tests = b.addTest(.{
+            .root_source_file = b.path("tests_rbf_evict_after_gates.zig"),
+            .target = target,
+            .optimize = optimize,
+            .filters = &[_][]const u8{"tests_rbf_evict_after_gates"},
+        });
+        reag_tests.linkSystemLibrary("rocksdb");
+        reag_tests.linkSystemLibrary("secp256k1");
+        reag_tests.addIncludePath(.{ .cwd_relative = secp256k1_include });
+        reag_tests.linkLibC();
+        if (target.result.cpu.arch == .x86_64) {
+            reag_tests.addCSourceFile(.{
+                .file = b.path("src/sha256_shani.c"),
+                .flags = shani_cflags,
+            });
+        }
+        if (minisketch_enabled) {
+            reag_tests.linkSystemLibrary("minisketch");
+            reag_tests.addIncludePath(.{ .cwd_relative = minisketch_include });
+        }
+        reag_tests.root_module.addOptions("build_options", build_options);
+
+        const run_reag_tests = b.addRunArtifact(reag_tests);
+        const reag_step = b.step("test-rbf-evict-after-gates", "Run RBF evict-after-gates tests (rejected replacement keeps its conflicts)");
+        reag_step.dependOn(&run_reag_tests.step);
+        test_step.dependOn(&run_reag_tests.step);
+    }
+
     // BIP-68 coin nCoinTime from the connecting block's ancestor chain (not
     // the sparse H: index).  Same rig as test-rbf-diagram-reason; part of `test`.
     {
