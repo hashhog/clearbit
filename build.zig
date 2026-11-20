@@ -2024,6 +2024,37 @@ pub fn build(b: *std.Build) void {
         test_step.dependOn(&run_b68_tests.step);
     }
 
+    // --load-snapshot runs the assumeutxo hash_serialized gate (Core "Bad
+    // snapshot content hash").  Same rig as test-bip68-coin-mtp-ancestor; part of `test`.
+    {
+        const shg_tests = b.addTest(.{
+            .root_source_file = b.path("tests_snapshot_cli_hash_gate.zig"),
+            .target = target,
+            .optimize = optimize,
+            .filters = &[_][]const u8{"tests_snapshot_cli_hash_gate"},
+        });
+        shg_tests.linkSystemLibrary("rocksdb");
+        shg_tests.linkSystemLibrary("secp256k1");
+        shg_tests.addIncludePath(.{ .cwd_relative = secp256k1_include });
+        shg_tests.linkLibC();
+        if (target.result.cpu.arch == .x86_64) {
+            shg_tests.addCSourceFile(.{
+                .file = b.path("src/sha256_shani.c"),
+                .flags = shani_cflags,
+            });
+        }
+        if (minisketch_enabled) {
+            shg_tests.linkSystemLibrary("minisketch");
+            shg_tests.addIncludePath(.{ .cwd_relative = minisketch_include });
+        }
+        shg_tests.root_module.addOptions("build_options", build_options);
+
+        const run_shg_tests = b.addRunArtifact(shg_tests);
+        const shg_step = b.step("test-snapshot-cli-hash-gate", "Run --load-snapshot content-hash gate tests (Bad snapshot content hash)");
+        shg_step.dependOn(&run_shg_tests.step);
+        test_step.dependOn(&run_shg_tests.step);
+    }
+
     // submitpackage response shape vs Core.  Same rig as test-tma-parity above.
     {
         const sps_tests = b.addTest(.{
