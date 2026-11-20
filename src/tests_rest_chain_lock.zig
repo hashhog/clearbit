@@ -478,3 +478,100 @@ test "tests_rest_chain_lock: every REST endpoint waits for the chain lock" {
     }
     try testing.expectEqual(@as(usize, 0), unlocked.items.len);
 }
+
+// ====================================================================
+// 3. /rest/blockfilterheaders must NOT hold cs_main for its filter walk
+// ====================================================================
+//
+// The handler recomputes every filter from genesis to the requested block.
+// Run under cs_main, one unauthenticated GET at mainnet height would stall
+// block connection for the whole walk.  It must collect the hashes it needs
+// under the lock and release it for the filter work: a P2P block connect
+// must complete while the REST request is parked inside the walk.
+
+test "tests_rest_chain_lock: REST blockfilterheaders releases the chain lock for its filter walk" {
+    // The park point exists only once the walk runs in a lock-free window.
+    if (comptime !@hasField(hooks.Point, "rest_filter_walk")) return error.SkipZigTest;
+    const validation = @import("validation.zig");
+    const allocator = testing.allocator;
+    var fx: Fixture = undefined;
+    try fx.init(allocator);
+    defer fx.deinit();
+
+    var a1 = try mineBlock(allocator, &fx.params, fx.params.genesis_hash, 1, 0xA1, null);
+    defer serialize.freeBlock(allocator, &a1.block);
+    try fx.p2pDeliver(&a1);
+    try testing.expectEqual(@as(u32, 1), fx.cs.best_height);
+
+    // Block index for the REST handler: genesis <- a1.
+    var cm = validation.ChainManager.init(&fx.cs, &fx.mp, allocator);
+    defer cm.deinit();
+    try cm.loadGenesis(&fx.params);
+    const g_entry = cm.getBlock(&fx.params.genesis_hash).?;
+    const a1_entry = try allocator.create(validation.BlockIndexEntry);
+    a1_entry.* = .{
+        .hash = a1.hash,
+        .header = a1.block.header,
+        .height = 1,
+        .status = .{ .has_data = true },
+        .chain_work = [_]u8{0} ** 32,
+        .sequence_id = 0,
+        .parent = g_entry,
+        .file_number = 0,
+        .file_offset = 0,
+    };
+    try cm.addBlock(a1_entry);
+    cm.active_tip = a1_entry;
+    fx.server.setChainManager(&cm);
+
+    const bh = hashHexDisplay(a1.hash);
+    const path = try std.fmt.allocPrint(allocator, "/rest/blockfilterheaders/basic/1/{s}.json", .{bh});
+    defer allocator.free(path);
+
+    hooks.arm(.rest_filter_walk, null);
+    var rctx = GetCtx{ .fx = &fx, .path = path };
+    var r = Racer(GetCtx, GetCtx.run){ .ctx = &rctx };
+    try r.start();
+    try testing.expect(hooks.waitParked(.rest_filter_walk, 5000));
+
+    // P2P thread: block 2 arrives and is connected while REST is mid-walk.
+    var b2 = try mineBlock(allocator, &fx.params, a1.hash, 2, 0xB2, null);
+    defer serialize.freeBlock(allocator, &b2.block);
+    var pctx = DeliverCtx{ .fx = &fx, .blk = &b2 };
+    var p = Racer(DeliverCtx, DeliverCtx.run){ .ctx = &pctx };
+    try p.start();
+    const p2p_finished_during_walk = p.finishesWithin(RACE_WINDOW_MS);
+    hooks.release(.rest_filter_walk);
+    r.join();
+    p.join();
+    const resp = rctx.response orelse return error.NoRestReply;
+    defer std.heap.page_allocator.free(resp);
+    std.debug.print("\n[REST-filterheaders] p2p_connect_finished_during_walk={} status={s}\n", .{
+        p2p_finished_during_walk,
+        resp[0..@min(resp.len, 12)],
+    });
+    try testing.expect(p2p_finished_during_walk);
+    try testing.expectEqual(@as(u32, 2), fx.cs.best_height);
+    try testing.expect(std.mem.startsWith(u8, resp, "HTTP/1.1 200"));
+
+    // The reply is still right: the one header (block a1) equals the
+    // `header` that JSON-RPC getblockfilter computes for a1 by its own,
+    // unchanged walk.
+    const body_at = (std.mem.indexOf(u8, resp, "\r\n\r\n") orelse return error.NoBody) + 4;
+    const rest_body = resp[body_at..];
+    const rpc_req = try std.fmt.allocPrint(allocator, "{{\"jsonrpc\":\"1.0\",\"id\":1,\"method\":\"getblockfilter\",\"params\":[\"{s}\"]}}", .{bh});
+    defer allocator.free(rpc_req);
+    // getblockfilter refuses without the index flag; no filter is persisted,
+    // so it still computes every filter on demand, as the REST call did.
+    fx.cs.blockfilterindex_enabled = true;
+    const rpc_resp = try fx.server.dispatch(rpc_req);
+    fx.cs.blockfilterindex_enabled = false;
+    defer allocator.free(rpc_resp);
+    const hk = "\"header\":\"";
+    const hi = (std.mem.indexOf(u8, rpc_resp, hk) orelse return error.NoHeaderField) + hk.len;
+    const want_header = rpc_resp[hi .. hi + 64];
+    const want_body = try std.fmt.allocPrint(allocator, "[\"{s}\"]", .{want_header});
+    defer allocator.free(want_body);
+    std.debug.print("[REST-filterheaders] rest={s} getblockfilter.header={s}\n", .{ rest_body, want_header });
+    try testing.expectEqualStrings(want_body, rest_body);
+}
