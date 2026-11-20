@@ -31,7 +31,7 @@ pub const Point = enum(u8) {
     /// not park again.
     utxo_db_walk,
     /// RpcServer.restBlockFilterHeaders: active-chain hashes collected, the
-    /// chain lock released, before the first filter is computed.
+    /// chain lock released, before the first persisted filter-header read.
     rest_filter_walk,
 };
 
