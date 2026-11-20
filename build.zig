@@ -2114,6 +2114,37 @@ pub fn build(b: *std.Build) void {
         test_step.dependOn(&run_mrd_tests.step);
     }
 
+    // A tx spending only value-0 coins still gets Core's CheckTxInputs
+    // bad-txns-in-belowout and the relay fee floor. Also part of `test`.
+    {
+        const zic_tests = b.addTest(.{
+            .root_source_file = b.path("tests_zero_input_conservation.zig"),
+            .target = target,
+            .optimize = optimize,
+            .filters = &[_][]const u8{"tests_zero_input_conservation"},
+        });
+        zic_tests.linkSystemLibrary("rocksdb");
+        zic_tests.linkSystemLibrary("secp256k1");
+        zic_tests.addIncludePath(.{ .cwd_relative = secp256k1_include });
+        zic_tests.linkLibC();
+        if (target.result.cpu.arch == .x86_64) {
+            zic_tests.addCSourceFile(.{
+                .file = b.path("src/sha256_shani.c"),
+                .flags = shani_cflags,
+            });
+        }
+        if (minisketch_enabled) {
+            zic_tests.linkSystemLibrary("minisketch");
+            zic_tests.addIncludePath(.{ .cwd_relative = minisketch_include });
+        }
+        zic_tests.root_module.addOptions("build_options", build_options);
+
+        const run_zic_tests = b.addRunArtifact(zic_tests);
+        const zic_step = b.step("test-zero-input-conservation", "Run value-conservation / fee-floor tests for txs spending value-0 coins");
+        zic_step.dependOn(&run_zic_tests.step);
+        test_step.dependOn(&run_zic_tests.step);
+    }
+
     // Script-check cache key commits to the whole witness (Core keys
     // m_script_execution_cache on the wtxid). Also part of `test`.
     {
