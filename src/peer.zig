@@ -996,6 +996,11 @@ pub const PeerError = error{
     ProtocolViolation,
     ConnectionClosed,
     OutOfMemory,
+    /// Whole packets were read and discarded (BIP-324 unknown short IDs)
+    /// up to the per-call cap; the stream is in sync and more may be
+    /// buffered. Not the peer's fault: call again (Core drops such a
+    /// message with no score, net.cpp V2Transport::GetReceivedMessage).
+    NoMessage,
 };
 
 // ============================================================================
@@ -1995,16 +2000,68 @@ pub const Peer = struct {
         };
     }
 
+    /// Most packets with an unknown short ID one `receiveMessageV2` call
+    /// discards before it returns `NoMessage`. The discard used to recurse
+    /// (one 16 KiB frame per packet, no bound), so a peer could overflow the
+    /// stack of the inbound handshake worker before VERSION with a few
+    /// hundred KB of 21-byte packets.
+    pub const MAX_V2_DISCARDS_PER_RECV: u32 = 64;
+
     /// V2 receive path: pull encrypted bytes off the socket into V2Transport
     /// until a full app packet decrypts; then translate the contents (short
     /// ID or 12-byte command + payload) into a `p2p.Message`.
     fn receiveMessageV2(self: *Peer) PeerError!p2p.Message {
         const t = self.v2_transport.?;
 
-        // Pull bytes off the socket until V2Transport has a complete app
-        // packet (or we hit a non-recoverable error).
         var read_buf: [16384]u8 = undefined;
         const slice_end_ms = std.time.milliTimestamp() + RECV_SLICE_MS;
+        var discarded: u32 = 0;
+        while (true) {
+            const contents = try self.pullV2Packet(t, &read_buf, slice_end_ms);
+
+            // contents[0] is either a short ID (1..28) or 0x00 followed by a
+            // 12-byte command.  Everything after is the v1-style payload.
+            if (contents.len == 0) return PeerError.ProtocolViolation;
+            const first: u8 = contents[0];
+            var command: []const u8 = "";
+            var payload: []const u8 = &[_]u8{};
+            var cmd_buf: [12]u8 = undefined;
+            if (first == 0) {
+                if (contents.len < 1 + 12) return PeerError.ProtocolViolation;
+                @memcpy(&cmd_buf, contents[1..13]);
+                var cmd_len: usize = 12;
+                while (cmd_len > 0 and cmd_buf[cmd_len - 1] == 0) cmd_len -= 1;
+                command = cmd_buf[0..cmd_len];
+                payload = contents[13..];
+            } else if (v2_transport.getMessageType(first)) |mt| {
+                command = mt;
+                payload = contents[1..];
+            } else {
+                // Unknown short ID: drop the message and read the next
+                // packet (Core marks it rejected; no score, no disconnect).
+                // `getReceivedMessage` already moved the transport back to
+                // .app. Bounded per call so a flood cannot hold the thread.
+                discarded += 1;
+                if (discarded >= MAX_V2_DISCARDS_PER_RECV) return PeerError.NoMessage;
+                continue;
+            }
+
+            if (payload.len > p2p.MAX_MESSAGE_SIZE) return PeerError.MessageTooLarge;
+
+            self.last_message_time = std.time.timestamp();
+            return p2p.decodePayload(command, payload, self.allocator) catch |err| {
+                if (err == error.OutOfMemory) return PeerError.OutOfMemory; // gate 6 (F12)
+                self.last_recv_undecodable = true;
+                return PeerError.ProtocolViolation;
+            };
+        }
+    }
+
+    /// Read until V2Transport holds one complete app packet and return its
+    /// decrypted contents (valid until the next packet is processed).
+    fn pullV2Packet(self: *Peer, t: *v2_transport.V2Transport, read_buf: []u8, slice_end_ms: i64) PeerError![]const u8 {
+        // Pull bytes off the socket until V2Transport has a complete app
+        // packet (or we hit a non-recoverable error).
         while (!t.isMessageReady()) {
             if (t.isV1Fallback()) return PeerError.ProtocolViolation;
 
@@ -2023,7 +2080,7 @@ pub const Peer = struct {
             // Timeout (no bytes, the slice used up, or the handshake
             // deadline passed) lets the caller move on; V2Transport keeps
             // the partial packet.
-            const n = try self.recvSome(&read_buf, slice_end_ms);
+            const n = try self.recvSome(read_buf, slice_end_ms);
             if (!t.processReceivedBytes(read_buf[0..n])) {
                 // Gate 6 (F12): an allocation failure in the transport is ours.
                 return if (t.recv_oom) PeerError.OutOfMemory else PeerError.ProtocolViolation;
@@ -2031,42 +2088,7 @@ pub const Peer = struct {
             self.bytes_received += n;
         }
 
-        const contents = t.getReceivedMessage() orelse return PeerError.ProtocolViolation;
-
-        // contents[0] is either a short ID (1..28) or 0x00 followed by a
-        // 12-byte command.  Everything after is the v1-style payload.
-        if (contents.len == 0) return PeerError.ProtocolViolation;
-        const first: u8 = contents[0];
-        var command: []const u8 = "";
-        var payload: []const u8 = &[_]u8{};
-        var cmd_buf: [12]u8 = undefined;
-        if (first == 0) {
-            if (contents.len < 1 + 12) return PeerError.ProtocolViolation;
-            @memcpy(&cmd_buf, contents[1..13]);
-            var cmd_len: usize = 12;
-            while (cmd_len > 0 and cmd_buf[cmd_len - 1] == 0) cmd_len -= 1;
-            command = cmd_buf[0..cmd_len];
-            payload = contents[13..];
-        } else {
-            const mt = v2_transport.getMessageType(first) orelse {
-                // Unknown short ID — discard quietly per BIP-324 (treat as
-                // ignored decoy on next iteration).  Since
-                // `getReceivedMessage` already advanced state to .app, we
-                // simply recurse to read the next packet.
-                return self.receiveMessageV2();
-            };
-            command = mt;
-            payload = contents[1..];
-        }
-
-        if (payload.len > p2p.MAX_MESSAGE_SIZE) return PeerError.MessageTooLarge;
-
-        self.last_message_time = std.time.timestamp();
-        return p2p.decodePayload(command, payload, self.allocator) catch |err| {
-            if (err == error.OutOfMemory) return PeerError.OutOfMemory; // gate 6 (F12)
-            self.last_recv_undecodable = true;
-            return PeerError.ProtocolViolation;
-        };
+        return t.getReceivedMessage() orelse PeerError.ProtocolViolation;
     }
 
     /// Maximum time we'll spend driving the BIP-324 cipher handshake
@@ -2534,6 +2556,9 @@ pub const Peer = struct {
                 // consumed and the stream is in sync. Core logs and ignores
                 // unknown/unsupported messages before verack — do the same.
                 if (err == PeerError.ProtocolViolation and self.last_recv_undecodable) continue;
+                // Discarded unknown-short-ID packets: in sync, read on (the
+                // deadline above still bounds the handshake).
+                if (err == PeerError.NoMessage) continue;
                 return err;
             };
             if (self.processPreVerackMessage(msg)) break;
@@ -2617,6 +2642,9 @@ pub const Peer = struct {
             if (std.time.timestamp() > deadline) return PeerError.HandshakeFailed;
             const msg = self.receiveMessage() catch |err| {
                 if (err == PeerError.ProtocolViolation and self.last_recv_undecodable) continue;
+                // Discarded unknown-short-ID packets: in sync, read on (the
+                // deadline above still bounds the handshake).
+                if (err == PeerError.NoMessage) continue;
                 return err;
             };
             switch (msg) {
@@ -6323,6 +6351,13 @@ pub const PeerManager = struct {
                 const msg = recv_res catch |err| {
                     switch (err) {
                         PeerError.Timeout => break, // No more data buffered, done draining
+                        // The per-call discard cap was hit; more may be
+                        // buffered. Count it against the per-pass bound so
+                        // a flood is cut off and resumed next pass.
+                        PeerError.NoMessage => {
+                            msgs_read += 1;
+                            continue;
+                        },
                         PeerError.ConnectionClosed => {
                             self.removePeerByIndex(i);
                             break;
