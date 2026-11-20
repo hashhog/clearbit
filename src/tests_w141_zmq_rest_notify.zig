@@ -494,26 +494,27 @@ test "w141/G20: REST headers handler only supports legacy <count>/<hash> path (x
     try testing.expect(!has_query_count);
 }
 
-// G21 BUG-21: restBlockFilterHeaders walks chain from genesis on every call.
-// clearbit recomputes filter bytes for blocks 0..start_entry.height per
-// request (rpc.zig:2750-2770).  Core uses a persistent BlockFilterIndex
-// lookup (rest.cpp:573-585).
-test "w141/G21: restBlockFilterHeaders pre-loop computes filters from genesis (xfail)" {
+// G21 BUG-21: restBlockFilterHeaders walked the chain from genesis on every
+// call, recomputing filter bytes for blocks 0..start_entry.height with one
+// getAncestor per height (O(height^2), before auth, under serve_mutex).
+// FIXED (cffix-clearbit-rest-filterheaders-index): it now reads each header
+// from the persisted BlockFilterIndex like Core's LookupFilterHeader
+// (rest.cpp rest_filter_header).  The behaviour is pinned by the rpc.zig
+// "REST blockfilterheaders" tests; this keeps the source-shape check.
+test "w141/G21: restBlockFilterHeaders reads the persisted filter-header index (FIXED)" {
     const alloc = testing.allocator;
     const src = try readRpcSrc(alloc);
     defer alloc.free(src);
 
-    // The signature comment claims "O(start_entry.height) per call".
-    const has_genesis_walk = std.mem.indexOf(u8, src, "Walk from genesis up to start_entry") != null;
-    try testing.expect(has_genesis_walk);
+    const fn_idx = std.mem.indexOf(u8, src, "fn restBlockFilterHeaders(").?;
+    const fn_end = std.mem.indexOfPos(u8, src, fn_idx, "\n    }\n") orelse src.len;
+    const body = src[fn_idx..fn_end];
 
-    // And there is no LookupFilterHeader-style index probe before the walk.
-    // The fast path goes via computeBasicFilterBytes, which already checks
-    // getPersistedFilter, but the recursive chained hash starts at zero —
-    // confirming the audit finding.
-    const has_prev_header_lookup = std.mem.indexOf(u8, src, "getPersistedFilterHeader") != null or
-        std.mem.indexOf(u8, src, "LookupFilterHeader") != null;
-    try testing.expect(!has_prev_header_lookup);
+    // No genesis walk left in the handler.
+    try testing.expect(std.mem.indexOf(u8, body, "Walk from genesis up to start_entry") == null);
+    try testing.expect(std.mem.indexOf(u8, body, "computeBasicFilterBytes") == null);
+    // Headers come from the index.
+    try testing.expect(std.mem.indexOf(u8, body, "getPersistedFilterHeader") != null);
 }
 
 // G22 BUG-22: restBlock JSON-vs-error discrimination by substring.

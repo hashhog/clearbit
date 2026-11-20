@@ -3261,12 +3261,18 @@ pub const RpcServer = struct {
 
     /// /rest/blockfilterheaders/<filtertype>/<count>/<hash>.{bin,hex,json}
     ///
-    /// Walks forward along the active chain from <hash> for up to <count>
-    /// blocks, computing each block's filter header via the chained
-    /// hash256(filter_hash || prev_filter_header) recurrence (BIP-158).
-    /// First-call walks a chain of length N, so this is O(N) per request;
-    /// fine for the default count cap of 2000 and matches Core's behavior
-    /// when the index is not yet built.
+    /// Core `rest_filter_header` (rest.cpp): requires the BlockFilterIndex
+    /// (400 "Index is not enabled for filtertype basic" without it), collects
+    /// up to <count> active-chain blocks forward from <hash>, and answers each
+    /// block's header from the index (`LookupFilterHeader`), 404 "Filter not
+    /// found." when an entry is missing.
+    ///
+    /// This handler runs before RPC auth while holding `serve_mutex`, so its
+    /// cost must not grow with the chain.  It used to recompute the filter
+    /// chain from genesis with one `getAncestor` (a linear parent walk) per
+    /// height, O(height^2) per request, and rebuilt every filter from disk.
+    /// Now: one `getAncestor` to the last requested height, one parent walk
+    /// back over the <count> requested blocks, one index read per block.
     fn restBlockFilterHeaders(self: *RpcServer, stream: std.net.Stream, remainder: []const u8) !void {
         // <filtertype>/<count>/<hash>.<ext>
         var iter = std.mem.splitScalar(u8, remainder, '/');
@@ -3320,6 +3326,12 @@ pub const RpcServer = struct {
             start_hash[31 - i] = (hi << 4) | lo;
         }
 
+        // Core: GetBlockFilterIndex(filtertype) == nullptr -> 400.
+        if (!self.chain_state.blockfilterindex_enabled) {
+            try self.sendRestResponse(stream, 400, "text/plain", "Index is not enabled for filtertype basic");
+            return;
+        }
+
         const cm = self.chain_manager orelse {
             try self.sendRestResponse(stream, 404, "text/plain", "No chain manager");
             return;
@@ -3332,63 +3344,59 @@ pub const RpcServer = struct {
             try self.sendRestResponse(stream, 404, "text/plain", "No active chain");
             return;
         };
-        const at_start = tip.getAncestor(start_entry.height) orelse {
+        if (start_entry.height > tip.height) {
+            try self.sendRestResponse(stream, 404, "text/plain", "Block not on active chain");
+            return;
+        }
+
+        // Last height served: start + count - 1, clamped to the tip (Core's
+        // walk stops when active_chain.Next() runs out).
+        const last_height: u32 = @intCast(@min(
+            @as(u64, start_entry.height) + count - 1,
+            @as(u64, tip.height),
+        ));
+        const n: usize = last_height - start_entry.height + 1;
+
+        // One ancestor walk to the last height, then one parent walk back
+        // to the start, filling the list from the end.  Arriving at
+        // start_entry is also the active-chain membership check.
+        const entries = try self.allocator.alloc(*validation.BlockIndexEntry, n);
+        defer self.allocator.free(entries);
+        var cur = tip.getAncestor(last_height) orelse {
             try self.sendRestResponse(stream, 404, "text/plain", "Block not on active chain");
             return;
         };
-        if (!std.mem.eql(u8, &at_start.hash, &start_entry.hash)) {
+        var idx: usize = n;
+        while (true) {
+            idx -= 1;
+            entries[idx] = cur;
+            if (idx == 0) break;
+            cur = cur.parent orelse {
+                try self.sendRestResponse(stream, 404, "text/plain", "Block not on active chain");
+                return;
+            };
+        }
+        if (!std.mem.eql(u8, &entries[0].hash, &start_entry.hash)) {
             try self.sendRestResponse(stream, 404, "text/plain", "Block not on active chain");
             return;
         }
 
-        // Walk from genesis up to start_entry, threading the filter-header
-        // chain so we have the correct prev_filter_header at the start.
-        // This is O(start_entry.height) per call — Core relies on a built
-        // index for amortized cost, but we don't have one, so brute-force
-        // it. Capped externally by RPC clients in practice.
-        var prev_filter_header: types.Hash256 = [_]u8{0} ** 32;
-        var h: u32 = 0;
-        while (h < start_entry.height) : (h += 1) {
-            const e = tip.getAncestor(h) orelse {
-                try self.sendRestResponse(stream, 500, "text/plain", "Filter chain walk failed");
-                return;
-            };
-            const f_bytes = self.computeBasicFilterBytes(&e.hash) catch null;
-            if (f_bytes) |fb| {
-                defer self.allocator.free(fb);
-                const filter_hash = crypto.hash256(fb);
-                var combined: [64]u8 = undefined;
-                @memcpy(combined[0..32], &filter_hash);
-                @memcpy(combined[32..64], &prev_filter_header);
-                prev_filter_header = crypto.hash256(&combined);
-            } else {
-                try self.sendRestResponse(stream, 404, "text/plain", "Filter not found.");
-                return;
-            }
-        }
-
-        // Now collect filter headers for up to `count` blocks starting at start_entry.
         var filter_headers = std.ArrayList(types.Hash256).init(self.allocator);
         defer filter_headers.deinit();
-
-        var i: u32 = 0;
-        while (i < count) : (i += 1) {
-            const target_h = start_entry.height + i;
-            if (target_h > tip.height) break;
-            const e = tip.getAncestor(target_h) orelse break;
-            const f_bytes = self.computeBasicFilterBytes(&e.hash) catch null;
-            if (f_bytes) |fb| {
-                defer self.allocator.free(fb);
-                const filter_hash = crypto.hash256(fb);
-                var combined: [64]u8 = undefined;
-                @memcpy(combined[0..32], &filter_hash);
-                @memcpy(combined[32..64], &prev_filter_header);
-                prev_filter_header = crypto.hash256(&combined);
-                try filter_headers.append(prev_filter_header);
-            } else {
-                try self.sendRestResponse(stream, 404, "text/plain", "Filter not found.");
+        try filter_headers.ensureTotalCapacity(n);
+        for (entries) |e| {
+            const fh = (self.chain_state.getPersistedFilterHeader(&e.hash) catch null) orelse {
+                // Core picks the suffix from whether the index has caught up
+                // with the active chain (index_ready).  Here: the flushed
+                // index tip standing below the active tip means it has not.
+                const msg = if ((self.persistedFilterIndexHeight() orelse 0) < tip.height)
+                    "Filter not found. Block filters are still in the process of being indexed."
+                else
+                    "Filter not found. This error is unexpected and indicates index corruption.";
+                try self.sendRestResponse(stream, 404, "text/plain", msg);
                 return;
-            }
+            };
+            filter_headers.appendAssumeCapacity(fh);
         }
 
         switch (parsed.format) {
@@ -3423,6 +3431,276 @@ pub const RpcServer = struct {
                 try self.sendRestResponse(stream, 200, "application/json", buf.items);
             },
         }
+    }
+
+    // ------------------------------------------------------------------
+    // Tests: /rest/blockfilterheaders cost + index gate
+    // (item cffix-clearbit-rest-filterheaders-index).
+    //
+    // A 2,000-block chain in the ChainManager with a populated
+    // BlockFilterIndex (CF_BLOCK_FILTER + CF_BLOCK_FILTER_HEADER) in a
+    // scratch RocksDB.  The REST handler is driven through
+    // handleRestRequest over an AF_UNIX socketpair.
+    // ------------------------------------------------------------------
+
+    const RestFhRig = struct {
+        const N: u32 = 2000;
+
+        tmp_dir: std.testing.TmpDir,
+        path: []u8,
+        db: storage.Database,
+        chain_state: storage.ChainState,
+        cm: validation.ChainManager,
+        mempool: mempool_mod.Mempool,
+        peer_manager: peer_mod.PeerManager,
+        server: RpcServer,
+        hashes: [N]types.Hash256,
+        headers: [N]types.Hash256,
+
+        fn hashAt(h: u32) types.Hash256 {
+            var buf: [12]u8 = undefined;
+            @memcpy(buf[0..8], "rfhtest_");
+            std.mem.writeInt(u32, buf[8..12], h, .little);
+            return crypto.hash256(&buf);
+        }
+
+        /// Heap-allocated: the struct holds self-references
+        /// (chain_state -> db, server -> chain_state/cm).
+        fn create(allocator: std.mem.Allocator, index_enabled: bool) !*RestFhRig {
+            const r = try allocator.create(RestFhRig);
+            errdefer allocator.destroy(r);
+            r.tmp_dir = std.testing.tmpDir(.{});
+            r.path = try r.tmp_dir.dir.realpathAlloc(allocator, ".");
+            r.db = try storage.Database.open(r.path, 64, allocator);
+            r.chain_state = storage.ChainState.init(&r.db, 64, allocator);
+            r.chain_state.blockfilterindex_enabled = index_enabled;
+            r.cm = validation.ChainManager.init(&r.chain_state, null, allocator);
+            r.mempool = mempool_mod.Mempool.init(null, null, allocator);
+            r.peer_manager = peer_mod.PeerManager.init(allocator, &consensus.REGTEST);
+
+            // Chain + index contents.  Filter bytes are arbitrary but
+            // distinct; the header chain follows BIP-157's recurrence
+            // header_n = hash256(hash256(filter_n) || header_{n-1}),
+            // header_{-1} = 0.
+            var prev_entry: ?*validation.BlockIndexEntry = null;
+            var prev_header: types.Hash256 = [_]u8{0} ** 32;
+            var h: u32 = 0;
+            while (h < N) : (h += 1) {
+                const hash = hashAt(h);
+                r.hashes[h] = hash;
+                const e = try allocator.create(validation.BlockIndexEntry);
+                e.* = .{
+                    .hash = hash,
+                    .header = std.mem.zeroes(types.BlockHeader),
+                    .height = h,
+                    .status = .{},
+                    .chain_work = [_]u8{0} ** 32,
+                    .sequence_id = 0,
+                    .parent = prev_entry,
+                    .file_number = 0,
+                    .file_offset = 0,
+                };
+                try r.cm.block_index.put(hash, e);
+                prev_entry = e;
+
+                var fbytes: [5]u8 = undefined;
+                fbytes[0] = 0x01;
+                std.mem.writeInt(u32, fbytes[1..5], h, .little);
+                const fhash = crypto.hash256(&fbytes);
+                var combined: [64]u8 = undefined;
+                @memcpy(combined[0..32], &fhash);
+                @memcpy(combined[32..64], &prev_header);
+                prev_header = crypto.hash256(&combined);
+                r.headers[h] = prev_header;
+                if (index_enabled) {
+                    try r.db.put(storage.CF_BLOCK_FILTER, &hash, &fbytes);
+                    try r.db.put(storage.CF_BLOCK_FILTER_HEADER, &hash, &prev_header);
+                }
+            }
+            r.cm.active_tip = prev_entry;
+            r.chain_state.best_height = N - 1;
+            r.chain_state.best_hash = r.hashes[N - 1];
+            if (index_enabled) {
+                var tipb: [4]u8 = undefined;
+                std.mem.writeInt(u32, &tipb, N - 1, .little);
+                try r.db.put(storage.CF_DEFAULT, storage.ChainState.FILTERINDEX_TIP_KEY, &tipb);
+                r.chain_state.blockfilterindex_height = N - 1;
+            }
+
+            r.server = RpcServer.init(allocator, &r.chain_state, &r.mempool, &r.peer_manager, &consensus.REGTEST, .{});
+            r.server.setChainManager(&r.cm);
+            return r;
+        }
+
+        fn destroy(r: *RestFhRig, allocator: std.mem.Allocator) void {
+            r.server.deinit();
+            r.peer_manager.deinit();
+            r.mempool.deinit();
+            r.cm.deinit();
+            r.chain_state.deinit();
+            r.db.close();
+            allocator.free(r.path);
+            r.tmp_dir.cleanup();
+            allocator.destroy(r);
+        }
+
+        /// GET `/rest/blockfilterheaders/basic/<count>/<hash(height)>.json`;
+        /// returns the raw HTTP response (caller frees).
+        fn get(r: *RestFhRig, allocator: std.mem.Allocator, count: u32, height: u32) ![]u8 {
+            var disp: [32]u8 = undefined;
+            for (0..32) |i| disp[i] = r.hashes[height][31 - i];
+            const url = try std.fmt.allocPrint(
+                allocator,
+                "/rest/blockfilterheaders/basic/{d}/{s}.json",
+                .{ count, std.fmt.fmtSliceHexLower(&disp) },
+            );
+            defer allocator.free(url);
+            var fds: [2]i32 = undefined;
+            try std.testing.expectEqual(@as(usize, 0), std.os.linux.socketpair(std.posix.AF.UNIX, std.posix.SOCK.STREAM, 0, &fds));
+            defer std.posix.close(fds[1]);
+            {
+                defer std.posix.close(fds[0]);
+                try r.server.handleRestRequest(std.net.Stream{ .handle = fds[0] }, url);
+            }
+            var out = std.ArrayList(u8).init(allocator);
+            errdefer out.deinit();
+            var buf: [65536]u8 = undefined;
+            while (true) {
+                const n = try std.posix.read(fds[1], &buf);
+                if (n == 0) break;
+                try out.appendSlice(buf[0..n]);
+            }
+            return out.toOwnedSlice();
+        }
+
+        /// Expected JSON body: `["<hdr>",...]` for heights [from, from+count).
+        fn expectedJson(r: *RestFhRig, allocator: std.mem.Allocator, from: u32, count: u32) ![]u8 {
+            var out = std.ArrayList(u8).init(allocator);
+            errdefer out.deinit();
+            const w = out.writer();
+            try w.writeByte('[');
+            var i: u32 = 0;
+            while (i < count) : (i += 1) {
+                if (i > 0) try w.writeByte(',');
+                try w.writeByte('"');
+                try writeHashHex(w, &r.headers[from + i]);
+                try w.writeByte('"');
+            }
+            try w.writeByte(']');
+            return out.toOwnedSlice();
+        }
+
+        fn body(resp: []const u8) []const u8 {
+            const i = std.mem.indexOf(u8, resp, "\r\n\r\n") orelse return "";
+            return resp[i + 4 ..];
+        }
+    };
+
+    test "REST blockfilterheaders: getAncestor steps are O(height), not O(height^2), on a 2000-block chain" {
+        const allocator = std.testing.allocator;
+        const r = try RestFhRig.create(allocator, true);
+        defer r.destroy(allocator);
+        const N = RestFhRig.N;
+
+        // /rest/blockfilterheaders/basic/1/<tip>.json
+        validation.test_ancestor_steps = 0;
+        const resp = try r.get(allocator, 1, N - 1);
+        defer allocator.free(resp);
+        const steps_tip = validation.test_ancestor_steps;
+        try std.testing.expect(std.mem.startsWith(u8, resp, "HTTP/1.1 200"));
+        const want = try r.expectedJson(allocator, N - 1, 1);
+        defer allocator.free(want);
+        try std.testing.expectEqualStrings(want, RestFhRig.body(resp));
+
+        // 1000 headers from the middle of the chain.
+        validation.test_ancestor_steps = 0;
+        const resp2 = try r.get(allocator, 1000, 500);
+        defer allocator.free(resp2);
+        const steps_mid = validation.test_ancestor_steps;
+        try std.testing.expect(std.mem.startsWith(u8, resp2, "HTTP/1.1 200"));
+        const want2 = try r.expectedJson(allocator, 500, 1000);
+        defer allocator.free(want2);
+        try std.testing.expectEqualStrings(want2, RestFhRig.body(resp2));
+
+        // count past the tip stops at the tip (Core: active_chain.Next == null).
+        const resp3 = try r.get(allocator, 2000, N - 3);
+        defer allocator.free(resp3);
+        const want3 = try r.expectedJson(allocator, N - 3, 3);
+        defer allocator.free(want3);
+        try std.testing.expectEqualStrings(want3, RestFhRig.body(resp3));
+
+        std.debug.print("rest-filterheaders steps: tip={d} mid={d} (bound {d})\n", .{ steps_tip, steps_mid, 2 * N });
+        // O(height): a constant number of passes over the chain.  The old
+        // per-height getAncestor walk took ~N^2/2 (~2,000,000) here.
+        try std.testing.expect(steps_tip <= 2 * N);
+        try std.testing.expect(steps_mid <= 2 * N);
+    }
+
+    test "REST blockfilterheaders without -blockfilterindex answers Core's 400 Index is not enabled for filtertype basic" {
+        const allocator = std.testing.allocator;
+        const r = try RestFhRig.create(allocator, false);
+        defer r.destroy(allocator);
+        validation.test_ancestor_steps = 0;
+        const resp = try r.get(allocator, 1, RestFhRig.N - 1);
+        defer allocator.free(resp);
+        try std.testing.expect(std.mem.startsWith(u8, resp, "HTTP/1.1 400"));
+        try std.testing.expectEqualStrings("Index is not enabled for filtertype basic", RestFhRig.body(resp));
+        // Refused before any chain walk.
+        try std.testing.expectEqual(@as(u64, 0), validation.test_ancestor_steps);
+    }
+
+    test "REST blockfilterheaders serves the persisted filter header and 404s Filter not found when the index lacks it" {
+        const allocator = std.testing.allocator;
+        const r = try RestFhRig.create(allocator, true);
+        defer r.destroy(allocator);
+
+        // Overwrite height 700's persisted header with a sentinel: the
+        // handler must return what the index holds (Core LookupFilterHeader),
+        // not recompute the chain from genesis.
+        const sentinel = [_]u8{0xAB} ** 32;
+        try r.db.put(storage.CF_BLOCK_FILTER_HEADER, &r.hashes[700], &sentinel);
+        const resp = try r.get(allocator, 1, 700);
+        defer allocator.free(resp);
+        try std.testing.expect(std.mem.startsWith(u8, resp, "HTTP/1.1 200"));
+        var want_buf = std.ArrayList(u8).init(allocator);
+        defer want_buf.deinit();
+        try want_buf.appendSlice("[\"");
+        try writeHashHex(want_buf.writer(), &sentinel);
+        try want_buf.appendSlice("\"]");
+        try std.testing.expectEqualStrings(want_buf.items, RestFhRig.body(resp));
+
+        // Drop height 701's header: Core answers 404 "Filter not found." and,
+        // with the index synced to the tip, the corruption suffix.
+        try r.db.delete(storage.CF_BLOCK_FILTER_HEADER, &r.hashes[701]);
+        const resp2 = try r.get(allocator, 5, 699);
+        defer allocator.free(resp2);
+        try std.testing.expect(std.mem.startsWith(u8, resp2, "HTTP/1.1 404"));
+        try std.testing.expectEqualStrings(
+            "Filter not found. This error is unexpected and indicates index corruption.",
+            RestFhRig.body(resp2),
+        );
+
+        // Index behind the tip: the "still being indexed" suffix.
+        var tipb: [4]u8 = undefined;
+        std.mem.writeInt(u32, &tipb, 600, .little);
+        try r.db.put(storage.CF_DEFAULT, storage.ChainState.FILTERINDEX_TIP_KEY, &tipb);
+        const resp3 = try r.get(allocator, 5, 699);
+        defer allocator.free(resp3);
+        try std.testing.expect(std.mem.startsWith(u8, resp3, "HTTP/1.1 404"));
+        try std.testing.expectEqualStrings(
+            "Filter not found. Block filters are still in the process of being indexed.",
+            RestFhRig.body(resp3),
+        );
+    }
+
+    /// Height of the flushed BlockFilterIndex tip (FILTERINDEX_TIP_KEY), or
+    /// null when absent / unreadable.
+    fn persistedFilterIndexHeight(self: *RpcServer) ?u32 {
+        const db = self.chain_state.utxo_set.db orelse return null;
+        const data = (db.get(storage.CF_DEFAULT, storage.ChainState.FILTERINDEX_TIP_KEY) catch return null) orelse return null;
+        defer self.allocator.free(data);
+        if (data.len != 4) return null;
+        return std.mem.readInt(u32, data[0..4], .little);
     }
 
     /// Compute the BIP-158 basic block filter for a block on disk, returning
