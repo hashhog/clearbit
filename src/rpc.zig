@@ -3245,12 +3245,18 @@ pub const RpcServer = struct {
 
     /// /rest/blockfilterheaders/<filtertype>/<count>/<hash>.{bin,hex,json}
     ///
-    /// Walks forward along the active chain from <hash> for up to <count>
-    /// blocks, computing each block's filter header via the chained
-    /// hash256(filter_hash || prev_filter_header) recurrence (BIP-158).
-    /// First-call walks a chain of length N, so this is O(N) per request;
-    /// fine for the default count cap of 2000 and matches Core's behavior
-    /// when the index is not yet built.
+    /// Core `rest_filter_header` (rest.cpp): requires the BlockFilterIndex
+    /// (400 "Index is not enabled for filtertype basic" without it), collects
+    /// up to <count> active-chain blocks forward from <hash>, and answers each
+    /// block's header from the index (`LookupFilterHeader`), 404 "Filter not
+    /// found." when an entry is missing.
+    ///
+    /// This handler runs before RPC auth while holding `serve_mutex`, so its
+    /// cost must not grow with the chain.  It used to recompute the filter
+    /// chain from genesis with one `getAncestor` (a linear parent walk) per
+    /// height, O(height^2) per request, and rebuilt every filter from disk.
+    /// Now: one `getAncestor` to the last requested height, one parent walk
+    /// back over the <count> requested blocks, one index read per block.
     fn restBlockFilterHeaders(self: *RpcServer, stream: std.net.Stream, remainder: []const u8) !void {
         // <filtertype>/<count>/<hash>.<ext>
         var iter = std.mem.splitScalar(u8, remainder, '/');
@@ -3304,6 +3310,12 @@ pub const RpcServer = struct {
             start_hash[31 - i] = (hi << 4) | lo;
         }
 
+        // Core: GetBlockFilterIndex(filtertype) == nullptr -> 400.
+        if (!self.chain_state.blockfilterindex_enabled) {
+            try self.sendRestResponse(stream, 400, "text/plain", "Index is not enabled for filtertype basic");
+            return;
+        }
+
         const cm = self.chain_manager orelse {
             try self.sendRestResponse(stream, 404, "text/plain", "No chain manager");
             return;
@@ -3316,63 +3328,59 @@ pub const RpcServer = struct {
             try self.sendRestResponse(stream, 404, "text/plain", "No active chain");
             return;
         };
-        const at_start = tip.getAncestor(start_entry.height) orelse {
+        if (start_entry.height > tip.height) {
+            try self.sendRestResponse(stream, 404, "text/plain", "Block not on active chain");
+            return;
+        }
+
+        // Last height served: start + count - 1, clamped to the tip (Core's
+        // walk stops when active_chain.Next() runs out).
+        const last_height: u32 = @intCast(@min(
+            @as(u64, start_entry.height) + count - 1,
+            @as(u64, tip.height),
+        ));
+        const n: usize = last_height - start_entry.height + 1;
+
+        // One ancestor walk to the last height, then one parent walk back
+        // to the start, filling the list from the end.  Arriving at
+        // start_entry is also the active-chain membership check.
+        const entries = try self.allocator.alloc(*validation.BlockIndexEntry, n);
+        defer self.allocator.free(entries);
+        var cur = tip.getAncestor(last_height) orelse {
             try self.sendRestResponse(stream, 404, "text/plain", "Block not on active chain");
             return;
         };
-        if (!std.mem.eql(u8, &at_start.hash, &start_entry.hash)) {
+        var idx: usize = n;
+        while (true) {
+            idx -= 1;
+            entries[idx] = cur;
+            if (idx == 0) break;
+            cur = cur.parent orelse {
+                try self.sendRestResponse(stream, 404, "text/plain", "Block not on active chain");
+                return;
+            };
+        }
+        if (!std.mem.eql(u8, &entries[0].hash, &start_entry.hash)) {
             try self.sendRestResponse(stream, 404, "text/plain", "Block not on active chain");
             return;
         }
 
-        // Walk from genesis up to start_entry, threading the filter-header
-        // chain so we have the correct prev_filter_header at the start.
-        // This is O(start_entry.height) per call — Core relies on a built
-        // index for amortized cost, but we don't have one, so brute-force
-        // it. Capped externally by RPC clients in practice.
-        var prev_filter_header: types.Hash256 = [_]u8{0} ** 32;
-        var h: u32 = 0;
-        while (h < start_entry.height) : (h += 1) {
-            const e = tip.getAncestor(h) orelse {
-                try self.sendRestResponse(stream, 500, "text/plain", "Filter chain walk failed");
-                return;
-            };
-            const f_bytes = self.computeBasicFilterBytes(&e.hash) catch null;
-            if (f_bytes) |fb| {
-                defer self.allocator.free(fb);
-                const filter_hash = crypto.hash256(fb);
-                var combined: [64]u8 = undefined;
-                @memcpy(combined[0..32], &filter_hash);
-                @memcpy(combined[32..64], &prev_filter_header);
-                prev_filter_header = crypto.hash256(&combined);
-            } else {
-                try self.sendRestResponse(stream, 404, "text/plain", "Filter not found.");
-                return;
-            }
-        }
-
-        // Now collect filter headers for up to `count` blocks starting at start_entry.
         var filter_headers = std.ArrayList(types.Hash256).init(self.allocator);
         defer filter_headers.deinit();
-
-        var i: u32 = 0;
-        while (i < count) : (i += 1) {
-            const target_h = start_entry.height + i;
-            if (target_h > tip.height) break;
-            const e = tip.getAncestor(target_h) orelse break;
-            const f_bytes = self.computeBasicFilterBytes(&e.hash) catch null;
-            if (f_bytes) |fb| {
-                defer self.allocator.free(fb);
-                const filter_hash = crypto.hash256(fb);
-                var combined: [64]u8 = undefined;
-                @memcpy(combined[0..32], &filter_hash);
-                @memcpy(combined[32..64], &prev_filter_header);
-                prev_filter_header = crypto.hash256(&combined);
-                try filter_headers.append(prev_filter_header);
-            } else {
-                try self.sendRestResponse(stream, 404, "text/plain", "Filter not found.");
+        try filter_headers.ensureTotalCapacity(n);
+        for (entries) |e| {
+            const fh = (self.chain_state.getPersistedFilterHeader(&e.hash) catch null) orelse {
+                // Core: index_ready = BlockUntilSyncedToCurrentChain().  The
+                // persisted index tip (flushed) standing below the active tip
+                // means the index is still catching up.
+                const msg = if ((self.persistedFilterIndexHeight() orelse 0) < tip.height)
+                    "Filter not found. Block filters are still in the process of being indexed."
+                else
+                    "Filter not found. This error is unexpected and indicates index corruption.";
+                try self.sendRestResponse(stream, 404, "text/plain", msg);
                 return;
-            }
+            };
+            filter_headers.appendAssumeCapacity(fh);
         }
 
         switch (parsed.format) {
@@ -3667,6 +3675,16 @@ pub const RpcServer = struct {
             "Filter not found. Block filters are still in the process of being indexed.",
             RestFhRig.body(resp3),
         );
+    }
+
+    /// Height of the flushed BlockFilterIndex tip (FILTERINDEX_TIP_KEY), or
+    /// null when absent / unreadable.
+    fn persistedFilterIndexHeight(self: *RpcServer) ?u32 {
+        const db = self.chain_state.utxo_set.db orelse return null;
+        const data = (db.get(storage.CF_DEFAULT, storage.ChainState.FILTERINDEX_TIP_KEY) catch return null) orelse return null;
+        defer self.allocator.free(data);
+        if (data.len != 4) return null;
+        return std.mem.readInt(u32, data[0..4], .little);
     }
 
     /// Compute the BIP-158 basic block filter for a block on disk, returning
