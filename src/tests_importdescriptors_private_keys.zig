@@ -266,7 +266,8 @@ test "importdesc_privkeys a wallet.dat written before the fix loads with the pub
     try testing.expect(!has(after, WIF));
 }
 
-// Core 31.1 importdescriptors (blank wallet) -> listdescriptors, one row each.
+// Core 31.1 importdescriptors (blank wallet) -> listdescriptors, one row each
+// (CORE_PUBLIC_WIF is getdescriptorinfo; no hardened step, so the same form).
 const CoreVector = struct { priv: []const u8, core: []const u8 };
 const CORE_VECTORS = [_]CoreVector{
     // BIP-84 shape: hardened prefix re-rooted into the origin, root fp added.
@@ -284,9 +285,35 @@ const CORE_VECTORS = [_]CoreVector{
     // Multisig, origin on the private key, a plain hex pubkey beside it.
     .{ .priv = "wsh(multi(1,[d34db33f/84'/1'/0']" ++ TPRV ++ "/1/*,03a34b99f22c790c4e36b2b3c2c35a36db06226e41c692fc82b8b56ac1c540c5bd))#4jt3rg3p", .core = "wsh(multi(1,[d34db33f/84h/1h/0h]" ++ TPUB ++ "/1/*,03a34b99f22c790c4e36b2b3c2c35a36db06226e41c692fc82b8b56ac1c540c5bd))#23x7s3vc" },
     .{ .priv = PRIV_WIF, .core = CORE_PUBLIC_WIF },
+    // P2TR context: a WIF prints x-only, as internal key and in a tap leaf.
+    .{ .priv = "tr(" ++ WIF ++ ")#tnrke5yz", .core = "tr(79be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798)#gxjkeue2" },
+    .{ .priv = "tr(" ++ TPUB ++ ",pk(" ++ WIF ++ "))#d5ktc8ud", .core = "tr(" ++ TPUB ++ ",pk(79be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798))#el9cgupy" },
+    // Origin path elements print from their value: 044' -> 44h.
+    .{ .priv = "pkh([d34db33f/044']" ++ TPRV ++ "/0)#nr8xdjap", .core = "pkh([d34db33f/44h]" ++ TPUB ++ "/0)#qse2zq9w" },
 };
 
-test "importdesc_privkeys public form matches Core listdescriptors (7 shapes)" {
+test "importdesc_privkeys BIP-32 depth past 255 is refused, not wrapped" {
+    // Core CExtKey::Derive refuses to go past depth 255. The root here has
+    // depth 0, so 255 hardened steps re-root at depth 255 and 256 must fail.
+    if (comptime !@hasDecl(descriptor, "toPublicDescriptor")) {
+        return error.NoPublicDescriptorConversion;
+    } else {
+        var buf = std.ArrayList(u8).init(testing.allocator);
+        defer buf.deinit();
+        try buf.appendSlice("wpkh(" ++ TPRV);
+        var n: usize = 0;
+        while (n < 255) : (n += 1) try buf.appendSlice("/0h");
+        try buf.append(')');
+        const ok = try descriptor.toPublicDescriptor(testing.allocator, buf.items);
+        defer testing.allocator.free(ok);
+        try testing.expect(std.mem.indexOf(u8, ok, "tprv") == null);
+        buf.shrinkRetainingCapacity(buf.items.len - 1);
+        try buf.appendSlice("/0h)");
+        try testing.expectError(error.InvalidKeyExpression, descriptor.toPublicDescriptor(testing.allocator, buf.items));
+    }
+}
+
+test "importdesc_privkeys public form matches Core listdescriptors (11 vectors)" {
     // Guarded so this file compiles on the base commit (where the function
     // does not exist) and fails there on the assertion.
     if (comptime !@hasDecl(descriptor, "toPublicDescriptor")) {

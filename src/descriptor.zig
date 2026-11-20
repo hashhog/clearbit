@@ -1682,7 +1682,9 @@ pub fn isSolvable(desc: *const Descriptor) bool {
 ///    the origin (`[<root fp>/84h/1h/0h]tpub.../0/*`; an existing origin is
 ///    extended instead, `[d34db33f/44h/1h/1h]tpub.../2/*`);
 ///  - a hardened-ranged key (`/*'`) keeps the root xpub and its path;
-///  - hardened markers in origins and in hardened-ranged paths print as `h`.
+///  - hardened markers in origins and in hardened-ranged paths print as `h`;
+///  - a WIF inside `tr(...)` (internal key or tap leaf) prints x-only, 64 hex
+///    (ConstPubkeyProvider m_xonly in P2TR context).
 ///
 /// Everything outside key expressions (script structure, miniscript, tap
 /// trees, addresses) is copied byte for byte, which is why this works on the
@@ -1694,15 +1696,19 @@ pub fn toPublicDescriptor(allocator: std.mem.Allocator, desc_str: []const u8) ![
     const body = if (std.mem.indexOfScalar(u8, desc_str, '#')) |h| desc_str[0..h] else desc_str;
     var out = std.ArrayList(u8).init(allocator);
     defer out.deinit();
+    // One entry per open '(' : is that script fragment in P2TR context?
+    var tr_stack: [64]bool = undefined;
+    var depth: usize = 0;
     var i: usize = 0;
     while (i < body.len) {
         const c = body[i];
+        const in_tr = depth > 0 and tr_stack[depth - 1];
         if (c == '[') {
             const close = std.mem.indexOfScalarPos(u8, body, i, ']') orelse return error.InvalidKeyExpression;
             var k = close + 1;
             while (k < body.len and std.ascii.isAlphanumeric(body[k])) : (k += 1) {}
             const pe = keyPathEnd(body, k);
-            try writeNormalizedKey(&out, body[i + 1 .. close], body[close + 1 .. k], body[k..pe]);
+            try writeNormalizedKey(&out, body[i + 1 .. close], body[close + 1 .. k], body[k..pe], in_tr);
             i = pe;
         } else if (std.ascii.isAlphanumeric(c)) {
             var k = i;
@@ -1710,13 +1716,21 @@ pub fn toPublicDescriptor(allocator: std.mem.Allocator, desc_str: []const u8) ![
             const tok = body[i..k];
             if (decodeKeyToken(tok) != .none) {
                 const pe = keyPathEnd(body, k);
-                try writeNormalizedKey(&out, null, tok, body[k..pe]);
+                try writeNormalizedKey(&out, null, tok, body[k..pe], in_tr);
                 i = pe;
             } else {
                 try out.appendSlice(tok);
                 i = k;
+                if (i < body.len and body[i] == '(') {
+                    if (depth == tr_stack.len) return error.InvalidKeyExpression;
+                    tr_stack[depth] = in_tr or std.mem.eql(u8, tok, "tr") or std.mem.eql(u8, tok, "rawtr");
+                    depth += 1;
+                    try out.append('(');
+                    i += 1;
+                }
             }
         } else {
+            if (c == ')' and depth > 0) depth -= 1;
             try out.append(c);
             i += 1;
         }
@@ -1791,13 +1805,23 @@ fn decodeKeyToken(tok: []const u8) KeyToken {
     return w;
 }
 
-/// Core OriginString(normalized=true): lowercase hex fingerprint, `h` marker.
+/// Core OriginString(normalized=true): lowercase hex fingerprint, each path
+/// element printed from its parsed value (`044'` -> `44h`), `h` marker.
 fn writeNormalizedOrigin(out: *std.ArrayList(u8), origin: []const u8) !void {
-    for (origin) |ch| {
-        try out.append(switch (ch) {
-            '\'', 'H' => 'h',
-            else => std.ascii.toLower(ch),
-        });
+    var it = std.mem.splitScalar(u8, origin, '/');
+    const fp = it.first();
+    for (fp) |ch| try out.append(std.ascii.toLower(ch));
+    while (it.next()) |el| {
+        var digits = el;
+        var hard = false;
+        if (el.len > 0 and (el[el.len - 1] == '\'' or el[el.len - 1] == 'h' or el[el.len - 1] == 'H')) {
+            digits = el[0 .. el.len - 1];
+            hard = true;
+        }
+        const v = std.fmt.parseInt(u32, digits, 10) catch return error.InvalidKeyExpression;
+        if (v >> 31 != 0) return error.InvalidKeyExpression;
+        try out.writer().print("/{d}", .{v});
+        if (hard) try out.append('h');
     }
 }
 
@@ -1808,7 +1832,7 @@ fn writeSteps(out: *std.ArrayList(u8), steps: []const u32) !void {
     }
 }
 
-fn writeNormalizedKey(out: *std.ArrayList(u8), origin: ?[]const u8, key: []const u8, suffix: []const u8) !void {
+fn writeNormalizedKey(out: *std.ArrayList(u8), origin: ?[]const u8, key: []const u8, suffix: []const u8, xonly: bool) !void {
     const kt = decodeKeyToken(key);
     switch (kt) {
         .none => {
@@ -1829,7 +1853,9 @@ fn writeNormalizedKey(out: *std.ArrayList(u8), origin: ?[]const u8, key: []const
                 try writeNormalizedOrigin(out, o);
                 try out.append(']');
             }
-            try out.writer().print("{s}", .{std.fmt.fmtSliceHexLower(w.pubkey[0..w.len])});
+            // P2TR context: Core prints the x-only key (drop the parity byte).
+            const pk = if (xonly and w.len == 33) w.pubkey[1..33] else w.pubkey[0..w.len];
+            try out.writer().print("{s}", .{std.fmt.fmtSliceHexLower(pk)});
         },
         .ext => |e| try writeNormalizedExtKey(out, origin, e, suffix),
     }
@@ -1908,6 +1934,9 @@ fn writeNormalizedExtKey(out: *std.ArrayList(u8), origin: ?[]const u8, e: ExtKey
     // Re-root at the last hardened step (needs the private key).
     if (!e.is_priv) return error.InvalidKeyExpression;
     const li = last_hard.?;
+    // BIP-32 depth is one byte; Core refuses to derive past 255
+    // (CExtKey::Derive, key.cpp).
+    if (@as(usize, key[4]) + li + 1 > 255) return error.InvalidKeyExpression;
     var secret: [32]u8 = undefined;
     defer @memset(&secret, 0);
     @memcpy(&secret, key[46..78]);
@@ -1946,7 +1975,7 @@ fn writeNormalizedExtKey(out: *std.ArrayList(u8), origin: ?[]const u8, e: ExtKey
     try writeSteps(out, steps[0 .. li + 1]);
     try out.append(']');
     var meta: [41]u8 = undefined; // depth, parent fp, child number, chain code
-    meta[0] = key[4] +% @as(u8, @intCast(li + 1));
+    meta[0] = @intCast(@as(usize, key[4]) + li + 1);
     const pfp = crypto.hash160(&parent_pub);
     @memcpy(meta[1..5], pfp[0..4]);
     std.mem.writeInt(u32, meta[5..9], steps[li], .big);
