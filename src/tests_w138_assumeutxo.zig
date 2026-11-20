@@ -77,9 +77,9 @@ fn p2pkh() [25]u8 {
 
 // ===========================================================================
 // G1 — CLI --load-snapshot enforces hash_serialized content-hash gate
-// Status: MISSING (BUG-1). Only RPC/in-memory path enforces it.
+// Status: FIXED (BUG-1). The CLI path runs the same gate as the RPC path.
 // ===========================================================================
-test "w138 G1: CLI --load-snapshot path lacks hash_serialized content-hash gate (BUG-1)" {
+test "w138 G1: CLI --load-snapshot path runs the hash_serialized content-hash gate (BUG-1 fixed)" {
     const allocator = testing.allocator;
     const src = try loadSrc(allocator, "main");
     defer allocator.free(src);
@@ -94,14 +94,12 @@ test "w138 G1: CLI --load-snapshot path lacks hash_serialized content-hash gate 
     try testing.expect(contains(src, "isValidMoney(amount)"));
     try testing.expect(contains(src, "utxo_height > block_height"));
 
-    // BUT: it does NOT call `computeHashSerializedTxOutSet` over the
-    // imported coins. That function exists in storage.zig but is not
-    // referenced from main.zig at all.
-    try testing.expect(!contains(src, "computeHashSerializedTxOutSet"));
-    // And it doesn't compare against `assume_entry.hash_serialized`
-    // anywhere in the body.
-    try testing.expect(!contains(src, "assume_entry.?.hash_serialized"));
-    try testing.expect(!contains(src, "expected_entry.hash_serialized"));
+    // BUG-1 FIXED: it now hashes the imported coins with
+    // `computeHashSerializedTxOutSet` and refuses on a mismatch with Core's
+    // "Bad snapshot content hash" (behaviour pinned in
+    // src/tests_snapshot_cli_hash_gate.zig).
+    try testing.expect(contains(src, "computeHashSerializedTxOutSet"));
+    try testing.expect(contains(src, "Bad snapshot content hash"));
     // The in-memory path (storage.zig) DOES have it — sanity check.
     const storage_src = try loadSrc(allocator, "storage");
     defer allocator.free(storage_src);

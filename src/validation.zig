@@ -7079,11 +7079,18 @@ pub const BlockIndexEntry = struct {
 
         var current: *BlockIndexEntry = self;
         while (current.height > target_height) {
+            if (builtin.is_test) test_ancestor_steps += 1;
             current = current.parent orelse return null;
         }
         return current;
     }
 };
+
+/// Test-only counter of parent steps taken by `BlockIndexEntry.getAncestor`.
+/// Lets a test assert that a handler's ancestor walking is O(height) rather
+/// than O(height^2).  The increment is comptime-gated on `builtin.is_test`,
+/// so production builds never touch it.
+pub var test_ancestor_steps: u64 = 0;
 
 /// Chain manager for invalidateblock / reconsiderblock / preciousblock operations.
 /// This struct maintains the block index and provides chain management RPCs.

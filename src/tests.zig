@@ -1063,6 +1063,7 @@ comptime {
     _ = @import("v2_transport.zig");
     _ = @import("tests_sec_p2p_trickle.zig"); // security audit C3/H3: trickled v1 messages + handshake deadline
     _ = @import("tests_bip324_w98.zig"); // W98 BIP-324 gate audit
+    _ = @import("tests_v2_unknown_shortid.zig"); // BIP-324 unknown short IDs: bounded discard, no recursion
     _ = @import("erlay.zig");
     _ = @import("tests_w104_addrman.zig"); // W104 AddrMan 30-gate fleet audit
     _ = @import("tests_w106_mempool.zig"); // W106 CTxMemPool descendant/ancestor + RBF + package 30-gate audit
@@ -1070,6 +1071,7 @@ comptime {
     _ = @import("tests_w116_package_relay.zig"); // W116 package relay 30-gate audit
     _ = @import("tests_w117_bip155_networks.zig"); // W117 BIP-155 anonymous networks 30-gate audit
     _ = @import("tests_sec_rpc_payjoin_auth_args.zig"); // security audit C6/H4/H5/H6: payjoin auth, RPC casts, serial RPC, descriptor range
+    _ = @import("tests_rpc_current_wallet_lifetime.zig"); // per-request wallet routing: no stale/freed current_wallet across a batch
     // rpc.zig is exercised in its own dedicated test step (`zig build
     // test-rpc` and folded into `zig build test` via build.zig). Importing
     // it here would transitively pull wallet.zig, which uses an

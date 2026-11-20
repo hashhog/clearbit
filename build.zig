@@ -1249,6 +1249,40 @@ pub fn build(b: *std.Build) void {
         r5_cw_step.dependOn(&run_r5_cw_tests.step);
     }
 
+    // walletpassphrase timeout must relock: signing after the unlock window
+    // is -13, the key is wiped (Core wallet/rpc/encrypt.cpp RelockWallet).
+    {
+        const relock_tests = b.addTest(.{
+            .root_source_file = b.path("tests_walletpassphrase_relock.zig"),
+            .target = target,
+            .optimize = optimize,
+            .filters = &[_][]const u8{"tests_walletpassphrase_relock"},
+        });
+        relock_tests.linkSystemLibrary("rocksdb");
+        relock_tests.linkSystemLibrary("secp256k1");
+        relock_tests.addIncludePath(.{ .cwd_relative = secp256k1_include });
+        relock_tests.linkLibC();
+        if (target.result.cpu.arch == .x86_64) {
+            relock_tests.addCSourceFile(.{
+                .file = b.path("src/sha256_shani.c"),
+                .flags = shani_cflags,
+            });
+        }
+        if (minisketch_enabled) {
+            relock_tests.linkSystemLibrary("minisketch");
+            relock_tests.addIncludePath(.{ .cwd_relative = minisketch_include });
+        }
+        relock_tests.root_module.addOptions("build_options", build_options);
+
+        const run_relock_tests = b.addRunArtifact(relock_tests);
+        const relock_step = b.step(
+            "test-walletpassphrase-relock",
+            "Run walletpassphrase timeout relock tests",
+        );
+        relock_step.dependOn(&run_relock_tests.step);
+        test_step.dependOn(&run_relock_tests.step);
+    }
+
     // CONTROL for QUEUES.md T3 getwalletinfo txcount / shape / wrong-arity.
     // Same project-root package layout as tests_r5_createwallet.zig.
     {
@@ -2054,6 +2088,37 @@ pub fn build(b: *std.Build) void {
         test_step.dependOn(&run_b68_tests.step);
     }
 
+    // --load-snapshot runs the assumeutxo hash_serialized gate (Core "Bad
+    // snapshot content hash").  Same rig as test-bip68-coin-mtp-ancestor; part of `test`.
+    {
+        const shg_tests = b.addTest(.{
+            .root_source_file = b.path("tests_snapshot_cli_hash_gate.zig"),
+            .target = target,
+            .optimize = optimize,
+            .filters = &[_][]const u8{"tests_snapshot_cli_hash_gate"},
+        });
+        shg_tests.linkSystemLibrary("rocksdb");
+        shg_tests.linkSystemLibrary("secp256k1");
+        shg_tests.addIncludePath(.{ .cwd_relative = secp256k1_include });
+        shg_tests.linkLibC();
+        if (target.result.cpu.arch == .x86_64) {
+            shg_tests.addCSourceFile(.{
+                .file = b.path("src/sha256_shani.c"),
+                .flags = shani_cflags,
+            });
+        }
+        if (minisketch_enabled) {
+            shg_tests.linkSystemLibrary("minisketch");
+            shg_tests.addIncludePath(.{ .cwd_relative = minisketch_include });
+        }
+        shg_tests.root_module.addOptions("build_options", build_options);
+
+        const run_shg_tests = b.addRunArtifact(shg_tests);
+        const shg_step = b.step("test-snapshot-cli-hash-gate", "Run --load-snapshot content-hash gate tests (Bad snapshot content hash)");
+        shg_step.dependOn(&run_shg_tests.step);
+        test_step.dependOn(&run_shg_tests.step);
+    }
+
     // submitpackage response shape vs Core.  Same rig as test-tma-parity above.
     {
         const sps_tests = b.addTest(.{
@@ -2173,6 +2238,37 @@ pub fn build(b: *std.Build) void {
         const sck_step = b.step("test-script-cache-key-wtxid", "Run script-check cache key (wtxid / full witness) tests");
         sck_step.dependOn(&run_sck_tests.step);
         test_step.dependOn(&run_sck_tests.step);
+    }
+
+    // Tapscript condition stack is O(1) per opcode (Core ConditionStack):
+    // 50k nested OP_IF must not cost quadratic time. Also part of `test`.
+    {
+        const tcs_tests = b.addTest(.{
+            .root_source_file = b.path("tests_tapscript_condition_stack.zig"),
+            .target = target,
+            .optimize = optimize,
+            .filters = &[_][]const u8{"tests_tapscript_condition_stack"},
+        });
+        tcs_tests.linkSystemLibrary("rocksdb");
+        tcs_tests.linkSystemLibrary("secp256k1");
+        tcs_tests.addIncludePath(.{ .cwd_relative = secp256k1_include });
+        tcs_tests.linkLibC();
+        if (target.result.cpu.arch == .x86_64) {
+            tcs_tests.addCSourceFile(.{
+                .file = b.path("src/sha256_shani.c"),
+                .flags = shani_cflags,
+            });
+        }
+        if (minisketch_enabled) {
+            tcs_tests.linkSystemLibrary("minisketch");
+            tcs_tests.addIncludePath(.{ .cwd_relative = minisketch_include });
+        }
+        tcs_tests.root_module.addOptions("build_options", build_options);
+
+        const run_tcs_tests = b.addRunArtifact(tcs_tests);
+        const tcs_step = b.step("test-tapscript-condition-stack", "Run tapscript condition-stack O(1) cost tests (Core ConditionStack)");
+        tcs_step.dependOn(&run_tcs_tests.step);
+        test_step.dependOn(&run_tcs_tests.step);
     }
 
     // setmocktime suite: regtest-only clock override RPC.
@@ -3242,6 +3338,40 @@ pub fn build(b: *std.Build) void {
         const gbt_step = b.step("test-getblocktxn", "Run BIP-152 getblocktxn serve-path tests (peer.zig-rooted)");
         gbt_step.dependOn(&run_gbt_tests.step);
         test_step.dependOn(&run_gbt_tests.step);
+    }
+
+    // recv-error ban — drives processAllMessages with a peer that sends an
+    // unknown command and checks the ban list: a local peer is disconnected
+    // only (Core MaybeDiscourageAndDisconnect), a routable one is banned.
+    // Uses peer.zig-private test helpers, so peer.zig-rooted like the above.
+    // Run with `zig build test-recv-error-ban`.
+    {
+        const reb_tests = b.addTest(.{
+            .root_source_file = b.path("src/peer.zig"),
+            .target = target,
+            .optimize = optimize,
+            .filters = &[_][]const u8{"recv-error ban"},
+        });
+        reb_tests.linkSystemLibrary("rocksdb");
+        reb_tests.linkSystemLibrary("secp256k1");
+        reb_tests.addIncludePath(.{ .cwd_relative = secp256k1_include });
+        reb_tests.linkLibC();
+        if (target.result.cpu.arch == .x86_64) {
+            reb_tests.addCSourceFile(.{
+                .file = b.path("src/sha256_shani.c"),
+                .flags = shani_cflags,
+            });
+        }
+        if (minisketch_enabled) {
+            reb_tests.linkSystemLibrary("minisketch");
+            reb_tests.addIncludePath(.{ .cwd_relative = minisketch_include });
+        }
+        reb_tests.root_module.addOptions("build_options", build_options);
+
+        const run_reb_tests = b.addRunArtifact(reb_tests);
+        const reb_step = b.step("test-recv-error-ban", "Run recv-error local-peer ban exemption tests (peer.zig-rooted)");
+        reb_step.dependOn(&run_reb_tests.step);
+        test_step.dependOn(&run_reb_tests.step);
     }
 
     // FIX-3G — ADDR/ADDRV2 peer-timestamp clamp (3G policy, fleet-wide).

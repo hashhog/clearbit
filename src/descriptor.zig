@@ -854,6 +854,114 @@ fn isHexPubkey(s: []const u8) bool {
 // Script Generation
 // ============================================================================
 
+/// BIP-341 tapleaf version for tapscript (Core TAPROOT_LEAF_TAPSCRIPT).
+const TAPROOT_LEAF_TAPSCRIPT: u8 = 0xc0;
+/// Core TAPROOT_CONTROL_MAX_NODE_COUNT: deepest allowed leaf.
+const TAPROOT_CONTROL_MAX_NODE_COUNT: usize = 128;
+
+/// Leaf script of a tr() sub-descriptor. Inside tapscript every key is
+/// x-only (Core ParseScriptContext::P2TR): pk(K) is `<32-byte K> OP_CHECKSIG`
+/// and pkh(K) (miniscript pkh) hashes the 32-byte x-only key. Any other leaf
+/// type is refused rather than hashed into a wrong (unspendable) output key.
+fn deriveTapLeafScript(allocator: std.mem.Allocator, leaf: *const Descriptor, index: u32) ![]u8 {
+    var script = std.ArrayList(u8).init(allocator);
+    errdefer script.deinit();
+    switch (leaf.*) {
+        .pk => |key| {
+            const xonly = try resolveKeyToXOnlyPubkey(allocator, key, index);
+            defer allocator.free(xonly);
+            if (xonly.len != 32) return error.InvalidKeyExpression;
+            try script.append(0x20);
+            try script.appendSlice(xonly);
+            try script.append(0xac); // OP_CHECKSIG
+        },
+        .pkh => |key| {
+            const xonly = try resolveKeyToXOnlyPubkey(allocator, key, index);
+            defer allocator.free(xonly);
+            if (xonly.len != 32) return error.InvalidKeyExpression;
+            const hash = crypto.hash160(xonly);
+            try script.append(0x76); // OP_DUP
+            try script.append(0xa9); // OP_HASH160
+            try script.append(0x14);
+            try script.appendSlice(&hash);
+            try script.append(0x88); // OP_EQUALVERIFY
+            try script.append(0xac); // OP_CHECKSIG
+        },
+        else => return error.UnsupportedTapLeaf,
+    }
+    return script.toOwnedSlice();
+}
+
+fn tapBranchHash(a: *const [32]u8, b: *const [32]u8) [32]u8 {
+    var buf: [64]u8 = undefined;
+    // BIP-341: children are sorted lexicographically before hashing.
+    if (std.mem.order(u8, a, b) == .lt) {
+        @memcpy(buf[0..32], a);
+        @memcpy(buf[32..64], b);
+    } else {
+        @memcpy(buf[0..32], b);
+        @memcpy(buf[32..64], a);
+    }
+    return crypto.taggedHash("TapBranch", &buf);
+}
+
+/// Merkle root of a tr() script tree given its leaves in depth-first order
+/// with their depths, as Core's TaprootBuilder::Add/Finalize builds it: each
+/// leaf is placed at its depth and merged upward with any sibling already
+/// waiting at that depth.
+fn computeTapTreeMerkleRoot(allocator: std.mem.Allocator, leaves: []const TapLeaf, index: u32) ![32]u8 {
+    var pending: [TAPROOT_CONTROL_MAX_NODE_COUNT + 1]?[32]u8 = .{null} ** (TAPROOT_CONTROL_MAX_NODE_COUNT + 1);
+    var complete = false;
+    for (leaves) |leaf| {
+        if (complete) return error.InvalidTapTree;
+        if (leaf.depth > TAPROOT_CONTROL_MAX_NODE_COUNT) return error.InvalidTapTree;
+        const leaf_script = try deriveTapLeafScript(allocator, leaf.script, index);
+        defer allocator.free(leaf_script);
+        var node = crypto.computeTapleafHash(leaf_script, TAPROOT_LEAF_TAPSCRIPT) orelse return error.InvalidTapTree;
+        var d: usize = leaf.depth;
+        while (true) {
+            if (pending[d]) |sibling| {
+                pending[d] = null;
+                node = tapBranchHash(&sibling, &node);
+                if (d == 0) return error.InvalidTapTree;
+                d -= 1;
+            } else {
+                pending[d] = node;
+                break;
+            }
+        }
+        if (d == 0) complete = true;
+    }
+    if (!complete) return error.InvalidTapTree;
+    for (pending[1..]) |p| if (p != null) return error.InvalidTapTree;
+    return pending[0].?;
+}
+
+/// Q = P + int(H_TapTweak(P || merkle_root))·G, x-only (BIP-341).
+fn tapTweakXOnlyWithRoot(ctx: *secp.Context, internal_xonly: *const [32]u8, merkle_root: *const [32]u8) ![32]u8 {
+    var internal: secp256k1.secp256k1_xonly_pubkey = undefined;
+    if (secp256k1.secp256k1_xonly_pubkey_parse(ctx, &internal, internal_xonly) != 1) {
+        return error.InvalidInternalKey;
+    }
+    var data: [64]u8 = undefined;
+    @memcpy(data[0..32], internal_xonly);
+    @memcpy(data[32..64], merkle_root);
+    const tweak = crypto.taggedHash("TapTweak", &data);
+    var tweaked_full: secp256k1.secp256k1_pubkey = undefined;
+    if (secp256k1.secp256k1_xonly_pubkey_tweak_add(ctx, &tweaked_full, &internal, &tweak) != 1) {
+        return error.TaprootTweakFailed;
+    }
+    var tweaked_xonly: secp256k1.secp256k1_xonly_pubkey = undefined;
+    if (secp256k1.secp256k1_xonly_pubkey_from_pubkey(ctx, &tweaked_xonly, null, &tweaked_full) != 1) {
+        return error.TaprootTweakFailed;
+    }
+    var out: [32]u8 = undefined;
+    if (secp256k1.secp256k1_xonly_pubkey_serialize(ctx, &out, &tweaked_xonly) != 1) {
+        return error.TaprootTweakFailed;
+    }
+    return out;
+}
+
 /// Generate scriptPubKey from descriptor at a specific index (for ranged descriptors)
 pub fn deriveScript(allocator: std.mem.Allocator, desc: *const Descriptor, index: u32) ![]u8 {
     var script = std.ArrayList(u8).init(allocator);
@@ -929,7 +1037,16 @@ pub fn deriveScript(allocator: std.mem.Allocator, desc: *const Descriptor, index
             var ik: [32]u8 = undefined;
             @memcpy(&ik, internal_xonly);
             const ctx = try getSecpContext();
-            const output_key = try wallet.bip86TweakXOnly(ctx, &ik);
+            // tr(KEY,TREE): the output key commits to the script tree, so the
+            // tweak is H_TapTweak(P || merkle_root) (Core TRDescriptor::
+            // MakeScripts → TaprootBuilder::Finalize). Only a key-path-only
+            // tr(KEY) uses the empty-root BIP-86 tweak.
+            const output_key = if (t.leaves.len == 0)
+                try wallet.bip86TweakXOnly(ctx, &ik)
+            else blk: {
+                const root = try computeTapTreeMerkleRoot(allocator, t.leaves, index);
+                break :blk try tapTweakXOnlyWithRoot(ctx, &ik, &root);
+            };
             try script.append(0x51); // OP_1
             try script.append(0x20); // Push 32 bytes
             try script.appendSlice(&output_key);
@@ -2249,4 +2366,106 @@ test "importdescriptors format parsing" {
     try std.testing.expectEqual(@as(usize, 3), origin.path.len);
     // 84' = 84 | 0x80000000
     try std.testing.expectEqual(@as(u32, 84 | 0x80000000), origin.path[0]);
+}
+
+// ----------------------------------------------------------------------------
+// tr(KEY,TREE): the output key commits to the script tree (BIP-386 / BIP-341).
+// Expected values are the BIP-386 test vectors; every one was also re-derived
+// with Bitcoin Core v31.1 `deriveaddresses` + `validateaddress` (mainnet).
+// ----------------------------------------------------------------------------
+
+const tr_tree_test_K = "a34b99f22c790c4e36b2b3c2c35a36db06226e41c692fc82b8b56ac1c540c5bd";
+
+fn trTreeExpectSpk(desc_str: []const u8, index: u32, expected_hex: []const u8) !void {
+    const allocator = std.testing.allocator;
+    var desc = try parseDescriptor(allocator, desc_str);
+    defer desc.deinit(allocator);
+    const spk = try deriveScript(allocator, &desc, index);
+    defer allocator.free(spk);
+    const got = try std.fmt.allocPrint(allocator, "{s}", .{std.fmt.fmtSliceHexLower(spk)});
+    defer allocator.free(got);
+    try std.testing.expectEqualStrings(expected_hex, got);
+}
+
+test "tr_script_tree: deriveaddresses of tr(KEY,pk(...)) equals Core's address (BIP-386)" {
+    const allocator = std.testing.allocator;
+    const addrs = try deriveAddresses(
+        allocator,
+        "tr(" ++ tr_tree_test_K ++ ",pk(669b8afcec803a0d323e9a17f3ea8e68e8abe5a278020a929adbec52421adbd0))",
+        .mainnet,
+        0,
+        0,
+    );
+    defer {
+        for (addrs) |a| allocator.free(a);
+        allocator.free(addrs);
+    }
+    try std.testing.expectEqual(@as(usize, 1), addrs.len);
+    // Core v31.1 deriveaddresses. The key-path-only address for this internal
+    // key (what master produced) is bc1pw74tdcrxlzn5r8z6...0gs8zu.
+    try std.testing.expectEqualStrings("bc1pzl833kecrkpkmzfrkx7my3k0ekqcmgdf7rnw0yrlrplsktunwa2q7vxsg5", addrs[0]);
+}
+
+test "tr_script_tree: BIP-386 nested tree vector" {
+    try trTreeExpectSpk(
+        "tr(" ++ tr_tree_test_K ++ ",{pk(xprvA2JDeKCSNNZky6uBCviVfJSKyQ1mDYahRjijr5idH2WwLsEd4Hsb2Tyh8RfQMuPh7f7RtyzTtdrbdqqsunu5Mm3wDvUAKRHSC34sJ7in334/0),{{pk(xpub6ERApfZwUNrhLCkDtcHTcxd75RbzS1ed54G1LkBUHQVHQKqhMkhgbmJbZRkrgZw4koxb5JaHWkY4ALHY2grBGRjaDMzQLcgJvLJuZZvRcEL),pk(02df12b7035bdac8e3bab862a3a83d06ea6b17b6753d52edecba9be46f5d09e076)},pk(L4rK1yDtCWekvXuE6oXD9jCYfFNV2cWRpVuPLBcCU2z8TrisoyY1)}})",
+        0,
+        "512071fff39599a7b78bc02623cbe814efebf1a404f5d8ad34ea80f213bd8943f574",
+    );
+}
+
+test "tr_script_tree: BIP-386 ranged tr(xprv/0/*,pk(xprv/1/*)) indices 0..2" {
+    const R = "xprvA1RpRA33e1JQ7ifknakTFpgNXPmW2YvmhqLQYMmrj4xJXXWYpDPS3xz7iAxn8L39njGVyuoseXzU6rcxFLJ8HFsTjSyQbLYnMpCqE2VbFWc";
+    const d = "tr(" ++ R ++ "/0/*,pk(" ++ R ++ "/1/*))";
+    try trTreeExpectSpk(d, 0, "512078bc707124daa551b65af74de2ec128b7525e10f374dc67b64e00ce0ab8b3e12");
+    try trTreeExpectSpk(d, 1, "512001f0a02a17808c20134b78faab80ef93ffba82261ccef0a2314f5d62b6438f11");
+    try trTreeExpectSpk(d, 2, "512021024954fcec88237a9386fce80ef2ced5f1e91b422b26c59ccfc174c8d1ad25");
+}
+
+test "tr_script_tree: Core descriptor_tests compressed-key tree vector" {
+    // bitcoin-core/src/test/descriptor_tests.cpp: 33-byte keys inside tr()
+    // are used x-only, both as internal key and in pk() leaves.
+    try trTreeExpectSpk(
+        "tr(03a34b99f22c790c4e36b2b3c2c35a36db06226e41c692fc82b8b56ac1c540c5,{pk(03a34b99f22c790c4e36b2b3c2c35a36db06226e41c692fc82b8b56ac1c540c5),{pk(L4rK1yDtCWekvXuE6oXD9jCYfFNV2cWRpVuPLBcCU2z8TrisoyY1),pk(03a34b99f22c790c4e36b2b3c2c35a36db06226e41c692fc82b8b56ac1c540c5)}})",
+        0,
+        "51201497ae16f30dacb88523ed9301bff17773b609e8a90518a3f96ea328a47d1500",
+    );
+}
+
+test "tr_script_tree: pkh() leaf hashes the x-only key (Core v31.1)" {
+    // BIP-386 lists this as valid without an output; value from Core v31.1.
+    try trTreeExpectSpk(
+        "tr(" ++ tr_tree_test_K ++ ",pkh(L4rK1yDtCWekvXuE6oXD9jCYfFNV2cWRpVuPLBcCU2z8TrisoyY1))",
+        0,
+        "51207cb44493f9a28e2d53656c2eb6fb3a053afaa05f8ae3ef474392d8759cd78b7a",
+    );
+}
+
+test "tr_script_tree: sibling order does not change the root (TapBranch sorts)" {
+    const expected = "5120c895d68a6e7881fa5e8ad4e554bab6b313705773bc6262117d92f70942a336cd";
+    try trTreeExpectSpk("tr(" ++ tr_tree_test_K ++ ",{pk(669b8afcec803a0d323e9a17f3ea8e68e8abe5a278020a929adbec52421adbd0),pk(" ++ tr_tree_test_K ++ ")})", 0, expected);
+    try trTreeExpectSpk("tr(" ++ tr_tree_test_K ++ ",{pk(" ++ tr_tree_test_K ++ "),pk(669b8afcec803a0d323e9a17f3ea8e68e8abe5a278020a929adbec52421adbd0)})", 0, expected);
+}
+
+test "tr_script_tree: tr(KEY) key-path-only is unchanged (BIP-386)" {
+    try trTreeExpectSpk("tr(" ++ tr_tree_test_K ++ ")", 0, "512077aab6e066f8a7419c5ab714c12c67d25007ed55a43cadcacb4d7a970a093f11");
+    try trTreeExpectSpk("tr(L4rK1yDtCWekvXuE6oXD9jCYfFNV2cWRpVuPLBcCU2z8TrisoyY1)", 0, "512077aab6e066f8a7419c5ab714c12c67d25007ed55a43cadcacb4d7a970a093f11");
+}
+
+test "tr_script_tree: unsupported leaf type is refused, not hashed into a wrong key" {
+    // multi() is not valid inside tr() (Core: only multi_a/sortedmulti_a).
+    // Producing an address that ignores or mis-encodes the leaf would be a
+    // wrong (unspendable-by-script-path) address, so derivation must fail.
+    const allocator = std.testing.allocator;
+    // The parser still accepts multi() here; this pins the derive step.
+    var desc = try parseDescriptor(allocator, "tr(" ++ tr_tree_test_K ++ ",multi(1,669b8afcec803a0d323e9a17f3ea8e68e8abe5a278020a929adbec52421adbd0))");
+    defer desc.deinit(allocator);
+    try std.testing.expect(desc == .tr);
+    try std.testing.expectEqual(@as(usize, 1), desc.tr.leaves.len);
+    if (deriveScript(allocator, &desc, 0)) |spk| {
+        allocator.free(spk);
+        return error.TestExpectedError;
+    } else |err| {
+        try std.testing.expect(@as(anyerror, err) == error.UnsupportedTapLeaf);
+    }
 }

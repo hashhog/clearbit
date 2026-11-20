@@ -1345,9 +1345,27 @@ fn loadSnapshotFromFile(config: *Config, allocator: std.mem.Allocator) !void {
     };
     defer db.close();
 
+    // Every refusal inside has already printed its FATAL line.
+    importSnapshotIntoDb(&db, snapshot_path, config.getNetworkParams(), allocator) catch std.process.exit(1);
+}
+
+/// The CLI snapshot import refused the file (the reason is printed to stderr).
+pub const SnapshotImportError = error{SnapshotRejected};
+
+/// Body of `--load-snapshot`: stream the snapshot at `snapshot_path` (absolute)
+/// into the already-open chainstate `db` and, only once the coins have passed
+/// the assumeutxo content-hash gate, point `chain_tip` at the snapshot base.
+/// Split out of `loadSnapshotFromFile` so it returns an error instead of
+/// exiting, which is what lets a unit test drive the real CLI path.
+pub fn importSnapshotIntoDb(
+    db: *storage.Database,
+    snapshot_path: []const u8,
+    network_params: *const consensus.NetworkParams,
+    allocator: std.mem.Allocator,
+) SnapshotImportError!void {
     const file = std.fs.openFileAbsolute(snapshot_path, .{}) catch |err| {
         std.debug.print("FATAL: Cannot open snapshot file {s}: {}\n", .{ snapshot_path, err });
-        std.process.exit(1);
+        return error.SnapshotRejected;
     };
     defer file.close();
 
@@ -1357,12 +1375,11 @@ fn loadSnapshotFromFile(config: *Config, allocator: std.mem.Allocator) !void {
     var hdr: [storage.SnapshotMetadata.HEADER_SIZE]u8 = undefined;
     reader.readBytesInto(&hdr) catch |err| {
         std.debug.print("FATAL: Failed to read snapshot header: {}\n", .{err});
-        std.process.exit(1);
+        return error.SnapshotRejected;
     };
-    const network_params = config.getNetworkParams();
     const metadata = storage.SnapshotMetadata.fromBytes(&hdr, network_params.magic) catch |err| {
         std.debug.print("FATAL: Snapshot header rejected (magic/version/network mismatch): {}\n", .{err});
-        std.process.exit(1);
+        return error.SnapshotRejected;
     };
 
     // 2. Cross-reference the snapshot tip against the assumeutxo entries
@@ -1388,7 +1405,7 @@ fn loadSnapshotFromFile(config: *Config, allocator: std.mem.Allocator) !void {
         var disp: [64]u8 = undefined;
         for (0..32) |i| _ = std.fmt.bufPrint(disp[i * 2 ..][0..2], "{x:0>2}", .{metadata.base_blockhash[31 - i]}) catch unreachable;
         std.debug.print("FATAL: Snapshot tip {s} is not a recognized assumeutxo block for this network.\n", .{disp[0..]});
-        std.process.exit(1);
+        return error.SnapshotRejected;
     }
     if (assume_entry == null) storage.warnUnverifiedSnapshot(&metadata.base_blockhash, unsafe_height.?);
     const block_height: u32 = if (assume_entry) |e| e.height else unsafe_height.?;
@@ -1407,6 +1424,20 @@ fn loadSnapshotFromFile(config: *Config, allocator: std.mem.Allocator) !void {
         std.debug.print("  Chain txs:  unknown (no chainparams entry - UNVERIFIED snapshot)\n", .{});
     }
 
+    // The content-hash gate below hashes the whole of CF_UTXO, so it only
+    // measures THIS snapshot when CF_UTXO held nothing before the import (Core
+    // populates a fresh snapshot chainstate for the same reason).  A chainstate
+    // that already has coins would fail the gate with a valid snapshot, and the
+    // refusal would then have to delete coins this import did not write.
+    if (assume_entry != null and !utxoColumnEmpty(db)) {
+        std.debug.print("FATAL: Chainstate already holds coins; load a snapshot only into a fresh datadir.\n", .{});
+        return error.SnapshotRejected;
+    }
+    // Any refusal from here on (a short or malformed file, a failed write, the
+    // hash gate) deletes the coins already written, so the datadir is left as
+    // it was found and no partial set survives.
+    errdefer if (assume_entry != null) deleteAllUtxoCoins(db, allocator);
+
     const start_time = std.time.milliTimestamp();
     const BATCH_SIZE: u64 = 100_000;
     var batch_ops = std.ArrayList(storage.BatchOp).init(allocator);
@@ -1415,6 +1446,11 @@ fn loadSnapshotFromFile(config: *Config, allocator: std.mem.Allocator) !void {
     defer batch_keys.deinit();
     var batch_values = std.ArrayList([]const u8).init(allocator);
     defer batch_values.deinit();
+    // A refusal mid-batch returns with this batch's buffers still owned here.
+    errdefer {
+        for (batch_keys.items) |k| allocator.free(k);
+        for (batch_values.items) |v| allocator.free(v);
+    }
 
     // 3. Stream coins by walking txid groups.
     var imported: u64 = 0;
@@ -1424,42 +1460,42 @@ fn loadSnapshotFromFile(config: *Config, allocator: std.mem.Allocator) !void {
         var txid: [32]u8 = undefined;
         reader.readBytesInto(&txid) catch |err| {
             std.debug.print("\nFATAL: Read error at coin {d}: {}\n", .{ imported, err });
-            std.process.exit(1);
+            return error.SnapshotRejected;
         };
         const coins_per_txid_u64 = reader.readCompactSize() catch |err| {
             std.debug.print("\nFATAL: Failed to read coins_per_txid at coin {d}: {}\n", .{ imported, err });
-            std.process.exit(1);
+            return error.SnapshotRejected;
         };
         if (coins_per_txid_u64 > coins_left) {
             std.debug.print("\nFATAL: coins_per_txid={d} exceeds remaining {d} at coin {d}\n", .{ coins_per_txid_u64, coins_left, imported });
-            std.process.exit(1);
+            return error.SnapshotRejected;
         }
         var i: u64 = 0;
         while (i < coins_per_txid_u64) : (i += 1) {
             const vout_u64 = reader.readCompactSize() catch |err| {
                 std.debug.print("\nFATAL: Read error (vout) at coin {d}: {}\n", .{ imported, err });
-                std.process.exit(1);
+                return error.SnapshotRejected;
             };
             if (vout_u64 >= std.math.maxInt(u32)) {
                 std.debug.print("\nFATAL: vout overflow at coin {d}\n", .{imported});
-                std.process.exit(1);
+                return error.SnapshotRejected;
             }
             const vout: u32 = @intCast(vout_u64);
 
             const code = reader.readVarInt() catch |err| {
                 std.debug.print("\nFATAL: Read error (code) at coin {d}: {}\n", .{ imported, err });
-                std.process.exit(1);
+                return error.SnapshotRejected;
             };
             const utxo_height: u32 = @intCast(code >> 1);
             const is_coinbase = (code & 1) != 0;
             if (utxo_height > block_height) {
                 std.debug.print("\nFATAL: Coin height {d} > snapshot height {d} at coin {d}\n", .{ utxo_height, block_height, imported });
-                std.process.exit(1);
+                return error.SnapshotRejected;
             }
 
             const compressed_amount = reader.readVarInt() catch |err| {
                 std.debug.print("\nFATAL: Read error (amount) at coin {d}: {}\n", .{ imported, err });
-                std.process.exit(1);
+                return error.SnapshotRejected;
             };
             const compressor = @import("compressor.zig");
             const amount: i64 = @intCast(compressor.decompressAmount(compressed_amount));
@@ -1467,12 +1503,12 @@ fn loadSnapshotFromFile(config: *Config, allocator: std.mem.Allocator) !void {
             // Reject coins with values outside [0, MAX_MONEY].
             if (!@import("consensus.zig").isValidMoney(amount)) {
                 std.debug.print("\nFATAL: Coin value {d} out of MoneyRange at coin {d}\n", .{ amount, imported });
-                std.process.exit(1);
+                return error.SnapshotRejected;
             }
 
             const script_pubkey = readCompressedScriptStreaming(&reader, allocator) catch |err| {
                 std.debug.print("\nFATAL: Read error (script) at coin {d}: {}\n", .{ imported, err });
-                std.process.exit(1);
+                return error.SnapshotRejected;
             };
             // script_pubkey ownership transfers into CompactUtxo.encode (which
             // copies the extracted hash/script), so free here after value_data
@@ -1482,7 +1518,7 @@ fn loadSnapshotFromFile(config: *Config, allocator: std.mem.Allocator) !void {
             const key_alloc = allocator.alloc(u8, 36) catch {
                 allocator.free(script_pubkey);
                 std.debug.print("\nFATAL: Out of memory at coin {d}\n", .{imported});
-                std.process.exit(1);
+                return error.SnapshotRejected;
             };
             @memcpy(key_alloc[0..32], &txid);
             std.mem.writeInt(u32, key_alloc[32..36], vout, .little);
@@ -1520,7 +1556,7 @@ fn loadSnapshotFromFile(config: *Config, allocator: std.mem.Allocator) !void {
                 allocator.free(key_alloc);
                 allocator.free(script_pubkey);
                 std.debug.print("\nFATAL: Serialization failed at coin {d}\n", .{imported});
-                std.process.exit(1);
+                return error.SnapshotRejected;
             };
             allocator.free(script_pubkey);
 
@@ -1530,7 +1566,7 @@ fn loadSnapshotFromFile(config: *Config, allocator: std.mem.Allocator) !void {
                 allocator.free(key_alloc);
                 allocator.free(value_data);
                 std.debug.print("\nFATAL: Out of memory at coin {d}\n", .{imported});
-                std.process.exit(1);
+                return error.SnapshotRejected;
             };
             batch_keys.append(key_alloc) catch unreachable;
             batch_values.append(value_data) catch unreachable;
@@ -1541,7 +1577,7 @@ fn loadSnapshotFromFile(config: *Config, allocator: std.mem.Allocator) !void {
             if (imported % BATCH_SIZE == 0 or coins_left == 0) {
                 db.writeBatch(batch_ops.items) catch |err| {
                     std.debug.print("\nFATAL: WriteBatch failed at coin {d}: {}\n", .{ imported, err });
-                    std.process.exit(1);
+                    return error.SnapshotRejected;
                 };
                 for (batch_keys.items) |k| allocator.free(k);
                 for (batch_values.items) |v| allocator.free(v);
@@ -1563,13 +1599,41 @@ fn loadSnapshotFromFile(config: *Config, allocator: std.mem.Allocator) !void {
 
     std.debug.print("\r  Progress: {d}/{d} coins (100.0%)                    \n", .{ imported, metadata.coins_count });
 
+    // STRICT CONTENT HASH, the same gate loadtxoutset runs
+    // (storage.validateAndLoadSnapshot): hash_serialized (SHA256d over Core's
+    // TxOutSer, canonical (txid, numeric vout) order) of the coins now in
+    // CF_UTXO must equal the pinned assume_utxo.hash_serialized.  Core:
+    // PopulateAndValidateSnapshot, "Bad snapshot content hash".  It runs before
+    // chain_tip or any other chain metadata is written, so a refused snapshot
+    // leaves no tip, and the errdefer above deletes its coins again.
+    // Skipped only under the DEV ESCAPE, which has no pinned hash to compare.
+    if (assume_entry) |e| {
+        std.debug.print("  Verifying snapshot content hash...\n", .{});
+        var utxo_view = storage.UtxoSet.init(db, 0, allocator);
+        defer utxo_view.deinit();
+        const actual = storage.computeHashSerializedTxOutSet(&utxo_view, allocator) catch |err| {
+            std.debug.print("FATAL: Could not hash the imported UTXO set: {}\n", .{err});
+            return error.SnapshotRejected;
+        };
+        if (!std.mem.eql(u8, &actual, &e.hash_serialized)) {
+            var exp_hex: [64]u8 = undefined;
+            var got_hex: [64]u8 = undefined;
+            for (0..32) |i| {
+                _ = std.fmt.bufPrint(exp_hex[i * 2 ..][0..2], "{x:0>2}", .{e.hash_serialized[31 - i]}) catch unreachable;
+                _ = std.fmt.bufPrint(got_hex[i * 2 ..][0..2], "{x:0>2}", .{actual[31 - i]}) catch unreachable;
+            }
+            std.debug.print("FATAL: Bad snapshot content hash: expected {s}, got {s}\n", .{ exp_hex[0..], got_hex[0..] });
+            return error.SnapshotRejected;
+        }
+    }
+
     // Set chain tip to snapshot block.
     var tip_buf: [36]u8 = undefined;
     @memcpy(tip_buf[0..32], &metadata.base_blockhash);
     std.mem.writeInt(u32, tip_buf[32..36], block_height, .little);
     db.put(storage.CF_DEFAULT, "chain_tip", &tip_buf) catch |err| {
         std.debug.print("FATAL: Failed to set chain tip: {}\n", .{err});
-        std.process.exit(1);
+        return error.SnapshotRejected;
     };
 
     var count_buf: [8]u8 = undefined;
@@ -1691,6 +1755,60 @@ fn loadSnapshotFromFile(config: *Config, allocator: std.mem.Allocator) !void {
     // headers only. Historical header+block backfill of genesis→base is
     // armed at boot by HistoricalBackfill (genesis-locator getheaders,
     // bodies into the height index, never rewinding the snapshot tip).
+}
+
+fn utxoColumnEmpty(db: *storage.Database) bool {
+    var it = db.iterator(storage.CF_UTXO);
+    defer it.deinit();
+    it.seekToFirst();
+    return !it.valid();
+}
+
+/// Undo a refused import: delete every CF_UTXO key.  Only reached after
+/// `importSnapshotIntoDb` checked CF_UTXO was empty before it wrote, so every
+/// key here is one of the refused snapshot's coins.
+fn deleteAllUtxoCoins(db: *storage.Database, allocator: std.mem.Allocator) void {
+    const CHUNK: usize = 100_000;
+    var keys = std.ArrayList([]u8).init(allocator);
+    defer keys.deinit();
+    var del_ops = std.ArrayList(storage.BatchOp).init(allocator);
+    defer del_ops.deinit();
+    defer for (keys.items) |k| allocator.free(k);
+    // One cursor pass; the iterator reads a pinned view, so the deletes
+    // written between chunks do not disturb it.
+    var it = db.iterator(storage.CF_UTXO);
+    defer it.deinit();
+    it.seekToFirst();
+    var ok = true;
+    while (ok) {
+        while (it.valid() and keys.items.len < CHUNK) : (it.next()) {
+            const k = allocator.dupe(u8, it.getKey()) catch {
+                ok = false;
+                break;
+            };
+            keys.append(k) catch {
+                allocator.free(k);
+                ok = false;
+                break;
+            };
+        }
+        if (keys.items.len == 0) break;
+        del_ops.clearRetainingCapacity();
+        for (keys.items) |k| del_ops.append(.{ .delete = .{ .cf = storage.CF_UTXO, .key = k } }) catch {
+            ok = false;
+            break;
+        };
+        if (ok) db.writeBatch(del_ops.items) catch {
+            ok = false;
+        };
+        for (keys.items) |k| allocator.free(k);
+        keys.clearRetainingCapacity();
+    }
+    if (!ok or !utxoColumnEmpty(db)) {
+        std.debug.print("WARNING: Could not delete the refused snapshot's coins; delete the chainstate directory before reusing this datadir.\n", .{});
+        return;
+    }
+    db.flush() catch {};
 }
 
 // ============================================================================
