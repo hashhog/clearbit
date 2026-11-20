@@ -220,6 +220,8 @@ pub const MempoolError = error{
     ConflictsWithMempool,
     /// Fee is below the minimum relay fee.
     InsufficientFee,
+    /// Value in < value out (Core CheckTxInputs "bad-txns-in-belowout").
+    InputsBelowOutputs,
     /// Too many unconfirmed ancestors.
     TooManyAncestors,
     /// Too many unconfirmed descendants.
@@ -442,6 +444,19 @@ fn coinbaseImmatureAtNextBlock(cs: *const storage.ChainState, u: anytype) bool {
     return spend_height -| u.height < consensus.COINBASE_MATURITY;
 }
 
+/// Whether the admission paths know the tx's fee, so value conservation
+/// (Core CheckTxInputs "bad-txns-in-belowout") and the fee floor run.
+///
+/// With chain state every input resolves (or the tx was refused as
+/// missing-inputs), so the answer is always true there, whatever the input
+/// total: a spend of value-0 coins is checked like any other. Only a pool
+/// with no chain state (unit tests) has unresolved inputs; it keeps its old
+/// behaviour of using the pool-input sum when that sum is non-zero.
+fn feeKnown(has_chain_state: bool, inputs_resolved: bool, total_in: i64) bool {
+    if (has_chain_state or inputs_resolved) return true;
+    return total_in > 0;
+}
+
 /// Map a MempoolError to Bitcoin Core's BARE reject-reason token.
 ///
 /// Single source of truth for reject-reason strings, so the full
@@ -452,6 +467,7 @@ fn rejectReasonForError(err: MempoolError) []const u8 {
         MempoolError.AlreadyInMempool => "txn-already-in-mempool",
         MempoolError.SameNonWitnessDataInMempool => "txn-same-nonwitness-data-in-mempool",
         MempoolError.InsufficientFee => "min relay fee not met",
+        MempoolError.InputsBelowOutputs => "bad-txns-in-belowout",
         MempoolError.MissingInputs => "missing-inputs",
         // Gate 6: not a reject — the tx was not judged.
         MempoolError.SystemFault => "system-error",
@@ -1512,6 +1528,13 @@ pub const Mempool = struct {
         // 3. Validate inputs exist (in UTXO set or in mempool) and compute fee.
         //    Also collect per-input UTXO info for BIP-68 sequence lock checks (step 3b).
         var total_in: i64 = 0;
+        // False only when some input was neither a pool output nor looked up
+        // (no chain state: unit tests). With chain state every input either
+        // resolves or returns MissingInputs, so production always computes
+        // the fee and runs the conservation / fee-floor checks below. They
+        // must not be gated on `total_in > 0`: a tx spending only value-0
+        // coins has total_in == 0 and still gets both checks, as in Core.
+        var inputs_resolved = true;
         var conflicting_txids = std.ArrayList(types.Hash256).init(self.allocator);
         defer conflicting_txids.deinit();
 
@@ -1561,6 +1584,7 @@ pub const Mempool = struct {
             } else {
                 // No chain state - for testing, assume inputs exist
                 // In production this would return MissingInputs
+                inputs_resolved = false;
             }
 
             // Check if another mempool tx spends this outpoint (potential RBF conflict)
@@ -1575,11 +1599,17 @@ pub const Mempool = struct {
             total_out += output.value;
         }
 
-        // 5. Compute fee (allow tests without chain state)
+        // 5. Compute fee (allow tests without chain state). Core
+        //    Consensus::CheckTxInputs: value in < value out is
+        //    "bad-txns-in-belowout", whatever the input total.
+        // Unit tests without chain state keep their old fee: a pool-only
+        // input sum when the tx also spends unresolved coins (see
+        // feeKnown). Never reached with chain state.
+        const fee_known = feeKnown(self.chain_state != null, inputs_resolved, total_in);
         var fee: i64 = 0;
-        if (total_in > 0) {
+        if (fee_known) {
             fee = total_in - total_out;
-            if (fee < 0) return MempoolError.InsufficientFee;
+            if (fee < 0) return MempoolError.InputsBelowOutputs;
         }
 
         // 5b. BIP-68 SequenceLocks: per-input relative locktimes (CSV).
@@ -1605,7 +1635,7 @@ pub const Mempool = struct {
         // FIX-72 / W120 BUG-11: include any pre-set priority delta on this txid
         // (set via `prioritisetransaction` before broadcast). Core does this via
         // `CheckFeeRate(ws.m_vsize, ws.m_modified_fees, state)` at validation.cpp:948.
-        if (total_in > 0 and !self.bypass_limits) {
+        if (fee_known and !self.bypass_limits) {
             const min_fee_sat_kvb = @as(f64, @floatFromInt(self.getMinFee()));
             const modified_fee = fee + self.applyDelta(tx_hash);
             const modified_fee_rate: f64 = if (vsize > 0)
@@ -2097,6 +2127,7 @@ pub const Mempool = struct {
                     MempoolError.TooManySigopsCost => "bad-txns-too-many-sigops",
                     MempoolError.DustOutput => "dust",
                     MempoolError.InsufficientFee => "min relay fee not met",
+                    MempoolError.InputsBelowOutputs => "bad-txns-in-belowout",
                     MempoolError.InputValuesOutOfRange => "bad-txns-inputvalues-outofrange",
                     // BIP-125 RBF rejections from the dry-run conflict gate
                     // (checkTestAcceptPolicy now runs checkRBFRules). These MUST
@@ -4419,12 +4450,12 @@ pub const Mempool = struct {
         // 3. Min-relay-fee gate. Compute the fee read-only by summing input
         //    values from the UTXO set (and any unconfirmed mempool parents),
         //    exactly as addTransaction does, then compare the modified fee rate
-        //    against getMinFee(). Only enforced when input values are resolvable
-        //    (total_in > 0); with no chain state the dry run can only check
-        //    standardness, which matches the full path's `if (total_in > 0)`
-        //    guard.
+        //    against getMinFee(). Only enforced when input values are resolvable;
+        //    with no chain state the dry run can only check standardness, which
+        //    matches the full path's `inputs_resolved` guard. A tx spending
+        //    only value-0 coins resolves with total_in == 0 and is checked.
         var total_in: i64 = 0;
-        var have_inputs = false;
+        var have_inputs = true;
         for (tx.inputs) |input| {
             if (self.getOutputFromMempool(&input.previous_output)) |mempool_output| {
                 if (!consensus.isValidMoney(mempool_output.value)) {
@@ -4434,7 +4465,6 @@ pub const Mempool = struct {
                 if (!consensus.isValidMoney(total_in)) {
                     return MempoolError.InputValuesOutOfRange;
                 }
-                have_inputs = true;
             } else if (self.chain_state) |cs| {
                 const utxo = cs.utxo_set.get(&input.previous_output) catch null;
                 if (utxo) |u| {
@@ -4456,7 +4486,6 @@ pub const Mempool = struct {
                     if (coinbaseImmatureAtNextBlock(cs, &u)) {
                         return MempoolError.ImmatureCoinbase;
                     }
-                    have_inputs = true;
                 } else {
                     // Input exists in neither the mempool nor the UTXO set: the
                     // coin the tx spends does not exist (or is already spent).
@@ -4490,11 +4519,11 @@ pub const Mempool = struct {
         const vsize = (weight + 3) / 4;
 
         var fee: i64 = 0;
-        if (have_inputs and total_in > 0) {
+        if (have_inputs) {
             var total_out: i64 = 0;
             for (tx.outputs) |output| total_out += output.value;
             fee = total_in - total_out;
-            if (fee < 0) return MempoolError.InsufficientFee;
+            if (fee < 0) return MempoolError.InputsBelowOutputs;
 
             const min_fee_sat_kvb = @as(f64, @floatFromInt(self.getMinFee()));
             const modified_fee = fee + self.applyDelta(tx_hash);
@@ -5418,6 +5447,8 @@ pub const Mempool = struct {
                         results[i].reject_details = try self.minRelayFeeDetails(&tx, txids[i], allocator);
                     } else if (std.mem.eql(u8, reason, "bad-txns-premature-spend-of-coinbase")) {
                         results[i].reject_details = try self.immatureCoinbaseDetails(&tx, allocator);
+                    } else if (std.mem.eql(u8, reason, "bad-txns-in-belowout")) {
+                        results[i].reject_details = try self.inBelowOutDetails(&tx, allocator);
                     }
                 }
                 return;
@@ -5475,6 +5506,37 @@ pub const Mempool = struct {
             }
         }
         return null;
+    }
+
+    /// Core CheckTxInputs' TxValidationState::ToString when value in <
+    /// value out:
+    ///   "bad-txns-in-belowout, value in (<FormatMoney>) < value out (<FormatMoney>)"
+    /// (consensus/tx_verify.cpp).  Null when an input no longer resolves or
+    /// the tx is no longer below-out (the chain moved since the reject).
+    /// Owned by `allocator`.
+    pub fn inBelowOutDetails(self: *Mempool, tx: *const types.Transaction, allocator: std.mem.Allocator) error{OutOfMemory}!?[]u8 {
+        const cs = self.chain_state orelse return null;
+        self.lockChainThenPool();
+        defer self.unlockPoolThenChain();
+        var total_in: i64 = 0;
+        for (tx.inputs) |input| {
+            if (self.getOutputFromMempool(&input.previous_output)) |o| {
+                total_in += o.value;
+            } else {
+                const utxo = cs.utxo_set.get(&input.previous_output) catch return null;
+                var u = utxo orelse return null;
+                total_in += u.value;
+                u.deinit(self.allocator);
+            }
+        }
+        var total_out: i64 = 0;
+        for (tx.outputs) |o| total_out += o.value;
+        if (total_in >= total_out) return null;
+        const in_s = formatMoney(allocator, total_in) catch return error.OutOfMemory;
+        defer allocator.free(in_s);
+        const out_s = formatMoney(allocator, total_out) catch return error.OutOfMemory;
+        defer allocator.free(out_s);
+        return try std.fmt.allocPrint(allocator, "bad-txns-in-belowout, value in ({s}) < value out ({s})", .{ in_s, out_s });
     }
 
     /// Core CheckFeeRate's debug message for "min relay fee not met":
@@ -5817,6 +5879,9 @@ pub const Mempool = struct {
 
         // 3. Validate inputs exist (in UTXO set or in mempool) and compute fee
         var total_in: i64 = 0;
+        // As addTransaction: false only for an input that was not looked up
+        // (no chain state), never inferred from `total_in > 0`.
+        var inputs_resolved = true;
         var conflicting_txids = std.ArrayList(types.Hash256).init(self.allocator);
         defer conflicting_txids.deinit();
 
@@ -5838,6 +5903,7 @@ pub const Mempool = struct {
                 }
             } else {
                 // No chain state - for testing, assume inputs exist
+                inputs_resolved = false;
             }
 
             // Check if another mempool tx spends this outpoint (potential RBF conflict)
@@ -5852,11 +5918,17 @@ pub const Mempool = struct {
             total_out += output.value;
         }
 
-        // 5. Compute fee (allow tests without chain state)
+        // 5. Compute fee (allow tests without chain state). Conservation is
+        //    per tx (Core PreChecks -> CheckTxInputs); a package feerate never
+        //    stands in for it.
+        // Unit tests without chain state keep their old fee: a pool-only
+        // input sum when the tx also spends unresolved coins (see
+        // feeKnown). Never reached with chain state.
+        const fee_known = feeKnown(self.chain_state != null, inputs_resolved, total_in);
         var fee: i64 = 0;
-        if (total_in > 0) {
+        if (fee_known) {
             fee = total_in - total_out;
-            if (fee < 0) return MempoolError.InsufficientFee;
+            if (fee < 0) return MempoolError.InputsBelowOutputs;
         }
 
         // 6. Compute size
@@ -5871,7 +5943,7 @@ pub const Mempool = struct {
         // Individual tx may have low fee rate, but package rate must be sufficient.
         // Use getMinFee() so we respect the rolling minimum (elevated post-eviction).
         const min_fee_rate_sat_kvb = @as(f64, @floatFromInt(self.getMinFee()));
-        if (total_in > 0 and package_fee_rate * 1000.0 < min_fee_rate_sat_kvb) {
+        if (fee_known and package_fee_rate * 1000.0 < min_fee_rate_sat_kvb) {
             return MempoolError.InsufficientFee;
         }
 
@@ -12114,6 +12186,7 @@ pub fn acceptPackage(
             tx_results[i].error_message = switch (err) {
                 MempoolError.AlreadyInMempool => "already in mempool",
                 MempoolError.InsufficientFee => "insufficient fee",
+                MempoolError.InputsBelowOutputs => "bad-txns-in-belowout",
                 MempoolError.TooManyAncestors => "too many ancestors",
                 MempoolError.TooManyDescendants => "too many descendants",
                 // Core PCKG_POLICY reject for the cluster gates
