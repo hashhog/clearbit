@@ -3370,9 +3370,9 @@ pub const RpcServer = struct {
         try filter_headers.ensureTotalCapacity(n);
         for (entries) |e| {
             const fh = (self.chain_state.getPersistedFilterHeader(&e.hash) catch null) orelse {
-                // Core: index_ready = BlockUntilSyncedToCurrentChain().  The
-                // persisted index tip (flushed) standing below the active tip
-                // means the index is still catching up.
+                // Core picks the suffix from whether the index has caught up
+                // with the active chain (index_ready).  Here: the flushed
+                // index tip standing below the active tip means it has not.
                 const msg = if ((self.persistedFilterIndexHeight() orelse 0) < tip.height)
                     "Filter not found. Block filters are still in the process of being indexed."
                 else
