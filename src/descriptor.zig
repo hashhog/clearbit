@@ -1671,46 +1671,311 @@ pub fn isSolvable(desc: *const Descriptor) bool {
     };
 }
 
-/// Return the PUBLIC form of a descriptor string, with a fresh `#checksum`:
-/// every xprv/tprv becomes the xpub/tpub of the same node (depth, parent
-/// fingerprint, child number and chain code kept, private key replaced by its
-/// compressed public key) and every WIF becomes its hex public key. Everything
-/// else (origins, paths, wildcards, script structure) is copied byte for byte,
-/// so this also works where `toString` would lose structure (miniscript,
-/// multi-leaf tap trees).
+/// Return the descriptor string Core's `listdescriptors` shows for a
+/// descriptor imported with private keys, with a fresh `#checksum`. This is
+/// `Descriptor::ToNormalizedString` (script/descriptor.cpp), which
+/// DescriptorScriptPubKeyMan::GetDescriptorString uses for priv=false:
 ///
-/// This is Core's `Descriptor::ToString()` view of a descriptor that was
-/// imported with private keys (DescriptorScriptPubKeyMan::GetDescriptorString
-/// with priv=false): the wallet's descriptor record carries public keys only;
-/// the private keys live in the (encrypted when the wallet is) key store.
+///  - xprv/tprv become xpub/tpub and WIF keys become hex pubkeys;
+///  - a BIP-32 key whose path has a hardened step is re-rooted at the LAST
+///    hardened step: the xpub of that node, and the hardened prefix moved into
+///    the origin (`[<root fp>/84h/1h/0h]tpub.../0/*`; an existing origin is
+///    extended instead, `[d34db33f/44h/1h/1h]tpub.../2/*`);
+///  - a hardened-ranged key (`/*'`) keeps the root xpub and its path;
+///  - hardened markers in origins and in hardened-ranged paths print as `h`.
 ///
-/// Token rule: a maximal run of base58 characters is replaced only if it
-/// decodes as a checksummed BIP-32 private extended key or a WIF private key.
-/// Addresses, pubkeys, paths and fingerprints never decode as either (wrong
-/// length, version byte or checksum), so they pass through unchanged.
+/// Everything outside key expressions (script structure, miniscript, tap
+/// trees, addresses) is copied byte for byte, which is why this works on the
+/// string rather than through `toString`. A token counts as a key only when it
+/// decodes as a checksummed BIP-32 key or WIF private key; other tokens are
+/// copied. Fails (and the caller refuses the import) rather than return a
+/// string that still holds a private key.
 pub fn toPublicDescriptor(allocator: std.mem.Allocator, desc_str: []const u8) ![]const u8 {
     const body = if (std.mem.indexOfScalar(u8, desc_str, '#')) |h| desc_str[0..h] else desc_str;
     var out = std.ArrayList(u8).init(allocator);
     defer out.deinit();
     var i: usize = 0;
     while (i < body.len) {
-        if (!isBase58Char(body[i])) {
-            try out.append(body[i]);
-            i += 1;
-            continue;
-        }
-        var j = i;
-        while (j < body.len and isBase58Char(body[j])) : (j += 1) {}
-        const tok = body[i..j];
-        if (try privateTokenToPublic(allocator, tok)) |pub_tok| {
-            defer allocator.free(pub_tok);
-            try out.appendSlice(pub_tok);
+        const c = body[i];
+        if (c == '[') {
+            const close = std.mem.indexOfScalarPos(u8, body, i, ']') orelse return error.InvalidKeyExpression;
+            var k = close + 1;
+            while (k < body.len and std.ascii.isAlphanumeric(body[k])) : (k += 1) {}
+            const pe = keyPathEnd(body, k);
+            try writeNormalizedKey(&out, body[i + 1 .. close], body[close + 1 .. k], body[k..pe]);
+            i = pe;
+        } else if (std.ascii.isAlphanumeric(c)) {
+            var k = i;
+            while (k < body.len and std.ascii.isAlphanumeric(body[k])) : (k += 1) {}
+            const tok = body[i..k];
+            if (decodeKeyToken(tok) != .none) {
+                const pe = keyPathEnd(body, k);
+                try writeNormalizedKey(&out, null, tok, body[k..pe]);
+                i = pe;
+            } else {
+                try out.appendSlice(tok);
+                i = k;
+            }
         } else {
-            try out.appendSlice(tok);
+            try out.append(c);
+            i += 1;
         }
-        i = j;
     }
     return addChecksum(allocator, out.items);
+}
+
+/// End of a key's `/NUM['h]...` path and optional `/*['h]` suffix.
+fn keyPathEnd(body: []const u8, start: usize) usize {
+    var k = start;
+    while (k + 1 < body.len and body[k] == '/') {
+        var j = k + 1;
+        if (body[j] == '*') {
+            j += 1;
+        } else if (std.ascii.isDigit(body[j])) {
+            while (j < body.len and std.ascii.isDigit(body[j])) : (j += 1) {}
+        } else break;
+        if (j < body.len and (body[j] == '\'' or body[j] == 'h' or body[j] == 'H')) j += 1;
+        k = j;
+    }
+    return k;
+}
+
+const ExtKeyBytes = struct {
+    is_priv: bool,
+    payload: [78]u8, // BIP-32 serialization without the checksum
+};
+
+const KeyToken = union(enum) {
+    none,
+    ext: ExtKeyBytes,
+    wif: struct { pubkey: [65]u8, len: usize },
+};
+
+/// Classify a token: checksummed BIP-32 extended key, WIF private key, or
+/// neither. Never allocates: tokens longer than 111 chars are not keys.
+fn decodeKeyToken(tok: []const u8) KeyToken {
+    if (tok.len < 50 or tok.len > 111) return .none;
+    for (tok) |ch| if (!isBase58Char(ch)) return .none;
+    var buf: [512]u8 = undefined;
+    var fba = std.heap.FixedBufferAllocator.init(&buf);
+    const raw = address.base58Decode(tok, fba.allocator()) catch return .none;
+    defer @memset(&buf, 0);
+    if (raw.len == 82) {
+        const computed = crypto.hash256(raw[0..78]);
+        if (!std.mem.eql(u8, raw[78..82], computed[0..4])) return .none;
+        const version = std.mem.readInt(u32, raw[0..4], .big);
+        const is_priv = switch (version) {
+            0x0488ADE4, 0x04358394 => true,
+            0x0488B21E, 0x043587CF => false,
+            else => return .none,
+        };
+        if (is_priv and raw[45] != 0x00) return .none;
+        var e = ExtKeyBytes{ .is_priv = is_priv, .payload = undefined };
+        @memcpy(&e.payload, raw[0..78]);
+        return .{ .ext = e };
+    }
+    // WIF: version(1) + key(32) [+ 0x01] + checksum(4).
+    if (raw.len != 37 and raw.len != 38) return .none;
+    if (raw[0] != 0x80 and raw[0] != 0xEF) return .none;
+    const n = raw.len - 4;
+    const computed = crypto.hash256(raw[0..n]);
+    if (!std.mem.eql(u8, raw[n..], computed[0..4])) return .none;
+    const compressed = raw.len == 38;
+    if (compressed and raw[33] != 0x01) return .none;
+    const ctx = getSecpContext() catch return .none;
+    var pk: secp256k1.secp256k1_pubkey = undefined;
+    if (secp256k1.secp256k1_ec_pubkey_create(ctx, &pk, raw[1..33].ptr) != 1) return .none;
+    var w: KeyToken = .{ .wif = .{ .pubkey = undefined, .len = if (compressed) 33 else 65 } };
+    var len: usize = w.wif.len;
+    _ = secp256k1.secp256k1_ec_pubkey_serialize(ctx, &w.wif.pubkey, &len, &pk, if (compressed) secp256k1.SECP256K1_EC_COMPRESSED else secp256k1.SECP256K1_EC_UNCOMPRESSED);
+    return w;
+}
+
+/// Core OriginString(normalized=true): lowercase hex fingerprint, `h` marker.
+fn writeNormalizedOrigin(out: *std.ArrayList(u8), origin: []const u8) !void {
+    for (origin) |ch| {
+        try out.append(switch (ch) {
+            '\'', 'H' => 'h',
+            else => std.ascii.toLower(ch),
+        });
+    }
+}
+
+fn writeSteps(out: *std.ArrayList(u8), steps: []const u32) !void {
+    for (steps) |s| {
+        try out.writer().print("/{d}", .{s & 0x7fffffff});
+        if (s >> 31 != 0) try out.append('h');
+    }
+}
+
+fn writeNormalizedKey(out: *std.ArrayList(u8), origin: ?[]const u8, key: []const u8, suffix: []const u8) !void {
+    const kt = decodeKeyToken(key);
+    switch (kt) {
+        .none => {
+            // Hex pubkey (or anything else that holds no private key): Core
+            // prints it as written, with a normalized origin.
+            if (origin) |o| {
+                try out.append('[');
+                try writeNormalizedOrigin(out, o);
+                try out.append(']');
+            }
+            try out.appendSlice(key);
+            try out.appendSlice(suffix);
+        },
+        .wif => |w| {
+            if (suffix.len != 0) return error.InvalidKeyExpression;
+            if (origin) |o| {
+                try out.append('[');
+                try writeNormalizedOrigin(out, o);
+                try out.append(']');
+            }
+            try out.writer().print("{s}", .{std.fmt.fmtSliceHexLower(w.pubkey[0..w.len])});
+        },
+        .ext => |e| try writeNormalizedExtKey(out, origin, e, suffix),
+    }
+}
+
+fn writeNormalizedExtKey(out: *std.ArrayList(u8), origin: ?[]const u8, e: ExtKeyBytes, suffix: []const u8) !void {
+    // Parse the path suffix.
+    var steps_buf: [256]u32 = undefined;
+    var n_steps: usize = 0;
+    var ranged = false;
+    var hardened_range = false;
+    var k: usize = 0;
+    while (k < suffix.len) {
+        if (suffix[k] != '/' or ranged) return error.InvalidKeyExpression;
+        k += 1;
+        if (k >= suffix.len) return error.InvalidKeyExpression;
+        var hard = false;
+        var val: u32 = 0;
+        if (suffix[k] == '*') {
+            ranged = true;
+            k += 1;
+        } else {
+            const ds = k;
+            while (k < suffix.len and std.ascii.isDigit(suffix[k])) : (k += 1) {}
+            val = std.fmt.parseInt(u32, suffix[ds..k], 10) catch return error.InvalidKeyExpression;
+            if (val >> 31 != 0) return error.InvalidKeyExpression;
+        }
+        if (k < suffix.len and (suffix[k] == '\'' or suffix[k] == 'h' or suffix[k] == 'H')) {
+            hard = true;
+            k += 1;
+        }
+        if (ranged) {
+            hardened_range = hard;
+        } else {
+            if (n_steps == steps_buf.len) return error.InvalidKeyExpression;
+            steps_buf[n_steps] = if (hard) val | 0x80000000 else val;
+            n_steps += 1;
+        }
+    }
+    const steps = steps_buf[0..n_steps];
+
+    const ctx = try getSecpContext();
+    var key = e.payload;
+    defer @memset(&key, 0);
+    const pub_version: u32 = switch (std.mem.readInt(u32, key[0..4], .big)) {
+        0x0488ADE4 => 0x0488B21E,
+        0x04358394 => 0x043587CF,
+        else => |v| v,
+    };
+    // Root public key.
+    var root_pub: [33]u8 = undefined;
+    if (e.is_priv) {
+        try pubFromSecret(ctx, key[46..78], &root_pub);
+    } else {
+        @memcpy(&root_pub, key[45..78]);
+    }
+
+    var last_hard: ?usize = null;
+    for (steps, 0..) |s, idx| {
+        if (s >> 31 != 0) last_hard = idx;
+    }
+
+    if (hardened_range or last_hard == null) {
+        // Root xpub + path as written (all steps print with `h` here).
+        if (origin) |o| {
+            try out.append('[');
+            try writeNormalizedOrigin(out, o);
+            try out.append(']');
+        }
+        try writeXpub(out, pub_version, key[4..45], &root_pub);
+        try writeSteps(out, steps);
+        if (ranged) try out.appendSlice(if (hardened_range) "/*h" else "/*");
+        return;
+    }
+
+    // Re-root at the last hardened step (needs the private key).
+    if (!e.is_priv) return error.InvalidKeyExpression;
+    const li = last_hard.?;
+    var secret: [32]u8 = undefined;
+    defer @memset(&secret, 0);
+    @memcpy(&secret, key[46..78]);
+    var chain: [32]u8 = undefined;
+    defer @memset(&chain, 0);
+    @memcpy(&chain, key[13..45]);
+    var parent_pub: [33]u8 = root_pub;
+    for (steps[0 .. li + 1]) |s| {
+        try pubFromSecret(ctx, &secret, &parent_pub);
+        var data: [37]u8 = undefined;
+        defer @memset(&data, 0);
+        if (s >> 31 != 0) {
+            data[0] = 0x00;
+            @memcpy(data[1..33], &secret);
+        } else {
+            @memcpy(data[0..33], &parent_pub);
+        }
+        std.mem.writeInt(u32, data[33..37], s, .big);
+        const HmacSha512 = std.crypto.auth.hmac.Hmac(std.crypto.hash.sha2.Sha512);
+        var I: [64]u8 = undefined;
+        defer @memset(&I, 0);
+        HmacSha512.create(&I, &data, &chain);
+        if (secp256k1.secp256k1_ec_seckey_tweak_add(ctx, &secret, I[0..32].ptr) != 1) return error.InvalidKeyExpression;
+        @memcpy(&chain, I[32..64]);
+    }
+    var child_pub: [33]u8 = undefined;
+    try pubFromSecret(ctx, &secret, &child_pub);
+
+    try out.append('[');
+    if (origin) |o| {
+        try writeNormalizedOrigin(out, o);
+    } else {
+        const fp = crypto.hash160(&root_pub);
+        try out.writer().print("{s}", .{std.fmt.fmtSliceHexLower(fp[0..4])});
+    }
+    try writeSteps(out, steps[0 .. li + 1]);
+    try out.append(']');
+    var meta: [41]u8 = undefined; // depth, parent fp, child number, chain code
+    meta[0] = key[4] +% @as(u8, @intCast(li + 1));
+    const pfp = crypto.hash160(&parent_pub);
+    @memcpy(meta[1..5], pfp[0..4]);
+    std.mem.writeInt(u32, meta[5..9], steps[li], .big);
+    @memcpy(meta[9..41], &chain);
+    try writeXpub(out, pub_version, &meta, &child_pub);
+    try writeSteps(out, steps[li + 1 ..]);
+    if (ranged) try out.appendSlice("/*");
+}
+
+fn pubFromSecret(ctx: *secp.Context, secret: []const u8, out: *[33]u8) !void {
+    var pk: secp256k1.secp256k1_pubkey = undefined;
+    if (secp256k1.secp256k1_ec_pubkey_create(ctx, &pk, secret.ptr) != 1) return error.InvalidKeyExpression;
+    var len: usize = 33;
+    _ = secp256k1.secp256k1_ec_pubkey_serialize(ctx, out, &len, &pk, secp256k1.SECP256K1_EC_COMPRESSED);
+}
+
+/// Base58check-encode version(4) || meta(41: depth, parent fp, child, chain
+/// code) || pubkey(33).
+fn writeXpub(out: *std.ArrayList(u8), version: u32, meta: []const u8, pubkey: *const [33]u8) !void {
+    var ext: [82]u8 = undefined;
+    std.mem.writeInt(u32, ext[0..4], version, .big);
+    @memcpy(ext[4..45], meta[0..41]);
+    @memcpy(ext[45..78], pubkey);
+    const ck = crypto.hash256(ext[0..78]);
+    @memcpy(ext[78..82], ck[0..4]);
+    var buf: [512]u8 = undefined;
+    var fba = std.heap.FixedBufferAllocator.init(&buf);
+    const s = try address.base58Encode(&ext, fba.allocator());
+    try out.appendSlice(s);
 }
 
 fn isBase58Char(c: u8) bool {
@@ -1718,44 +1983,6 @@ fn isBase58Char(c: u8) bool {
         '1'...'9', 'A'...'H', 'J'...'N', 'P'...'Z', 'a'...'k', 'm'...'z' => true,
         else => false,
     };
-}
-
-/// xprv/tprv -> xpub/tpub, WIF -> hex pubkey; null when `tok` is neither.
-fn privateTokenToPublic(allocator: std.mem.Allocator, tok: []const u8) !?[]const u8 {
-    // A WIF is 51-52 chars, an extended key 111; anything shorter is a path
-    // element, fingerprint fragment or similar.
-    if (tok.len < 50) return null;
-    const raw = address.base58Decode(tok, allocator) catch return null;
-    defer {
-        @memset(@constCast(raw), 0);
-        allocator.free(raw);
-    }
-    if (raw.len == 82) {
-        const payload = raw[0..78];
-        const computed = crypto.hash256(payload);
-        if (!std.mem.eql(u8, raw[78..82], computed[0..4])) return null;
-        const version = std.mem.readInt(u32, payload[0..4], .big);
-        const pub_version: u32 = switch (version) {
-            0x0488ADE4 => 0x0488B21E, // xprv -> xpub
-            0x04358394 => 0x043587CF, // tprv -> tpub
-            else => return null,
-        };
-        if (payload[45] != 0x00) return null;
-        const ctx = try getSecpContext();
-        var pk: secp256k1.secp256k1_pubkey = undefined;
-        if (secp256k1.secp256k1_ec_pubkey_create(ctx, &pk, payload[46..78].ptr) != 1) return null;
-        var ext: [82]u8 = undefined;
-        std.mem.writeInt(u32, ext[0..4], pub_version, .big);
-        @memcpy(ext[4..45], payload[4..45]); // depth, parent fp, child, chain code
-        var len: usize = 33;
-        _ = secp256k1.secp256k1_ec_pubkey_serialize(ctx, ext[45..78].ptr, &len, &pk, secp256k1.SECP256K1_EC_COMPRESSED);
-        const ck = crypto.hash256(ext[0..78]);
-        @memcpy(ext[78..82], ck[0..4]);
-        return try address.base58Encode(&ext, allocator);
-    }
-    const pubkey = decodeWifToPubkey(allocator, tok) catch return null;
-    defer allocator.free(pubkey);
-    return try std.fmt.allocPrint(allocator, "{s}", .{std.fmt.fmtSliceHexLower(pubkey)});
 }
 
 /// Derive addresses from a descriptor (for deriveaddresses RPC)

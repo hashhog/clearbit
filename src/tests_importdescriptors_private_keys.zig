@@ -11,8 +11,11 @@
 //! raw xprv/WIF descriptor string, wrote it into wallet.dat in plaintext even
 //! when the wallet was encrypted, and returned it from listdescriptors.
 //!
-//! Expected public forms are Bitcoin Core 31.1 `getdescriptorinfo` output for
-//! the same inputs (recorded in the PR body).
+//! Expected public forms are Bitcoin Core 31.1 output for the same inputs:
+//! `listdescriptors` on a blank Core wallet that imported them
+//! (DescriptorScriptPubKeyMan::GetDescriptorString -> ToNormalizedString),
+//! recorded in the PR body. Where the key path has no hardened step this is
+//! also what `getdescriptorinfo` prints.
 //!
 //! Run: zig build test-unit -Dtest-filter=importdesc_privkeys
 
@@ -28,7 +31,7 @@ const wallet_mod = @import("wallet.zig");
 const descriptor = @import("descriptor.zig");
 
 const TPRV = "tprv8ZgxMBicQKsPd7Uf69XL1XwhmjHopUGep8GuEiJDZmbQz6o58LninorQAfcKZWARbtRtfnLcJ5MQ2AtHcQJCCRUcMRvmDUjyEmNUWwx8UbK";
-// Core 31.1: getdescriptorinfo "wpkh(<TPRV>/0/*)" -> descriptor.
+// Core 31.1: listdescriptors after importing "wpkh(<TPRV>/0/*)".
 const TPUB = "tpubD6NzVbkrYhZ4WaWSyoBvQwbpLkojyoTZPRsgXELWz3Popb3qkjcJyJUGLnL4qHHoQvao8ESaAstxYSnhyswJ76uZPStJRJCTKvosUCJZL5B";
 const CORE_PUBLIC_RANGED = "wpkh(" ++ TPUB ++ "/0/*)#efr7m7hr";
 // The private descriptor with its checksum (Core: checksum xgqsjp6d).
@@ -263,21 +266,68 @@ test "importdesc_privkeys a wallet.dat written before the fix loads with the pub
     try testing.expect(!has(after, WIF));
 }
 
-test "importdesc_privkeys public form matches Core getdescriptorinfo (multi, origin, mixed keys)" {
-    // Core 31.1 getdescriptorinfo on the private multisig descriptor below.
-    const priv = "wsh(multi(1,[d34db33f/84h/1h/0h]" ++ TPRV ++ "/1/*,03a34b99f22c790c4e36b2b3c2c35a36db06226e41c692fc82b8b56ac1c540c5bd))";
-    const want = "wsh(multi(1,[d34db33f/84h/1h/0h]" ++ TPUB ++ "/1/*,03a34b99f22c790c4e36b2b3c2c35a36db06226e41c692fc82b8b56ac1c540c5bd))#23x7s3vc";
+// Core 31.1 importdescriptors (blank wallet) -> listdescriptors, one row each.
+const CoreVector = struct { priv: []const u8, core: []const u8 };
+const CORE_VECTORS = [_]CoreVector{
+    // BIP-84 shape: hardened prefix re-rooted into the origin, root fp added.
+    .{ .priv = "wpkh(" ++ TPRV ++ "/84h/1h/0h/0/*)#pe5sgqha", .core = "wpkh([0c5f9a1e/84h/1h/0h]tpubDCxzhZZE31g2EqSv1UajMAw5Hd62htydz9r2XBkrccHgBh8uw3n62zr6Zjmj64tfTk8Tjxo6VctjUMAh5DXWTErfQPC6RmQhTdtNnXuTXTQ/0/*)#jgtynm6c" },
+    // Existing origin extended by the hardened prefix; apostrophes -> h.
+    .{ .priv = "pkh([d34db33f/44'/1']" ++ TPRV ++ "/1'/2/*)#zd2ex2nw", .core = "pkh([d34db33f/44h/1h/1h]tpubD8MQJFNHgAX8vnSnh9XYgiR45ofayYzBn2rRrxzEjYg7jmLgPuK7V9TdF381RP3MiwWynwYUXdQ3keKCNeiV6av9pfzJwh93BQQjP5GmdtP/2/*)#f70fes0p" },
+    // Hardened-ranged: root xpub kept, marker printed as h.
+    .{ .priv = "sh(wpkh(" ++ TPRV ++ "/7/*'))#zmh0uxw8", .core = "sh(wpkh(" ++ TPUB ++ "/7/*h))#fjguwcts" },
+    // No hardened step: xpub swapped in place.
+    .{ .priv = PRIV_RANGED, .core = CORE_PUBLIC_RANGED },
+    // WIF with an origin.
+    .{ .priv = "wpkh([aabbccdd/0']" ++ WIF ++ ")#lnc03fse", .core = "wpkh([aabbccdd/0h]0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798)#20ec8aw5" },
+    // Non-ranged taproot key with a hardened prefix.
+    .{ .priv = "tr(" ++ TPRV ++ "/86'/1'/0'/0/5)#706a9aam", .core = "tr([0c5f9a1e/86h/1h/0h]tpubDDCA1MQNPcAVLUaV3A3yWNLuM25zSoXMWHYTQwLVeNRmKkT61j8SZ1XCsXDAUoU7mwbVhmntBji9ydEQrCdE8PcqwCytXb18J7bi8tfCbHA/0/5)#3l4ynhzv" },
+    // Multisig, origin on the private key, a plain hex pubkey beside it.
+    .{ .priv = "wsh(multi(1,[d34db33f/84'/1'/0']" ++ TPRV ++ "/1/*,03a34b99f22c790c4e36b2b3c2c35a36db06226e41c692fc82b8b56ac1c540c5bd))#4jt3rg3p", .core = "wsh(multi(1,[d34db33f/84h/1h/0h]" ++ TPUB ++ "/1/*,03a34b99f22c790c4e36b2b3c2c35a36db06226e41c692fc82b8b56ac1c540c5bd))#23x7s3vc" },
+    .{ .priv = PRIV_WIF, .core = CORE_PUBLIC_WIF },
+};
+
+test "importdesc_privkeys public form matches Core listdescriptors (7 shapes)" {
     // Guarded so this file compiles on the base commit (where the function
     // does not exist) and fails there on the assertion.
     if (comptime !@hasDecl(descriptor, "toPublicDescriptor")) {
         return error.NoPublicDescriptorConversion;
     } else {
-        const got = try descriptor.toPublicDescriptor(testing.allocator, priv);
-        defer testing.allocator.free(got);
-        try testing.expectEqualStrings(want, got);
-        // Idempotent on an already-public descriptor (and on its checksum).
-        const again = try descriptor.toPublicDescriptor(testing.allocator, want);
-        defer testing.allocator.free(again);
-        try testing.expectEqualStrings(want, again);
+        for (CORE_VECTORS) |v| {
+            const got = try descriptor.toPublicDescriptor(testing.allocator, v.priv);
+            defer testing.allocator.free(got);
+            try testing.expectEqualStrings(v.core, got);
+            // Idempotent: Core's own output converts to itself.
+            const again = try descriptor.toPublicDescriptor(testing.allocator, v.core);
+            defer testing.allocator.free(again);
+            try testing.expectEqualStrings(v.core, again);
+        }
+    }
+}
+
+test "importdesc_privkeys BIP-84 hardened import lists Core's re-rooted xpub" {
+    var fx: Fixture = undefined;
+    try fx.init(testing.allocator);
+    defer fx.deinit();
+    _ = try fx.encryptedLockedWallet();
+    const unl = try fx.call("walletpassphrase", "[\"" ++ PASS ++ "\",600]");
+    defer testing.allocator.free(unl);
+    try testing.expect(has(unl, UNLOCK));
+
+    const v = CORE_VECTORS[0];
+    const req = try std.fmt.allocPrint(testing.allocator, "[[{{\"desc\":\"{s}\",\"timestamp\":\"now\",\"range\":[0,2]}}]]", .{v.priv});
+    defer testing.allocator.free(req);
+    const resp = try fx.call("importdescriptors", req);
+    defer testing.allocator.free(resp);
+    if (!has(resp, "[{\"success\":true}]")) {
+        std.debug.print("\nimportdescriptors answered: {s}\n", .{resp});
+        return error.ImportFailed;
+    }
+    const ld = try fx.call("listdescriptors", "[]");
+    defer testing.allocator.free(ld);
+    const want = try std.fmt.allocPrint(testing.allocator, "\"desc\":\"{s}\"", .{v.core});
+    defer testing.allocator.free(want);
+    if (has(ld, "tprv") or !has(ld, want)) {
+        std.debug.print("\nlistdescriptors answered: {s}\nwant {s}\n", .{ ld, want });
+        return error.ListDescriptorsNotCoreForm;
     }
 }

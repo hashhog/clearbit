@@ -21395,15 +21395,17 @@ pub const RpcServer = struct {
 
         const solvable = descriptor.isSolvable(&desc);
 
-        // The wallet's descriptor record is the PUBLIC form (Core
-        // DescriptorScriptPubKeyMan keeps the descriptor with public keys and
-        // the private keys in its key store, encrypted when the wallet is).
+        // The wallet's descriptor record is the PUBLIC form Core's
+        // listdescriptors shows (DescriptorScriptPubKeyMan::GetDescriptorString
+        // -> ToNormalizedString; the private keys live in its key store,
+        // encrypted when the wallet is).
         // clearbit's imported scripts are watch-only and never sign, so the
         // private keys are not kept at all: storing `desc_str` verbatim wrote
         // the xprv/WIF into wallet.dat in plaintext even on an encrypted
         // wallet, and listdescriptors handed it back.
-        const stored_desc = descriptor.toPublicDescriptor(self.allocator, desc_str) catch {
-            return dupErr(self, RPC_INVALID_ADDRESS_OR_KEY, "Invalid descriptor");
+        const stored_desc = descriptor.toPublicDescriptor(self.allocator, desc_str) catch |err| switch (err) {
+            error.OutOfMemory => return err,
+            else => return dupErr(self, RPC_INVALID_ADDRESS_OR_KEY, "Invalid descriptor"),
         };
         defer self.allocator.free(stored_desc);
 

@@ -6323,8 +6323,10 @@ pub const WalletManager = struct {
                             // plaintext. Load it as the public form, so the next
                             // save rewrites wallet.dat without the key and
                             // listdescriptors never returns it.
-                            desc_s = descriptor_mod.toPublicDescriptor(self.allocator, dv.string) catch
-                                (self.allocator.dupe(u8, dv.string) catch &[_]u8{});
+                            // If it cannot be converted, drop the string
+                            // rather than keep one that may hold a key (the
+                            // script itself still loads and is watched).
+                            desc_s = descriptor_mod.toPublicDescriptor(self.allocator, dv.string) catch &[_]u8{};
                         }
                     }
                     var is_change = false;
