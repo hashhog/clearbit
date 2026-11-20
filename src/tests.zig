@@ -1064,6 +1064,7 @@ comptime {
     _ = @import("tests_sec_p2p_trickle.zig"); // security audit C3/H3: trickled v1 messages + handshake deadline
     _ = @import("tests_bip324_w98.zig"); // W98 BIP-324 gate audit
     _ = @import("tests_v2_unknown_shortid.zig"); // BIP-324 unknown short IDs: bounded discard, no recursion
+    _ = @import("tests_importdescriptors_private_keys.zig"); // importdescriptors: -13 on a locked wallet, public form at rest + in listdescriptors
     _ = @import("erlay.zig");
     _ = @import("tests_w104_addrman.zig"); // W104 AddrMan 30-gate fleet audit
     _ = @import("tests_w106_mempool.zig"); // W106 CTxMemPool descendant/ancestor + RBF + package 30-gate audit

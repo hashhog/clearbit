@@ -8,6 +8,7 @@ const taproot_sighash = @import("taproot_sighash.zig");
 const bip21 = @import("bip21.zig");
 const psbt_mod = @import("psbt.zig");
 const script_mod = @import("script.zig");
+const descriptor_mod = @import("descriptor.zig");
 
 // ============================================================================
 // BIP-21 URI parser re-exports (FIX-62 / W119 prereq).
@@ -6317,7 +6318,13 @@ pub const WalletManager = struct {
                     var desc_s: []const u8 = &[_]u8{};
                     if (sobj.get("desc")) |dv| {
                         if (dv == .string and dv.string.len > 0) {
-                            desc_s = self.allocator.dupe(u8, dv.string) catch &[_]u8{};
+                            // Files written before importdescriptors stored the
+                            // public form can hold the imported xprv/WIF here in
+                            // plaintext. Load it as the public form, so the next
+                            // save rewrites wallet.dat without the key and
+                            // listdescriptors never returns it.
+                            desc_s = descriptor_mod.toPublicDescriptor(self.allocator, dv.string) catch
+                                (self.allocator.dupe(u8, dv.string) catch &[_]u8{});
                         }
                     }
                     var is_change = false;

@@ -1671,6 +1671,93 @@ pub fn isSolvable(desc: *const Descriptor) bool {
     };
 }
 
+/// Return the PUBLIC form of a descriptor string, with a fresh `#checksum`:
+/// every xprv/tprv becomes the xpub/tpub of the same node (depth, parent
+/// fingerprint, child number and chain code kept, private key replaced by its
+/// compressed public key) and every WIF becomes its hex public key. Everything
+/// else (origins, paths, wildcards, script structure) is copied byte for byte,
+/// so this also works where `toString` would lose structure (miniscript,
+/// multi-leaf tap trees).
+///
+/// This is Core's `Descriptor::ToString()` view of a descriptor that was
+/// imported with private keys (DescriptorScriptPubKeyMan::GetDescriptorString
+/// with priv=false): the wallet's descriptor record carries public keys only;
+/// the private keys live in the (encrypted when the wallet is) key store.
+///
+/// Token rule: a maximal run of base58 characters is replaced only if it
+/// decodes as a checksummed BIP-32 private extended key or a WIF private key.
+/// Addresses, pubkeys, paths and fingerprints never decode as either (wrong
+/// length, version byte or checksum), so they pass through unchanged.
+pub fn toPublicDescriptor(allocator: std.mem.Allocator, desc_str: []const u8) ![]const u8 {
+    const body = if (std.mem.indexOfScalar(u8, desc_str, '#')) |h| desc_str[0..h] else desc_str;
+    var out = std.ArrayList(u8).init(allocator);
+    defer out.deinit();
+    var i: usize = 0;
+    while (i < body.len) {
+        if (!isBase58Char(body[i])) {
+            try out.append(body[i]);
+            i += 1;
+            continue;
+        }
+        var j = i;
+        while (j < body.len and isBase58Char(body[j])) : (j += 1) {}
+        const tok = body[i..j];
+        if (try privateTokenToPublic(allocator, tok)) |pub_tok| {
+            defer allocator.free(pub_tok);
+            try out.appendSlice(pub_tok);
+        } else {
+            try out.appendSlice(tok);
+        }
+        i = j;
+    }
+    return addChecksum(allocator, out.items);
+}
+
+fn isBase58Char(c: u8) bool {
+    return switch (c) {
+        '1'...'9', 'A'...'H', 'J'...'N', 'P'...'Z', 'a'...'k', 'm'...'z' => true,
+        else => false,
+    };
+}
+
+/// xprv/tprv -> xpub/tpub, WIF -> hex pubkey; null when `tok` is neither.
+fn privateTokenToPublic(allocator: std.mem.Allocator, tok: []const u8) !?[]const u8 {
+    // A WIF is 51-52 chars, an extended key 111; anything shorter is a path
+    // element, fingerprint fragment or similar.
+    if (tok.len < 50) return null;
+    const raw = address.base58Decode(tok, allocator) catch return null;
+    defer {
+        @memset(@constCast(raw), 0);
+        allocator.free(raw);
+    }
+    if (raw.len == 82) {
+        const payload = raw[0..78];
+        const computed = crypto.hash256(payload);
+        if (!std.mem.eql(u8, raw[78..82], computed[0..4])) return null;
+        const version = std.mem.readInt(u32, payload[0..4], .big);
+        const pub_version: u32 = switch (version) {
+            0x0488ADE4 => 0x0488B21E, // xprv -> xpub
+            0x04358394 => 0x043587CF, // tprv -> tpub
+            else => return null,
+        };
+        if (payload[45] != 0x00) return null;
+        const ctx = try getSecpContext();
+        var pk: secp256k1.secp256k1_pubkey = undefined;
+        if (secp256k1.secp256k1_ec_pubkey_create(ctx, &pk, payload[46..78].ptr) != 1) return null;
+        var ext: [82]u8 = undefined;
+        std.mem.writeInt(u32, ext[0..4], pub_version, .big);
+        @memcpy(ext[4..45], payload[4..45]); // depth, parent fp, child, chain code
+        var len: usize = 33;
+        _ = secp256k1.secp256k1_ec_pubkey_serialize(ctx, ext[45..78].ptr, &len, &pk, secp256k1.SECP256K1_EC_COMPRESSED);
+        const ck = crypto.hash256(ext[0..78]);
+        @memcpy(ext[78..82], ck[0..4]);
+        return try address.base58Encode(&ext, allocator);
+    }
+    const pubkey = decodeWifToPubkey(allocator, tok) catch return null;
+    defer allocator.free(pubkey);
+    return try std.fmt.allocPrint(allocator, "{s}", .{std.fmt.fmtSliceHexLower(pubkey)});
+}
+
 /// Derive addresses from a descriptor (for deriveaddresses RPC)
 pub fn deriveAddresses(
     allocator: std.mem.Allocator,

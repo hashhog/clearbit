@@ -21048,6 +21048,14 @@ pub const RpcServer = struct {
             return self.jsonRpcError(RPC_INVALID_PARAMS, "Missing requests array", id);
         }
 
+        // Core backup.cpp importdescriptors: EnsureWalletIsUnlocked(*pwallet)
+        // before any request is processed, so a locked encrypted wallet
+        // refuses the whole call with -13 instead of taking key material it
+        // cannot protect.
+        if (wallet.encrypted and !wallet.isUnlocked()) {
+            return self.jsonRpcError(RPC_WALLET_UNLOCK_NEEDED, "Error: Please enter the wallet passphrase with walletpassphrase first.", id);
+        }
+
         const now_mtp: i64 = @intCast(self.chain_state.computeMTP());
 
         var results = std.ArrayList(ImportDescResult).init(self.allocator);
@@ -21387,6 +21395,18 @@ pub const RpcServer = struct {
 
         const solvable = descriptor.isSolvable(&desc);
 
+        // The wallet's descriptor record is the PUBLIC form (Core
+        // DescriptorScriptPubKeyMan keeps the descriptor with public keys and
+        // the private keys in its key store, encrypted when the wallet is).
+        // clearbit's imported scripts are watch-only and never sign, so the
+        // private keys are not kept at all: storing `desc_str` verbatim wrote
+        // the xprv/WIF into wallet.dat in plaintext even on an encrypted
+        // wallet, and listdescriptors handed it back.
+        const stored_desc = descriptor.toPublicDescriptor(self.allocator, desc_str) catch {
+            return dupErr(self, RPC_INVALID_ADDRESS_OR_KEY, "Invalid descriptor");
+        };
+        defer self.allocator.free(stored_desc);
+
         // Derive + register the watch-only script(s). For a non-ranged
         // descriptor this is a single spk; for a ranged one, [start,end]
         // inclusive. Any single derivation failure aborts THIS request (Core
@@ -21405,7 +21425,7 @@ pub const RpcServer = struct {
             defer if (addr_opt) |a| self.allocator.free(a);
             const addr_disp: []const u8 = addr_opt orelse "";
 
-            _ = wallet.importWatchScript(spk, addr_disp, desc_str, is_internal, solvable) catch {
+            _ = wallet.importWatchScript(spk, addr_disp, stored_desc, is_internal, solvable) catch {
                 return dupErr(self, RPC_WALLET_ERROR, "Failed to add watch-only script to wallet");
             };
 
