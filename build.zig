@@ -3214,6 +3214,40 @@ pub fn build(b: *std.Build) void {
         test_step.dependOn(&run_gbt_tests.step);
     }
 
+    // recv-error ban — drives processAllMessages with a peer that sends an
+    // unknown command and checks the ban list: a local peer is disconnected
+    // only (Core MaybeDiscourageAndDisconnect), a routable one is banned.
+    // Uses peer.zig-private test helpers, so peer.zig-rooted like the above.
+    // Run with `zig build test-recv-error-ban`.
+    {
+        const reb_tests = b.addTest(.{
+            .root_source_file = b.path("src/peer.zig"),
+            .target = target,
+            .optimize = optimize,
+            .filters = &[_][]const u8{"recv-error ban"},
+        });
+        reb_tests.linkSystemLibrary("rocksdb");
+        reb_tests.linkSystemLibrary("secp256k1");
+        reb_tests.addIncludePath(.{ .cwd_relative = secp256k1_include });
+        reb_tests.linkLibC();
+        if (target.result.cpu.arch == .x86_64) {
+            reb_tests.addCSourceFile(.{
+                .file = b.path("src/sha256_shani.c"),
+                .flags = shani_cflags,
+            });
+        }
+        if (minisketch_enabled) {
+            reb_tests.linkSystemLibrary("minisketch");
+            reb_tests.addIncludePath(.{ .cwd_relative = minisketch_include });
+        }
+        reb_tests.root_module.addOptions("build_options", build_options);
+
+        const run_reb_tests = b.addRunArtifact(reb_tests);
+        const reb_step = b.step("test-recv-error-ban", "Run recv-error local-peer ban exemption tests (peer.zig-rooted)");
+        reb_step.dependOn(&run_reb_tests.step);
+        test_step.dependOn(&run_reb_tests.step);
+    }
+
     // FIX-3G — ADDR/ADDRV2 peer-timestamp clamp (3G policy, fleet-wide).
     // Reference: bitcoin-core/src/net_processing.cpp:5678-5679.
     // Clamps peer-advertised nTime that is pre-2001 (≤100_000_000s) or more than
