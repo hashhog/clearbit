@@ -8,6 +8,8 @@ const taproot_sighash = @import("taproot_sighash.zig");
 const bip21 = @import("bip21.zig");
 const psbt_mod = @import("psbt.zig");
 const script_mod = @import("script.zig");
+// Core GetTime() (setmocktime-aware): the walletpassphrase relock clock.
+const mempool_clock = @import("mempool.zig");
 const descriptor_mod = @import("descriptor.zig");
 
 // ============================================================================
@@ -1899,7 +1901,7 @@ pub const Wallet = struct {
         // rest.  If the wallet is locked (encryption_key == null) the caller
         // must unlock before importing.
         if (self.encrypted) {
-            const enc_key = self.encryption_key orelse return error.WalletLocked;
+            const enc_key = self.liveEncryptionKey() orelse return error.WalletLocked;
             const enc = encryptPrivateKey(&enc_key, &secret);
             key.secret_key = enc.ciphertext;
             key.encryption_nonce = enc.nonce;
@@ -2677,7 +2679,7 @@ pub const Wallet = struct {
         if (!self.encrypted) {
             return kp.secret_key;
         }
-        const enc_key = self.encryption_key orelse return error.WalletLocked;
+        const enc_key = self.liveEncryptionKey() orelse return error.WalletLocked;
         const nonce = kp.encryption_nonce orelse return error.WalletNotEncrypted;
         const tag = kp.encryption_tag orelse return error.WalletNotEncrypted;
         return decryptPrivateKey(&enc_key, &kp.secret_key, &nonce, &tag);
@@ -2711,7 +2713,7 @@ pub const Wallet = struct {
         if (self.master_key_nonce == null or self.master_chain_code_nonce == null) {
             return mk;
         }
-        const enc_key = self.encryption_key orelse return error.WalletLocked;
+        const enc_key = self.liveEncryptionKey() orelse return error.WalletLocked;
         const k_nonce = self.master_key_nonce.?;
         const k_tag = self.master_key_tag orelse return error.WalletNotEncrypted;
         const cc_nonce = self.master_chain_code_nonce.?;
@@ -3236,8 +3238,29 @@ pub const Wallet = struct {
 
         // Store the key and set unlock timeout
         self.encryption_key = derived_key;
-        const now = std.time.timestamp();
+        const now = mempool_clock.currentTime();
         self.unlock_until = now + @as(i64, timeout_seconds);
+    }
+
+    /// The decryption key, but only while the walletpassphrase window is
+    /// open. Core's RelockWallet (wallet/rpc/encrypt.cpp) wipes vMasterKey
+    /// once nRelockTime passes, after which IsLocked() is true; every key
+    /// access goes through here so an expired unlock can never decrypt,
+    /// even before relockIfExpired() has wiped the bytes.
+    fn liveEncryptionKey(self: *const Wallet) ?[32]u8 {
+        const key = self.encryption_key orelse return null;
+        const until = self.unlock_until orelse return null;
+        if (mempool_clock.currentTime() >= until) return null;
+        return key;
+    }
+
+    /// Core's RelockWallet: once the unlock window has passed, wipe the
+    /// in-memory key and zero unlock_until (getwalletinfo then reports
+    /// unlocked_until 0, as Core does after nRelockTime = 0).
+    pub fn relockIfExpired(self: *Wallet) void {
+        if (self.encryption_key == null) return;
+        if (self.liveEncryptionKey() != null) return;
+        self.lockWallet();
     }
 
     /// Lock the wallet, clearing the encryption key from memory.
@@ -3252,11 +3275,7 @@ pub const Wallet = struct {
     /// Check if the wallet is currently unlocked.
     pub fn isUnlocked(self: *const Wallet) bool {
         if (!self.encrypted) return true;
-        if (self.encryption_key == null) return false;
-        if (self.unlock_until) |until| {
-            return std.time.timestamp() < until;
-        }
-        return false;
+        return self.liveEncryptionKey() != null;
     }
 
     /// Change the wallet passphrase.
