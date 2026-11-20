@@ -8850,12 +8850,14 @@ pub const RpcServer = struct {
 
     /// Get the current target wallet
     fn getTargetWallet(self: *RpcServer) ?*wallet_mod.Wallet {
-        if (self.current_wallet) |w| return w;
-        if (self.wallet) |w| return w;
-        if (self.wallet_manager) |wm| {
-            return wm.getDefaultWallet() catch null;
-        }
-        return null;
+        const w = self.current_wallet orelse self.wallet orelse blk: {
+            const wm = self.wallet_manager orelse return null;
+            break :blk wm.getDefaultWallet() catch return null;
+        };
+        // Core's scheduled RelockWallet: an expired walletpassphrase window
+        // wipes the key before the request sees the wallet.
+        w.relockIfExpired();
+        return w;
     }
 
     /// Name of `target` in the wallet manager, or "" for the legacy single
@@ -17919,6 +17921,12 @@ pub const RpcServer = struct {
             return self.jsonRpcError(RPC_INVALID_PARAMS, "address must be a string", id);
         }
 
+        // Core sendtoaddress: EnsureWalletIsUnlocked before the address and
+        // amount are parsed (wallet/rpc/spend.cpp).
+        if (wallet.encrypted and !wallet.isUnlocked()) {
+            return self.jsonRpcError(RPC_WALLET_UNLOCK_NEEDED, "Error: Please enter the wallet passphrase with walletpassphrase first.", id);
+        }
+
         var amount_sats: i64 = 0;
         if (amount_param == .float) {
             amount_sats = btcFloatToSatsChecked(amount_param.float) orelse
@@ -19485,6 +19493,12 @@ pub const RpcServer = struct {
         var tx = serialize.readTransaction(&reader, self.allocator) catch {
             return self.jsonRpcError(RPC_DESERIALIZATION_ERROR, "TX decode failed", id);
         };
+
+        // Core signrawtransactionwithwallet: EnsureWalletIsUnlocked right
+        // after DecodeHexTx (wallet/rpc/spend.cpp).
+        if (wallet.encrypted and !wallet.isUnlocked()) {
+            return self.jsonRpcError(RPC_WALLET_UNLOCK_NEEDED, "Error: Please enter the wallet passphrase with walletpassphrase first.", id);
+        }
 
         // First pass: resolve each input to a wallet UTXO (if any). This
         // gives us the full prevouts vector that BIP-341 needs to build
