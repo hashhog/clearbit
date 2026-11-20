@@ -2457,10 +2457,15 @@ test "tr_script_tree: unsupported leaf type is refused, not hashed into a wrong 
     // Producing an address that ignores or mis-encodes the leaf would be a
     // wrong (unspendable-by-script-path) address, so derivation must fail.
     const allocator = std.testing.allocator;
-    var desc = parseDescriptor(allocator, "tr(" ++ tr_tree_test_K ++ ",multi(1,669b8afcec803a0d323e9a17f3ea8e68e8abe5a278020a929adbec52421adbd0))") catch return;
+    // The parser still accepts multi() here; this pins the derive step.
+    var desc = try parseDescriptor(allocator, "tr(" ++ tr_tree_test_K ++ ",multi(1,669b8afcec803a0d323e9a17f3ea8e68e8abe5a278020a929adbec52421adbd0))");
     defer desc.deinit(allocator);
+    try std.testing.expect(desc == .tr);
+    try std.testing.expectEqual(@as(usize, 1), desc.tr.leaves.len);
     if (deriveScript(allocator, &desc, 0)) |spk| {
         allocator.free(spk);
         return error.TestExpectedError;
-    } else |_| {}
+    } else |err| {
+        try std.testing.expect(@as(anyerror, err) == error.UnsupportedTapLeaf);
+    }
 }
