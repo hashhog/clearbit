@@ -5106,6 +5106,19 @@ pub const PeerManager = struct {
         try self.ban_list.banAddress(address, duration, reason);
     }
 
+    /// Write the ban-list entry for a peer whose should_ban verdict is being
+    /// acted on, unless it is local. Core MaybeDiscourageAndDisconnect
+    /// (net_processing.cpp): a local peer is disconnected only and never
+    /// discouraged. misbehaving() still sets should_ban on a local peer to
+    /// force the disconnect, so every site that acts on should_ban must come
+    /// through here; banning a loopback address refuses every later inbound
+    /// loopback connection (local proxy, tooling) for DEFAULT_BAN_DURATION.
+    /// The caller removes the peer.
+    fn discourageMisbehavingPeer(self: *PeerManager, peer_obj: *const Peer) void {
+        if (peer_obj.isLocalAddress()) return;
+        self.banIP(peer_obj.address, DEFAULT_BAN_DURATION, "misbehavior threshold reached") catch {};
+    }
+
     /// Unban an IP address.
     pub fn unbanIP(self: *PeerManager, address: std.net.Address) bool {
         return self.ban_list.unbanAddress(address);
@@ -6192,8 +6205,9 @@ pub const PeerManager = struct {
                     // a local/loopback peer is DISCONNECT-ONLY — no discourage
                     // (ban-list) entry is ever written.  misbehaving() documents
                     // this exemption but still sets should_ban to force the
-                    // disconnect, so the ban-list write MUST be suppressed here
-                    // or the exemption is defeated.  Without this guard a single
+                    // disconnect, so the ban-list write MUST be suppressed
+                    // (discourageMisbehavingPeer does, for all three should_ban
+                    // sites) or the exemption is defeated.  Without this guard a single
                     // misbehaving() on a 127.0.0.1 peer persisted a loopback ban
                     // to banlist.json (written relative to cwd, shared across
                     // datadirs incl. mainnet) which then RST'd every subsequent
@@ -6201,9 +6215,7 @@ pub const PeerManager = struct {
                     // "retry: handshake never completes" half of the P2P-reorg
                     // wedge, and a footgun that could brick the mainnet node's
                     // local RPC/consensus-diff tooling.
-                    if (!peer_obj.isLocalAddress()) {
-                        self.banIP(peer_obj.address, DEFAULT_BAN_DURATION, "misbehavior threshold reached") catch {};
-                    }
+                    self.discourageMisbehavingPeer(peer_obj);
                     self.removePeerByIndex(i);
                     continue;
                 }
@@ -6390,7 +6402,7 @@ pub const PeerManager = struct {
 
                     // Check if should be banned after misbehavior
                     if (peer_obj.should_ban) {
-                        self.banIP(peer_obj.address, DEFAULT_BAN_DURATION, "misbehavior threshold reached") catch {};
+                        self.discourageMisbehavingPeer(peer_obj);
                         self.removePeerByIndex(i);
                         break;
                     }
@@ -6405,9 +6417,7 @@ pub const PeerManager = struct {
                 // Up to 256 more 2000-header batches then re-logged
                 // REORG-CANDIDATE and re-validated on the only P2P thread.
                 if (peer_obj.should_ban) {
-                    if (!peer_obj.isLocalAddress()) {
-                        self.banIP(peer_obj.address, DEFAULT_BAN_DURATION, "misbehavior threshold reached") catch {};
-                    }
+                    self.discourageMisbehavingPeer(peer_obj);
                     self.removePeerByIndex(i);
                     break;
                 }
@@ -17130,4 +17140,72 @@ test "getblocktxn LIVE: at MAX_BLOCKTXN_DEPTH gets blocktxn for the requested ha
     try std.testing.expectEqual(@as(u32, 1000), msg.blocktxn.transactions[0].lock_time);
     try std.testing.expectEqual(@as(u32, 1002), msg.blocktxn.transactions[1].lock_time);
     try std.testing.expect(!h.peer.should_ban);
+}
+
+// ---------------------------------------------------------------------------
+// cffix-clearbit-recv-error-ban-local: the receive-error branch of
+// processAllMessages must honour the local-peer exemption like the other two
+// should_ban sites. Core MaybeDiscourageAndDisconnect (net_processing.cpp):
+// a local peer is disconnected but never discouraged.
+// ---------------------------------------------------------------------------
+
+/// Run one processAllMessages pass in which `addr` sends a correctly framed
+/// message with an unknown command (receiveMessage -> ProtocolViolation ->
+/// misbehaving). Returns whether the peer was dropped and whether `addr` is
+/// now banned.
+fn recvErrorBanRun(addr: std.net.Address) !struct { dropped: bool, banned: bool } {
+    const allocator = std.testing.allocator;
+    var pm = PeerManager.init(allocator, &consensus.MAINNET);
+    defer pm.deinit();
+    pm.anchors_path = "/dev/null";
+    // No file behind the ban list: nothing reaches the working directory.
+    pm.ban_list.deinit();
+    pm.ban_list = banlist.BanList.init(allocator, null);
+
+    var fds: [2]i32 = undefined;
+    try std.testing.expectEqual(@as(usize, 0), std.os.linux.socketpair(std.posix.AF.UNIX, std.posix.SOCK.STREAM, 0, &fds));
+    const far = fds[1];
+    defer std.posix.close(far);
+
+    // Owned by pm from here on: removePeerByIndex disconnects (closes fds[0])
+    // and destroys it.
+    const peer = try allocator.create(Peer);
+    peer.* = makeTestPeer(allocator, .inbound);
+    peer.address = addr;
+    peer.stream = .{ .handle = fds[0] };
+    try pm.peers.append(peer);
+
+    var cmd = [_]u8{0} ** 12;
+    @memcpy(cmd[0..7], "zzzunkn");
+    const sum = crypto.hash256(&.{});
+    const hdr = p2p.MessageHeader{ .magic = consensus.MAINNET.magic, .command = cmd, .length = 0, .checksum = sum[0..4].* };
+    const bytes = hdr.encode();
+    try std.testing.expectEqual(@as(usize, 24), try std.posix.write(far, &bytes));
+
+    try pm.processAllMessages();
+
+    const dropped = pm.peers.items.len == 0;
+    if (!dropped) {
+        // Hand the peer back so the test frees it instead of leaking.
+        const p = pm.peers.swapRemove(0);
+        p.disconnect();
+        allocator.destroy(p);
+    }
+    return .{ .dropped = dropped, .banned = pm.isIPBanned(addr) };
+}
+
+test "recv-error ban: a loopback peer sending an unknown command is disconnected but NOT banned" {
+    const loopback = std.net.Address.initIp4(.{ 127, 0, 0, 1 }, 18444);
+    const r = try recvErrorBanRun(loopback);
+    try std.testing.expect(r.dropped);
+    try std.testing.expect(!r.banned);
+}
+
+test "recv-error ban: a non-local peer sending an unknown command is disconnected AND banned" {
+    // Control: the exemption is for local peers only; the same input from a
+    // routable address must still reach the ban list.
+    const remote = std.net.Address.initIp4(.{ 10, 0, 0, 1 }, 8333);
+    const r = try recvErrorBanRun(remote);
+    try std.testing.expect(r.dropped);
+    try std.testing.expect(r.banned);
 }
