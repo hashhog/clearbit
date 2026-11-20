@@ -195,8 +195,15 @@ test "current_wallet a waitfor batch to /wallet/w runs its wallet call on w even
     var waiter_reply: ?[]u8 = null;
     const th = try std.Thread.spawn(.{}, Waiter.run, .{ live, &waiter_reply });
 
-    // While the batch is parked in its wait, another connection targets v.
-    std.time.sleep(400 * std.time.ns_per_ms);
+    // Once the batch is parked on its wait thread, another connection
+    // targets v.  wait_workers rises when handleConnection hands the body
+    // to the thread, so poll it rather than guess a delay.
+    var polls: usize = 0;
+    while (live.server.wait_workers.load(.acquire) == 0) : (polls += 1) {
+        if (polls > 2000) return error.WaitBatchNeverParked;
+        std.time.sleep(5 * std.time.ns_per_ms);
+    }
+    std.time.sleep(100 * std.time.ns_per_ms);
     const other = try live.post("/wallet/v", "{\"id\":9,\"method\":\"getwalletinfo\",\"params\":[]}");
     defer allocator.free(other);
     {
