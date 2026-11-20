@@ -9779,6 +9779,14 @@ pub const RpcServer = struct {
                     defer if (details) |d| self.allocator.free(d);
                     return self.jsonRpcError(RPC_VERIFY_REJECTED, details orelse "bad-txns-premature-spend-of-coinbase", id);
                 },
+                // Core CheckTxInputs (TX_CONSENSUS -> MEMPOOL_REJECTED): the
+                // state's ToString, "bad-txns-in-belowout, value in (..) <
+                // value out (..)".
+                mempool_mod.MempoolError.InputsBelowOutputs => {
+                    const details = try self.mempool.inBelowOutDetails(&tx, self.allocator);
+                    defer if (details) |d| self.allocator.free(d);
+                    return self.jsonRpcError(RPC_VERIFY_REJECTED, details orelse "bad-txns-in-belowout", id);
+                },
                 else => self.jsonRpcError(RPC_VERIFY_REJECTED, "transaction rejected", id),
             };
         };
@@ -15871,6 +15879,16 @@ pub const RpcServer = struct {
                         // CheckTxInputs' ToString, which carries the depth.
                         if (std.mem.eql(u8, reason, "bad-txns-premature-spend-of-coinbase")) {
                             if (try self.mempool.immatureCoinbaseDetails(&tx, self.allocator)) |d| {
+                                defer self.allocator.free(d);
+                                try writer.writeAll(",\"reject-details\":\"");
+                                try writer.writeAll(d);
+                                try writer.writeByte('"');
+                            }
+                        }
+                        // Value in < value out: CheckTxInputs' ToString, which
+                        // carries both amounts.
+                        if (std.mem.eql(u8, reason, "bad-txns-in-belowout")) {
+                            if (try self.mempool.inBelowOutDetails(&tx, self.allocator)) |d| {
                                 defer self.allocator.free(d);
                                 try writer.writeAll(",\"reject-details\":\"");
                                 try writer.writeAll(d);
