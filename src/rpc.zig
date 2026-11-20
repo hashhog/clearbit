@@ -1604,7 +1604,14 @@ pub const RpcServer = struct {
     config: RpcConfig,
     running: std.atomic.Value(bool),
 
-    // Per-request state (for wallet targeting)
+    /// The wallet the request being handled targets (Core's
+    /// GetWalletForJSONRPCRequest).  Valid only while one JSON-RPC request
+    /// is being handled under `serve_mutex`: handleSingleRequest resolves it
+    /// afresh from that request's URL path, and resets it to null when the
+    /// request returns.  It used to be resolved once per HTTP body and reused
+    /// by every batch element, so an `unloadwallet` element left the next
+    /// element holding a freed pointer, and a "waitfor" body (served outside
+    /// serve_mutex) read whatever wallet another connection had set since.
     current_wallet: ?*wallet_mod.Wallet = null,
     /// Unix timestamp (seconds) when this server was created; used by `uptime`.
     start_time: i64 = 0,
@@ -1940,13 +1947,17 @@ pub const RpcServer = struct {
 
     /// Serve one already-authenticated wait-family request on its own thread,
     /// then close the connection.  Owns `body` and frees it.
-    fn waitWorker(self: *RpcServer, conn: std.net.Server.Connection, body: []u8) void {
+    /// Owns `url_path` too.  Runs WITHOUT serve_mutex: handleSingleRequest
+    /// takes it for every element that is not a wait method.
+    fn waitWorker(self: *RpcServer, conn: std.net.Server.Connection, body: []u8, url_path: []u8) void {
         defer {
             self.allocator.free(body);
+            self.allocator.free(url_path);
             conn.stream.close();
             _ = self.wait_workers.fetchSub(1, .release);
         }
-        const response = self.dispatch(body) catch |err| {
+        const ctx = RequestCtx{ .url_path = url_path, .serve_locked = false };
+        const response = self.dispatchFor(body, &ctx) catch |err| {
             const er = self.jsonRpcError(RPC_INTERNAL_ERROR, @errorName(err), null) catch return;
             defer self.allocator.free(er);
             self.sendHttpResponse(conn.stream, 200, er) catch {};
@@ -2174,10 +2185,13 @@ pub const RpcServer = struct {
         self.serve_mutex.lock();
         defer self.serve_mutex.unlock();
 
-        // Set target wallet based on URL path
-        self.current_wallet = null;
+        // A /wallet/<name> URI naming no loaded wallet is refused up front,
+        // as before.  The wallet itself is NOT kept here: each request
+        // resolves it again from `url_path` (handleSingleRequest), because a
+        // batch element may unload it and the "waitfor" thread runs outside
+        // this lock.
         if (self.wallet_manager) |wm| {
-            self.current_wallet = wm.getTargetWallet(url_path) catch |err| blk: {
+            _ = wm.getTargetWallet(url_path) catch |err| {
                 if (err == error.WalletNotFound) {
                     const error_response = self.jsonRpcError(
                         RPC_WALLET_NOT_FOUND,
@@ -2187,14 +2201,9 @@ pub const RpcServer = struct {
                     defer self.allocator.free(error_response);
                     try self.sendHttpResponse(conn.stream, 200, error_response);
                     return;
-                } else {
-                    // WalletNotSpecified or other - continue and let individual handlers decide
-                    break :blk null;
                 }
+                // WalletNotSpecified or other: let individual handlers decide.
             };
-        } else if (self.wallet) |w| {
-            // Single wallet mode (backwards compatible)
-            self.current_wallet = w;
         }
 
         // Process JSON-RPC request
@@ -2240,8 +2249,13 @@ pub const RpcServer = struct {
                 try self.sendHttpError(conn.stream, 500, "Internal Server Error");
                 return;
             };
+            const owned_path = self.allocator.dupe(u8, url_path) catch {
+                self.allocator.free(owned);
+                try self.sendHttpError(conn.stream, 500, "Internal Server Error");
+                return;
+            };
             _ = self.wait_workers.fetchAdd(1, .acquire);
-            if (std.Thread.spawn(.{}, waitWorker, .{ self, conn, owned })) |th| {
+            if (std.Thread.spawn(.{}, waitWorker, .{ self, conn, owned, owned_path })) |th| {
                 th.detach();
                 handed_off = true;
                 return;
@@ -2251,10 +2265,12 @@ pub const RpcServer = struct {
                 // better than refusing the request.
                 _ = self.wait_workers.fetchSub(1, .release);
                 self.allocator.free(owned);
+                self.allocator.free(owned_path);
             }
         }
 
-        const response = self.dispatch(body) catch |err| {
+        const ctx = RequestCtx{ .url_path = url_path, .serve_locked = true };
+        const response = self.dispatchFor(body, &ctx) catch |err| {
             const error_response = self.jsonRpcError(
                 RPC_INTERNAL_ERROR,
                 @errorName(err),
@@ -3508,7 +3524,24 @@ pub const RpcServer = struct {
     }
 
     /// Dispatch a JSON-RPC request to the appropriate handler.
+    /// Where an HTTP JSON-RPC body came from, for per-request wallet routing.
+    pub const RequestCtx = struct {
+        /// The request URI path (`/` or `/wallet/<name>`).
+        url_path: []const u8,
+        /// The caller already holds `serve_mutex` (handleConnection).  The
+        /// wait-family thread does not, so each non-wait element takes it.
+        serve_locked: bool,
+    };
+
+    /// Dispatch a body with no HTTP context (internal REST sub-calls and
+    /// tests).  The caller is responsible for `current_wallet` and locking.
     pub fn dispatch(self: *RpcServer, body: []const u8) ![]const u8 {
+        return self.dispatchFor(body, null);
+    }
+
+    /// Dispatch an HTTP body.  With `ctx`, every request in it (each batch
+    /// element) resolves its target wallet from `ctx.url_path` on its own.
+    pub fn dispatchFor(self: *RpcServer, body: []const u8, ctx: ?*const RequestCtx) ![]const u8 {
         // Parse JSON
         const parsed = std.json.parseFromSlice(std.json.Value, self.allocator, body, .{}) catch {
             return self.jsonRpcError(RPC_PARSE_ERROR, "Parse error", null);
@@ -3519,7 +3552,7 @@ pub const RpcServer = struct {
 
         // Handle batch requests (array of requests)
         if (root == .array) {
-            return self.handleBatch(root.array.items);
+            return self.handleBatch(root.array.items, ctx);
         }
 
         // Single request
@@ -3527,7 +3560,20 @@ pub const RpcServer = struct {
             return self.jsonRpcError(RPC_INVALID_REQUEST, "Invalid Request", null);
         }
 
-        return self.handleSingleRequest(root.object);
+        return self.handleSingleRequest(root.object, ctx);
+    }
+
+    /// Resolve the wallet a request to `url_path` targets, the way
+    /// handleConnection used to once per body.  null = not named and not
+    /// unambiguous; handlers then fall back (requireWallet / getTargetWallet).
+    fn resolveRequestWallet(self: *RpcServer, url_path: []const u8) error{WalletNotFound}!?*wallet_mod.Wallet {
+        if (self.wallet_manager) |wm| {
+            return wm.getTargetWallet(url_path) catch |err| {
+                if (err == error.WalletNotFound) return error.WalletNotFound;
+                return null;
+            };
+        }
+        return self.wallet;
     }
 
     /// Methods dispatched WITHOUT the chain lock (they take it themselves for
@@ -3539,7 +3585,7 @@ pub const RpcServer = struct {
     }
 
     /// Handle a single JSON-RPC request.
-    fn handleSingleRequest(self: *RpcServer, obj: std.json.ObjectMap) ![]const u8 {
+    fn handleSingleRequest(self: *RpcServer, obj: std.json.ObjectMap, ctx: ?*const RequestCtx) ![]const u8 {
         // Get method
         const method_value = obj.get("method") orelse {
             return self.jsonRpcError(RPC_INVALID_REQUEST, "Missing method", null);
@@ -3571,7 +3617,32 @@ pub const RpcServer = struct {
         // tip notifier and must not hold it (waitForTip locks per check), and
         // handlers that do long or blocking work release it themselves
         // (scantxoutset's walk, addnode's DNS) through chain_lock.IoWindow.
-        const chain_locked = !methodRunsWithoutChainLock(method);
+        // Per-request wallet routing (Core GetWalletForJSONRPCRequest).  The
+        // wait family touches no wallet and must not hold serve_mutex while
+        // it sleeps; every other method holds it (taking it here when the
+        // body is being served on the wait thread) and resolves the wallet
+        // from its own URL path, so a wallet unloaded by an earlier element
+        // is not found instead of being dereferenced after free.
+        const is_wait = methodRunsWithoutChainLock(method);
+        const take_serve = if (ctx) |c| (!is_wait and !c.serve_locked) else false;
+        if (take_serve) self.serve_mutex.lock();
+        defer if (take_serve) self.serve_mutex.unlock();
+        const routed = if (ctx != null) !is_wait else false;
+        if (routed) {
+            self.current_wallet = self.resolveRequestWallet(ctx.?.url_path) catch {
+                self.current_wallet = null;
+                return self.jsonRpcError(
+                    RPC_WALLET_NOT_FOUND,
+                    "Requested wallet does not exist or is not loaded",
+                    id,
+                );
+            };
+        }
+        defer if (routed) {
+            self.current_wallet = null;
+        };
+
+        const chain_locked = !is_wait;
         if (chain_locked) self.chain_state.connect_mutex.lock();
         defer if (chain_locked) self.chain_state.connect_mutex.unlock();
 
@@ -3904,7 +3975,7 @@ pub const RpcServer = struct {
     pub const MAX_BATCH_SIZE: usize = 1000;
 
     /// Handle batch requests.
-    fn handleBatch(self: *RpcServer, requests: []std.json.Value) ![]const u8 {
+    fn handleBatch(self: *RpcServer, requests: []std.json.Value, ctx: ?*const RequestCtx) ![]const u8 {
         // Empty batch is an error (per JSON-RPC spec)
         if (requests.len == 0) {
             return self.jsonRpcError(RPC_INVALID_REQUEST, "Empty batch request", null);
@@ -3928,7 +3999,7 @@ pub const RpcServer = struct {
                 defer self.allocator.free(err_resp);
                 try responses.appendSlice(err_resp);
             } else {
-                const resp = try self.handleSingleRequest(req.object);
+                const resp = try self.handleSingleRequest(req.object, ctx);
                 defer self.allocator.free(resp);
                 try responses.appendSlice(resp);
             }
@@ -9016,12 +9087,15 @@ pub const RpcServer = struct {
             return self.jsonRpcError(RPC_INVALID_PARAMS, "Missing wallet_name", id);
         }
 
+        const doomed = wm.getWallet(wallet_name);
         wm.unloadWallet(wallet_name) catch |err| {
             if (err == error.WalletNotLoaded) {
                 return self.jsonRpcError(RPC_WALLET_NOT_FOUND, "Wallet is not loaded", id);
             }
             return self.jsonRpcError(RPC_WALLET_ERROR, @errorName(err), id);
         };
+        // The wallet is freed now: drop the request's reference to it.
+        if (doomed != null and self.current_wallet == doomed) self.current_wallet = null;
 
         var buf = std.ArrayList(u8).init(self.allocator);
         defer buf.deinit();
