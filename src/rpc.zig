@@ -2055,11 +2055,31 @@ pub const RpcServer = struct {
         }
 
         // Handle REST API requests (GET /rest/...)
+        //
+        // Every REST endpoint reads chain or mempool state the P2P thread
+        // mutates (getutxos' read-through inserts into and evicts the coin
+        // cache; the others read the tip, block index and mempool), so the
+        // handler runs under the chain lock exactly as a JSON-RPC handler does
+        // in handleSingleRequest (Core rest.cpp: LOCK(cs_main) /
+        // LOCK2(cs_main, mempool.cs)).  Lock order serve_mutex -> cs_main, as
+        // on the JSON-RPC path.  The reply is rendered into memory and written
+        // only after both locks are released, so an unauthenticated client
+        // that stops reading cannot hold cs_main for the 30s send timeout.
         if (is_get and std.mem.startsWith(u8, url_path, "/rest/")) {
-            self.serve_mutex.lock();
-            defer self.serve_mutex.unlock();
-            self.handleRestRequest(conn.stream, url_path) catch {
-                try self.sendHttpError(conn.stream, 500, "Internal Server Error");
+            var reply = RestReply{ .buf = std.ArrayList(u8).init(self.allocator) };
+            defer reply.buf.deinit();
+            {
+                self.serve_mutex.lock();
+                defer self.serve_mutex.unlock();
+                self.chain_state.connect_mutex.lock();
+                defer self.chain_state.connect_mutex.unlock();
+                self.handleRestRequest(&reply, url_path) catch {
+                    try self.sendHttpError(&reply, 500, "Internal Server Error");
+                };
+            }
+            conn.stream.writeAll(reply.buf.items) catch |err| {
+                if (err == error.WouldBlock)
+                    std.debug.print("RPC: dropping stalled client (REST response write timeout)\n", .{});
             };
             return;
         }
@@ -2286,7 +2306,7 @@ pub const RpcServer = struct {
     }
 
     /// Send an HTTP error response.
-    fn sendHttpError(self: *RpcServer, stream: std.net.Stream, status: u16, message: []const u8) !void {
+    fn sendHttpError(self: *RpcServer, stream: anytype, status: u16, message: []const u8) !void {
         _ = self;
         var response_buf: [256]u8 = undefined;
         const response = std.fmt.bufPrint(&response_buf, "HTTP/1.1 {d} {s}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n", .{ status, message }) catch return;
@@ -2317,7 +2337,7 @@ pub const RpcServer = struct {
     }
 
     /// Send an HTTP response with custom content type.
-    fn sendRestResponse(self: *RpcServer, stream: std.net.Stream, status: u16, content_type: []const u8, body: []const u8) !void {
+    fn sendRestResponse(self: *RpcServer, stream: anytype, status: u16, content_type: []const u8, body: []const u8) !void {
         _ = self;
         var header_buf: [512]u8 = undefined;
         const status_text = switch (status) {
@@ -2334,6 +2354,16 @@ pub const RpcServer = struct {
     // ========================================================================
     // REST API (Bitcoin Core compatible)
     // ========================================================================
+
+    /// In-memory REST reply.  REST handlers render here under the chain lock;
+    /// handleConnection writes it to the socket after releasing the lock.
+    const RestReply = struct {
+        buf: std.ArrayList(u8),
+
+        pub fn writeAll(self: *RestReply, bytes: []const u8) !void {
+            try self.buf.appendSlice(bytes);
+        }
+    };
 
     /// REST response format derived from file extension.
     const RestFormat = enum {
@@ -2379,7 +2409,7 @@ pub const RpcServer = struct {
     ///   - /rest/getutxos[/checkmempool]/<txid>-<n>[/<txid>-<n>...].{bin,hex,json}
     ///   - /rest/blockfilter/<filtertype>/<hash>.{bin,hex,json}
     ///   - /rest/blockfilterheaders/<filtertype>/<count>/<hash>.{bin,hex,json}
-    fn handleRestRequest(self: *RpcServer, stream: std.net.Stream, url_path: []const u8) !void {
+    fn handleRestRequest(self: *RpcServer, stream: *RestReply, url_path: []const u8) !void {
         // Strip the "/rest/" prefix and any trailing query string (e.g. "?count=5").
         // Core's ParseDataFormat strips after the rfind('?'), so we mirror that.
         var rest_path = url_path[6..]; // skip "/rest/"
@@ -2556,7 +2586,7 @@ pub const RpcServer = struct {
     /// TxVerbosity::SHOW_TXID).
     fn restBlock(
         self: *RpcServer,
-        stream: std.net.Stream,
+        stream: *RestReply,
         remainder: []const u8,
         mode: BlockDetailMode,
     ) !void {
@@ -2650,7 +2680,7 @@ pub const RpcServer = struct {
     }
 
     /// /rest/tx/<txid>.{bin,hex,json}
-    fn restTx(self: *RpcServer, stream: std.net.Stream, remainder: []const u8) !void {
+    fn restTx(self: *RpcServer, stream: *RestReply, remainder: []const u8) !void {
         const parsed = parseRestFormat(remainder) orelse {
             try self.sendRestResponse(
                 stream,
@@ -2739,7 +2769,7 @@ pub const RpcServer = struct {
     ///
     /// Walks forward from <hash> along the active chain up to <count>
     /// headers (capped at MAX_REST_HEADERS_RESULTS=2000, Core parity).
-    fn restHeaders(self: *RpcServer, stream: std.net.Stream, remainder: []const u8) !void {
+    fn restHeaders(self: *RpcServer, stream: *RestReply, remainder: []const u8) !void {
         const slash_idx = std.mem.indexOf(u8, remainder, "/") orelse {
             try self.sendRestResponse(
                 stream,
@@ -2898,7 +2928,7 @@ pub const RpcServer = struct {
     }
 
     /// /rest/blockhashbyheight/<height>.{bin,hex,json}
-    fn restBlockHashByHeight(self: *RpcServer, stream: std.net.Stream, remainder: []const u8) !void {
+    fn restBlockHashByHeight(self: *RpcServer, stream: *RestReply, remainder: []const u8) !void {
         const parsed = parseRestFormat(remainder) orelse {
             try self.sendRestResponse(
                 stream,
@@ -2968,7 +2998,7 @@ pub const RpcServer = struct {
     /// Implements Core's BIP-64 binary serialization for `.bin`/`.hex` and
     /// the BIP-64 JSON projection for `.json`. Body-encoded outpoint lists
     /// (POST) are not supported — GET-only.
-    fn restGetUtxos(self: *RpcServer, stream: std.net.Stream, remainder: []const u8) !void {
+    fn restGetUtxos(self: *RpcServer, stream: *RestReply, remainder: []const u8) !void {
         // remainder is e.g. "/checkmempool/aa..bb-0/cc..dd-1.json", or just
         // ".json" if no outpoints were given.
         const parsed = parseRestFormat(remainder) orelse {
@@ -3171,7 +3201,7 @@ pub const RpcServer = struct {
     /// of one block-deserialize + one filter-build per request.  The
     /// fallback keeps REST coverage even when the index is off or the
     /// queried block falls before the persisted backfill point.
-    fn restBlockFilter(self: *RpcServer, stream: std.net.Stream, remainder: []const u8) !void {
+    fn restBlockFilter(self: *RpcServer, stream: *RestReply, remainder: []const u8) !void {
         // Path is "<filtertype>/<hash>.<ext>".
         const slash_idx = std.mem.indexOf(u8, remainder, "/") orelse {
             try self.sendRestResponse(
@@ -3273,7 +3303,12 @@ pub const RpcServer = struct {
     /// height, O(height^2) per request, and rebuilt every filter from disk.
     /// Now: one `getAncestor` to the last requested height, one parent walk
     /// back over the <count> requested blocks, one index read per block.
-    fn restBlockFilterHeaders(self: *RpcServer, stream: std.net.Stream, remainder: []const u8) !void {
+    ///
+    /// Runs under serve_mutex + cs_main (handleRestRequest).  The chain walk
+    /// stays under cs_main; the <count> index reads run in an IoWindow so a
+    /// P2P block connect can proceed meanwhile (Core likewise takes cs_main
+    /// only to collect the index entries).
+    fn restBlockFilterHeaders(self: *RpcServer, stream: *RestReply, remainder: []const u8) !void {
         // <filtertype>/<count>/<hash>.<ext>
         var iter = std.mem.splitScalar(u8, remainder, '/');
         const filter_type_str = iter.next() orelse {
@@ -3381,15 +3416,28 @@ pub const RpcServer = struct {
             return;
         }
 
+        // The index reads below touch only RocksDB (CF_BLOCK_FILTER_HEADER
+        // and the persisted index tip), never the in-memory block index, so
+        // they run with cs_main released: copy the n hashes and the tip
+        // height while still holding it, then open the IoWindow.
+        const tip_height = tip.height;
+        const block_hashes = try self.allocator.alloc(types.Hash256, n);
+        defer self.allocator.free(block_hashes);
+        for (entries, 0..) |e, k| block_hashes[k] = e.hash;
+
+        const io_window = storage.chain_lock.IoWindow.begin(&self.chain_state.connect_mutex);
+        defer io_window.end();
+        @import("test_hooks.zig").park(.rest_filter_walk, null);
+
         var filter_headers = std.ArrayList(types.Hash256).init(self.allocator);
         defer filter_headers.deinit();
         try filter_headers.ensureTotalCapacity(n);
-        for (entries) |e| {
-            const fh = (self.chain_state.getPersistedFilterHeader(&e.hash) catch null) orelse {
+        for (block_hashes) |*bh| {
+            const fh = (self.chain_state.getPersistedFilterHeader(bh) catch null) orelse {
                 // Core picks the suffix from whether the index has caught up
                 // with the active chain (index_ready).  Here: the flushed
                 // index tip standing below the active tip means it has not.
-                const msg = if ((self.persistedFilterIndexHeight() orelse 0) < tip.height)
+                const msg = if ((self.persistedFilterIndexHeight() orelse 0) < tip_height)
                     "Filter not found. Block filters are still in the process of being indexed."
                 else
                     "Filter not found. This error is unexpected and indicates index corruption.";
@@ -3555,22 +3603,10 @@ pub const RpcServer = struct {
                 .{ count, std.fmt.fmtSliceHexLower(&disp) },
             );
             defer allocator.free(url);
-            var fds: [2]i32 = undefined;
-            try std.testing.expectEqual(@as(usize, 0), std.os.linux.socketpair(std.posix.AF.UNIX, std.posix.SOCK.STREAM, 0, &fds));
-            defer std.posix.close(fds[1]);
-            {
-                defer std.posix.close(fds[0]);
-                try r.server.handleRestRequest(std.net.Stream{ .handle = fds[0] }, url);
-            }
-            var out = std.ArrayList(u8).init(allocator);
-            errdefer out.deinit();
-            var buf: [65536]u8 = undefined;
-            while (true) {
-                const n = try std.posix.read(fds[1], &buf);
-                if (n == 0) break;
-                try out.appendSlice(buf[0..n]);
-            }
-            return out.toOwnedSlice();
+            var reply = RestReply{ .buf = std.ArrayList(u8).init(allocator) };
+            errdefer reply.buf.deinit();
+            try r.server.handleRestRequest(&reply, url);
+            return reply.buf.toOwnedSlice();
         }
 
         /// Expected JSON body: `["<hdr>",...]` for heights [from, from+count).

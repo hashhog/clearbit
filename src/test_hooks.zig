@@ -30,6 +30,9 @@ pub const Point = enum(u8) {
     /// before the first coin is read.  One-shot, so a dump's later passes do
     /// not park again.
     utxo_db_walk,
+    /// RpcServer.restBlockFilterHeaders: active-chain hashes collected, the
+    /// chain lock released, before the first persisted filter-header read.
+    rest_filter_walk,
 };
 
 const N = @typeInfo(Point).Enum.fields.len;
