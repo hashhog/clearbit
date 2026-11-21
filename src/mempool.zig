@@ -1702,22 +1702,19 @@ pub const Mempool = struct {
                 }
             }
 
-            // Remove conflicting transactions (and their descendants)
-            for (conflicting_txids.items) |conflicting_txid| {
-                self.removeTransactionWithDescendants(conflicting_txid);
-            }
+            // The evictions themselves are STAGED: they are applied only after
+            // every remaining gate (TRUC, cluster, dust) has passed — see
+            // applyStagedEvictions below. Core's MemPoolAccept stages the
+            // removals in a changeset and applies them in Finalize, so a
+            // replacement rejected by a later gate leaves the mempool as it
+            // was. Removing here first evicted third-party txs (and their
+            // CPFP children) for a replacement that was then refused.
         }
 
-        // 7b. Check TRUC (v3) policy rules
-        // This must be done after RBF conflict removal so we see the updated mempool state
+        // 7b. Check TRUC (v3) policy rules against the PRE-eviction mempool,
+        // as Core's SingleTRUCChecks does in PreChecks: a parent's child that
+        // is a direct conflict is recognised via `conflicting_txids`.
         const truc_result = try self.checkTrucPolicy(&tx, vsize, conflicting_txids.items);
-
-        // Handle sibling eviction for v3 transactions
-        if (truc_result.sibling_to_evict) |sibling_txid| {
-            // Sibling eviction: remove the existing sibling to make room for this tx
-            // This is allowed for v3 transactions without requiring higher fee rate
-            self.removeTransaction(sibling_txid);
-        }
 
         // 8. Cluster limits — the ONLY topology bound in Core v31's cluster mempool.
         //
@@ -1755,6 +1752,10 @@ pub const Mempool = struct {
         for (tx.outputs) |output| {
             if (isDust(&output)) return MempoolError.DustOutput;
         }
+
+        // 9b. Every gate has passed: apply the staged evictions (RBF
+        // conflicts with their descendants, then a TRUC sibling).
+        self.applyStagedEvictions(conflicting_txids.items, truc_result.sibling_to_evict);
 
         // 10. Mempool size limit: enforced after insertion (below), as Core's
         // LimitMempoolSize runs after the tx is added.
@@ -2325,6 +2326,26 @@ pub const Mempool = struct {
             // captured at admission (BIP-125 RBF evicted txids).
             if (entry.replaces) |rs| self.allocator.free(rs);
             self.allocator.destroy(entry);
+        }
+    }
+
+    /// Apply the removals an admission staged once every policy gate has
+    /// passed: each RBF direct conflict with all its descendants, then the
+    /// TRUC sibling (if any). Core applies its changeset only in Finalize,
+    /// after PreChecks/ReplacementChecks/PolicyScriptChecks have all passed.
+    ///
+    /// The gates run on the pre-eviction mempool and reach the same answer
+    /// they did post-eviction: the replacement's ancestors are disjoint from
+    /// the evicted set (checkRBFRules' spends-conflicting gate), so its
+    /// ancestor set and parent cluster indices are unchanged, and the cluster
+    /// UnionFind never dropped removed members anyway.
+    fn applyStagedEvictions(self: *Mempool, conflicts: []const types.Hash256, sibling: ?types.Hash256) void {
+        for (conflicts) |conflicting_txid| {
+            self.removeTransactionWithDescendants(conflicting_txid);
+        }
+        if (sibling) |sibling_txid| {
+            // A no-op if the sibling already left as a conflict's descendant.
+            self.removeTransaction(sibling_txid);
         }
     }
 
@@ -5984,19 +6005,11 @@ pub const Mempool = struct {
                 }
             }
 
-            // Remove conflicting transactions (and their descendants)
-            for (conflicting_txids.items) |conflicting_txid| {
-                self.removeTransactionWithDescendants(conflicting_txid);
-            }
+            // Evictions are staged until every gate passes (see addTransaction §7).
         }
 
-        // 7b. Check TRUC (v3) policy rules
+        // 7b. Check TRUC (v3) policy rules against the pre-eviction mempool.
         const truc_result = try self.checkTrucPolicy(&tx, vsize, conflicting_txids.items);
-
-        // Handle sibling eviction for v3 transactions
-        if (truc_result.sibling_to_evict) |sibling_txid| {
-            self.removeTransaction(sibling_txid);
-        }
 
         // 8. Cluster limits — the only topology bound (see `addTransaction` §8
         // for the full rationale). Applies to all transactions including TRUC.
@@ -6018,6 +6031,9 @@ pub const Mempool = struct {
         for (tx.outputs) |output| {
             if (isDust(&output)) return MempoolError.DustOutput;
         }
+
+        // 9b. Every gate has passed: apply the staged evictions.
+        self.applyStagedEvictions(conflicting_txids.items, truc_result.sibling_to_evict);
 
         // 10. Mempool size limit: acceptPackage trims once after the whole
         // package is in, as Core's SubmitPackage calls LimitMempoolSize after
