@@ -438,8 +438,44 @@ pub const ParseError = error{
     NestedShNotAllowed,
     NestedWshNotAllowed,
     UncompressedNotAllowed,
+    /// multi()/sortedmulti() key count outside 1..MAX_PUBKEYS_PER_MULTISIG.
+    MultiKeyCount,
+    /// multi()/sortedmulti() threshold of 0.
+    MultiThresholdZero,
+    /// multi()/sortedmulti() threshold larger than the key count.
+    MultiThresholdTooLarge,
+    /// Top-level (bare) multi()/sortedmulti() with more than 3 keys.
+    BareMultiTooManyKeys,
+    /// sh(multi()) redeem script larger than MAX_SCRIPT_ELEMENT_SIZE.
+    P2shScriptTooLarge,
     OutOfMemory,
     BufferTooSmall,
+};
+
+/// Core MAX_PUBKEYS_PER_MULTISIG (script/script.h).
+pub const MAX_PUBKEYS_PER_MULTISIG: usize = 20;
+/// Core MAX_SCRIPT_ELEMENT_SIZE (script/script.h); bounds an sh() redeem script.
+pub const MAX_SCRIPT_ELEMENT_SIZE: usize = 520;
+
+/// Optional human-readable reason for a parse failure, worded as Core's
+/// ParseScript error string so RPCs can return it verbatim. Only set for the
+/// errors that carry one (today: the multi() bounds).
+pub const Diagnostic = struct {
+    buf: [256]u8 = undefined,
+    len: usize = 0,
+
+    pub fn message(self: *const Diagnostic) ?[]const u8 {
+        if (self.len == 0) return null;
+        return self.buf[0..self.len];
+    }
+
+    fn set(self: *Diagnostic, comptime fmt: []const u8, args: anytype) void {
+        const out = std.fmt.bufPrint(&self.buf, fmt, args) catch {
+            self.len = 0;
+            return;
+        };
+        self.len = out.len;
+    }
 };
 
 /// Parser state
@@ -447,6 +483,7 @@ pub const Parser = struct {
     input: []const u8,
     pos: usize,
     allocator: std.mem.Allocator,
+    diag: ?*Diagnostic = null,
 
     pub fn init(allocator: std.mem.Allocator, input: []const u8) Parser {
         return .{
@@ -454,6 +491,11 @@ pub const Parser = struct {
             .pos = 0,
             .allocator = allocator,
         };
+    }
+
+    fn fail(self: *Parser, err: ParseError, comptime fmt: []const u8, args: anytype) ParseError {
+        if (self.diag) |d| d.set(fmt, args);
+        return err;
     }
 
     fn peek(self: *Parser) ?u8 {
@@ -578,9 +620,9 @@ pub const Parser = struct {
                 },
             };
         } else if (std.mem.eql(u8, name, "multi")) {
-            return self.parseMulti(false);
+            return self.parseMulti(false, ctx);
         } else if (std.mem.eql(u8, name, "sortedmulti")) {
-            return self.parseMulti(true);
+            return self.parseMulti(true, ctx);
         } else if (std.mem.eql(u8, name, "addr")) {
             try self.expect('(');
             const addr_str = self.readUntil(')');
@@ -620,7 +662,7 @@ pub const Parser = struct {
         }
     }
 
-    fn parseMulti(self: *Parser, sorted: bool) ParseError!Descriptor {
+    fn parseMulti(self: *Parser, sorted: bool, ctx: Context) ParseError!Descriptor {
         try self.expect('(');
 
         // Parse threshold
@@ -645,6 +687,34 @@ pub const Parser = struct {
         }
 
         try self.expect(')');
+
+        // Core ParseScript (script/descriptor.cpp), same check order: key
+        // count, threshold >= 1, threshold <= n, bare n <= 3, then the sh()
+        // redeem-script size. Without these, deriveScript encoded k=0 as
+        // OP_RESERVED (0x50), n in 17..20 as OP_NOP-range bytes, and k or
+        // n >= 176 overflowed the u8 in @intCast (UB in ReleaseFast).
+        const n = keys.items.len;
+        if (n == 0 or n > MAX_PUBKEYS_PER_MULTISIG) {
+            return self.fail(error.MultiKeyCount, "Cannot have {d} keys in multisig; must have between 1 and {d} keys, inclusive", .{ n, MAX_PUBKEYS_PER_MULTISIG });
+        }
+        if (threshold < 1) {
+            return self.fail(error.MultiThresholdZero, "Multisig threshold cannot be {d}, must be at least 1", .{threshold});
+        }
+        if (threshold > n) {
+            return self.fail(error.MultiThresholdTooLarge, "Multisig threshold cannot be larger than the number of keys; threshold is {d} but only {d} keys specified", .{ threshold, n });
+        }
+        if (ctx == .top and n > 3) {
+            return self.fail(error.BareMultiTooManyKeys, "Cannot have {d} pubkeys in bare multisig; only at most 3 pubkeys", .{n});
+        }
+        if (ctx == .sh) {
+            // Core: script_size = sum(pubkey size + 1 push byte), plus 3 for
+            // <k> <n> OP_CHECKMULTISIG. Limits compressed keys to 15.
+            var script_size: usize = 0;
+            for (keys.items) |k| script_size += multiKeySize(k.key) + 1;
+            if (script_size + 3 > MAX_SCRIPT_ELEMENT_SIZE) {
+                return self.fail(error.P2shScriptTooLarge, "P2SH script is too large, {d} bytes is larger than {d} bytes", .{ script_size + 3, MAX_SCRIPT_ELEMENT_SIZE });
+            }
+        }
 
         const multi = MultiDescriptor{
             .threshold = threshold,
@@ -1053,7 +1123,9 @@ pub fn deriveScript(allocator: std.mem.Allocator, desc: *const Descriptor, index
         },
         .multi, .sorted_multi => |m| {
             // multisig: <threshold> <pubkey1> ... <pubkeyn> <n> OP_CHECKMULTISIG
-            try script.append(@intCast(0x50 + m.threshold)); // OP_1..OP_16
+            // Core GetScriptForMultisig: `script << nRequired` pushes a
+            // script number (OP_1..OP_16, else a minimal data push).
+            try pushScriptInt(&script, m.threshold);
 
             // Get all pubkeys
             var pubkeys = std.ArrayList([]const u8).init(allocator);
@@ -1080,7 +1152,7 @@ pub fn deriveScript(allocator: std.mem.Allocator, desc: *const Descriptor, index
                 try pushData(&script, pk);
             }
 
-            try script.append(@intCast(0x50 + m.keys.len)); // OP_1..OP_16
+            try pushScriptInt(&script, m.keys.len);
             try script.append(0xae); // OP_CHECKMULTISIG
         },
         .addr => |addr_str| {
@@ -1119,6 +1191,37 @@ pub fn deriveScript(allocator: std.mem.Allocator, desc: *const Descriptor, index
     }
 
     return script.toOwnedSlice();
+}
+
+/// Push a non-negative integer the way Core's `CScript << int64` does:
+/// OP_0 for 0, OP_1..OP_16 for 1..16, else a minimal CScriptNum data push.
+fn pushScriptInt(script: *std.ArrayList(u8), value: u64) !void {
+    if (value == 0) return script.append(0x00);
+    if (value <= 16) return script.append(@intCast(0x50 + value));
+    var buf: [9]u8 = undefined;
+    var len: usize = 0;
+    var v = value;
+    while (v > 0) : (v >>= 8) {
+        buf[len] = @truncate(v);
+        len += 1;
+    }
+    // A set top bit would read as negative; add a 0x00 sign byte.
+    if (buf[len - 1] & 0x80 != 0) {
+        buf[len] = 0x00;
+        len += 1;
+    }
+    try pushData(script, buf[0..len]);
+}
+
+/// Serialized pubkey size Core counts for the sh(multi()) size limit
+/// (PubkeyProvider::GetSize): 65 for an uncompressed key, else 33.
+fn multiKeySize(k: KeyExpression) usize {
+    return switch (k) {
+        .pubkey => |p| if (p.data.len == 130) 65 else 33,
+        // Base58 WIF: 51 chars = uncompressed, 52 = compressed (0x01 suffix).
+        .wif => |w| if (w.len == 51) 65 else 33,
+        .xpub, .xprv => 33,
+    };
 }
 
 fn pushData(script: *std.ArrayList(u8), data: []const u8) !void {
@@ -1716,6 +1819,12 @@ fn writeTapTree(out: *std.ArrayList(u8), leaves: []const TapLeaf) std.mem.Alloca
 
 /// Parse a descriptor string (with or without checksum)
 pub fn parseDescriptor(allocator: std.mem.Allocator, input: []const u8) !Descriptor {
+    return parseDescriptorDiag(allocator, input, null);
+}
+
+/// parseDescriptor that also fills `diag` with Core's ParseScript wording when
+/// the failure carries one (see Diagnostic).
+pub fn parseDescriptorDiag(allocator: std.mem.Allocator, input: []const u8, diag: ?*Diagnostic) !Descriptor {
     // Strip checksum if present
     var desc_str = input;
     if (std.mem.lastIndexOf(u8, input, "#")) |hash_pos| {
@@ -1727,6 +1836,7 @@ pub fn parseDescriptor(allocator: std.mem.Allocator, input: []const u8) !Descrip
     }
 
     var parser = Parser.init(allocator, desc_str);
+    parser.diag = diag;
     return parser.parse();
 }
 
@@ -2811,4 +2921,193 @@ test "tr_script_tree: unsupported leaf type is refused, not hashed into a wrong 
     } else |err| {
         try std.testing.expect(@as(anyerror, err) == error.UnsupportedTapLeaf);
     }
+}
+
+// ----------------------------------------------------------------------------
+// multi_bounds: multi()/sortedmulti() threshold and key-count bounds (Core
+// ParseScript, script/descriptor.cpp) and script-number encoding of k and n
+// (Core GetScriptForMultisig, script/solver.cpp).
+//
+// Every expected address and message below is Bitcoin Core v31.1 regtest
+// `deriveaddresses` output. The keys are the compressed (mk_K) and
+// uncompressed (mk_U) pubkeys of private keys 1..21 / 1..8; mk_W are the
+// uncompressed regtest WIFs of 1..8.
+// ----------------------------------------------------------------------------
+
+const mk_K1 = "0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798";
+const mk_K2 = "02c6047f9441ed7d6d3045406e95c07cd85c778e4b8cef3ca7abac09b95c709ee5";
+const mk_K3 = "02f9308a019258c31049344f85f89d5229b531c845836f99b08601f113bce036f9";
+const mk_K4 = "02e493dbf1c10d80f3581e4904930b1404cc6c13900ee0758474fa94abe8c4cd13";
+const mk_K5 = "022f8bde4d1a07209355b4a7250a5c5128e88b84bddc619ab7cba8d569b240efe4";
+const mk_K6 = "03fff97bd5755eeea420453a14355235d382f6472f8568a18b2f057a1460297556";
+const mk_K7 = "025cbdf0646e5db4eaa398f365f2ea7a0e3d419b7e0330e39ce92bddedcac4f9bc";
+const mk_K8 = "022f01e5e15cca351daff3843fb70f3c2f0a1bdd05e5af888a67784ef3e10a2a01";
+const mk_K9 = "03acd484e2f0c7f65309ad178a9f559abde09796974c57e714c35f110dfc27ccbe";
+const mk_K10 = "03a0434d9e47f3c86235477c7b1ae6ae5d3442d49b1943c2b752a68e2a47e247c7";
+const mk_K11 = "03774ae7f858a9411e5ef4246b70c65aac5649980be5c17891bbec17895da008cb";
+const mk_K12 = "03d01115d548e7561b15c38f004d734633687cf4419620095bc5b0f47070afe85a";
+const mk_K13 = "03f28773c2d975288bc7d1d205c3748651b075fbc6610e58cddeeddf8f19405aa8";
+const mk_K14 = "03499fdf9e895e719cfd64e67f07d38e3226aa7b63678949e6e49b241a60e823e4";
+const mk_K15 = "02d7924d4f7d43ea965a465ae3095ff41131e5946f3c85f79e44adbcf8e27e080e";
+const mk_K16 = "03e60fce93b59e9ec53011aabc21c23e97b2a31369b87a5ae9c44ee89e2a6dec0a";
+const mk_K17 = "03defdea4cdb677750a420fee807eacf21eb9898ae79b9768766e4faa04a2d4a34";
+const mk_K18 = "025601570cb47f238d2b0286db4a990fa0f3ba28d1a319f5e7cf55c2a2444da7cc";
+const mk_K19 = "022b4ea0a797a443d293ef5cff444f4979f06acfebd7e86d277475656138385b6c";
+const mk_K20 = "024ce119c96e2fa357200b559b2f7dd5a5f02d5290aff74b03f3e471b273211c97";
+const mk_K21 = "02352bbf4a4cdd12564f93fa332ce333301d9ad40271f8107181340aef25be59d5";
+const mk_U1 = "0479be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798483ada7726a3c4655da4fbfc0e1108a8fd17b448a68554199c47d08ffb10d4b8";
+const mk_U2 = "04c6047f9441ed7d6d3045406e95c07cd85c778e4b8cef3ca7abac09b95c709ee51ae168fea63dc339a3c58419466ceaeef7f632653266d0e1236431a950cfe52a";
+const mk_U3 = "04f9308a019258c31049344f85f89d5229b531c845836f99b08601f113bce036f9388f7b0f632de8140fe337e62a37f3566500a99934c2231b6cb9fd7584b8e672";
+const mk_U4 = "04e493dbf1c10d80f3581e4904930b1404cc6c13900ee0758474fa94abe8c4cd1351ed993ea0d455b75642e2098ea51448d967ae33bfbdfe40cfe97bdc47739922";
+const mk_U5 = "042f8bde4d1a07209355b4a7250a5c5128e88b84bddc619ab7cba8d569b240efe4d8ac222636e5e3d6d4dba9dda6c9c426f788271bab0d6840dca87d3aa6ac62d6";
+const mk_U6 = "04fff97bd5755eeea420453a14355235d382f6472f8568a18b2f057a1460297556ae12777aacfbb620f3be96017f45c560de80f0f6518fe4a03c870c36b075f297";
+const mk_U7 = "045cbdf0646e5db4eaa398f365f2ea7a0e3d419b7e0330e39ce92bddedcac4f9bc6aebca40ba255960a3178d6d861a54dba813d0b813fde7b5a5082628087264da";
+const mk_U8 = "042f01e5e15cca351daff3843fb70f3c2f0a1bdd05e5af888a67784ef3e10a2a015c4da8a741539949293d082a132d13b4c2e213d6ba5b7617b5da2cb76cbde904";
+const mk_W1 = "91avARGdfge8E4tZfYLoxeJ5sGBdNJQH4kvjJoQFacbgwmaKkrx";
+const mk_W2 = "91avARGdfge8E4tZfYLoxeJ5sGBdNJQH4kvjJoQFacbgww7vXtT";
+const mk_W3 = "91avARGdfge8E4tZfYLoxeJ5sGBdNJQH4kvjJoQFacbgx3cTMqe";
+const mk_W4 = "91avARGdfge8E4tZfYLoxeJ5sGBdNJQH4kvjJoQFacbgx9rcrL7";
+const mk_W5 = "91avARGdfge8E4tZfYLoxeJ5sGBdNJQH4kvjJoQFacbgxCZY6u6";
+const mk_W6 = "91avARGdfge8E4tZfYLoxeJ5sGBdNJQH4kvjJoQFacbgxPr9P7A";
+const mk_W7 = "91avARGdfge8E4tZfYLoxeJ5sGBdNJQH4kvjJoQFacbgxVDHN1P";
+const mk_W8 = "91avARGdfge8E4tZfYLoxeJ5sGBdNJQH4kvjJoQFacbgxZRghKv";
+
+fn mkJoin(comptime prefix: []const u8, comptime n: usize) []const u8 {
+    comptime {
+        var s: []const u8 = "";
+        for (1..n + 1) |i| {
+            s = s ++ (if (i > 1) "," else "") ++ @field(@This(), prefix ++ std.fmt.comptimePrint("{d}", .{i}));
+        }
+        return s;
+    }
+}
+
+fn multiBoundsExpectAddr(desc_str: []const u8, expected: []const u8) !void {
+    const allocator = std.testing.allocator;
+    const addrs = try deriveAddresses(allocator, desc_str, .regtest, 0, 0);
+    defer {
+        for (addrs) |a| allocator.free(a);
+        allocator.free(addrs);
+    }
+    try std.testing.expectEqual(@as(usize, 1), addrs.len);
+    try std.testing.expectEqualStrings(expected, addrs[0]);
+}
+
+/// The descriptor must be refused with `expected_err`, and the parser must
+/// report Core's ParseScript message (what deriveaddresses returns as -5).
+fn multiBoundsExpectRefused(desc_str: []const u8, expected_err: anyerror, expected_msg: []const u8) !void {
+    const allocator = std.testing.allocator;
+    if (deriveAddresses(allocator, desc_str, .regtest, 0, 0)) |addrs| {
+        defer {
+            for (addrs) |a| allocator.free(a);
+            allocator.free(addrs);
+        }
+        std.debug.print("accepted, derived {s}; Core refuses with \"{s}\"\n", .{ addrs[0], expected_msg });
+        return error.TestExpectedError;
+    } else |err| {
+        try std.testing.expectEqual(expected_err, err);
+    }
+    // Message check. Guarded so this file still compiles where the
+    // diagnostic API does not exist (the test then fails by assertion).
+    if (comptime @hasDecl(@This(), "parseDescriptorDiag")) {
+        var diag: @field(@This(), "Diagnostic") = .{};
+        if (@field(@This(), "parseDescriptorDiag")(allocator, desc_str, &diag)) |d| {
+            var dd = d;
+            dd.deinit(allocator);
+            return error.TestExpectedError;
+        } else |_| {}
+        try std.testing.expectEqualStrings(expected_msg, diag.message() orelse "");
+    } else {
+        return error.NoParseDiagnostic;
+    }
+}
+
+test "multi_bounds: multi(0,K1,K2) is refused (k=0 encoded OP_RESERVED)" {
+    try multiBoundsExpectRefused("multi(0," ++ comptime mkJoin("mk_K", 2) ++ ")", error.MultiThresholdZero, "Multisig threshold cannot be 0, must be at least 1");
+}
+
+test "multi_bounds: multi(3,K1,K2) is refused (threshold > keys)" {
+    try multiBoundsExpectRefused("multi(3," ++ comptime mkJoin("mk_K", 2) ++ ")", error.MultiThresholdTooLarge, "Multisig threshold cannot be larger than the number of keys; threshold is 3 but only 2 keys specified");
+}
+
+test "multi_bounds: bare multi() with 4 keys is refused" {
+    try multiBoundsExpectRefused("multi(1," ++ comptime mkJoin("mk_K", 4) ++ ")", error.BareMultiTooManyKeys, "Cannot have 4 pubkeys in bare multisig; only at most 3 pubkeys");
+}
+
+test "multi_bounds: wsh(multi()) with 21 keys is refused" {
+    try multiBoundsExpectRefused("wsh(multi(1," ++ comptime mkJoin("mk_K", 21) ++ "))", error.MultiKeyCount, "Cannot have 21 keys in multisig; must have between 1 and 20 keys, inclusive");
+}
+
+test "multi_bounds: key count is checked before the threshold (Core order)" {
+    try multiBoundsExpectRefused("wsh(multi(0," ++ comptime mkJoin("mk_K", 21) ++ "))", error.MultiKeyCount, "Cannot have 21 keys in multisig; must have between 1 and 20 keys, inclusive");
+}
+
+test "multi_bounds: wsh(multi(0,...)) is refused" {
+    try multiBoundsExpectRefused("wsh(multi(0," ++ comptime mkJoin("mk_K", 2) ++ "))", error.MultiThresholdZero, "Multisig threshold cannot be 0, must be at least 1");
+}
+
+test "multi_bounds: sh(sortedmulti(0,...)) is refused" {
+    try multiBoundsExpectRefused("sh(sortedmulti(0," ++ comptime mkJoin("mk_K", 2) ++ "))", error.MultiThresholdZero, "Multisig threshold cannot be 0, must be at least 1");
+}
+
+test "multi_bounds: sh(multi()) with 16 compressed keys exceeds 520 bytes" {
+    try multiBoundsExpectRefused("sh(multi(1," ++ comptime mkJoin("mk_K", 16) ++ "))", error.P2shScriptTooLarge, "P2SH script is too large, 547 bytes is larger than 520 bytes");
+}
+
+test "multi_bounds: sh(multi()) with 8 uncompressed hex keys exceeds 520 bytes" {
+    try multiBoundsExpectRefused("sh(multi(1," ++ comptime mkJoin("mk_U", 8) ++ "))", error.P2shScriptTooLarge, "P2SH script is too large, 531 bytes is larger than 520 bytes");
+}
+
+test "multi_bounds: sh(multi()) with 8 uncompressed WIF keys exceeds 520 bytes" {
+    try multiBoundsExpectRefused("sh(multi(1," ++ comptime mkJoin("mk_W", 8) ++ "))", error.P2shScriptTooLarge, "P2SH script is too large, 531 bytes is larger than 520 bytes");
+}
+
+test "multi_bounds: 17-key wsh(multi(1,...)) equals Core's address" {
+    try multiBoundsExpectAddr("wsh(multi(1," ++ comptime mkJoin("mk_K", 17) ++ "))", "bcrt1qeqlqzd940c9qs38wp7tlavdlmh6v6gwsdtt4peauvgeuue499h7ql6dwyw");
+}
+
+test "multi_bounds: wsh(multi(17,17 keys)) equals Core's address" {
+    try multiBoundsExpectAddr("wsh(multi(17," ++ comptime mkJoin("mk_K", 17) ++ "))", "bcrt1q930ak48grylg2ef572yxe244psx8psgyw6p0pxv3j7xm8vepqwlse2gzs5");
+}
+
+test "multi_bounds: wsh(multi(20,20 keys)) equals Core's address" {
+    try multiBoundsExpectAddr("wsh(multi(20," ++ comptime mkJoin("mk_K", 20) ++ "))", "bcrt1qtcukuehq2r6sev2rf26mlndsr98ttphpt8nv30ejymqyvsr7w6cqgeekdm");
+}
+
+test "multi_bounds: wsh(sortedmulti(18,18 keys)) equals Core's address" {
+    try multiBoundsExpectAddr("wsh(sortedmulti(18," ++ comptime mkJoin("mk_K", 18) ++ "))", "bcrt1qdmmxnlch3ca0zt2nuclzektkyk2d5tkujhdhethga5x4tspcrehsas4u9h");
+}
+
+test "multi_bounds: sh(wsh(multi(1,17 keys))) equals Core's address" {
+    try multiBoundsExpectAddr("sh(wsh(multi(1," ++ comptime mkJoin("mk_K", 17) ++ ")))", "2Mu3zGUV6z9FHXh8q6vVC7TZF2Ztkdb4Dgk");
+}
+
+test "multi_bounds: control: wsh(multi(16,16 keys)) unchanged" {
+    try multiBoundsExpectAddr("wsh(multi(16," ++ comptime mkJoin("mk_K", 16) ++ "))", "bcrt1qj6hhveadu5vhq3qz7hkk07dppc03pzsqsn0jgqf06yptmxc5yldsuzsvh9");
+}
+
+test "multi_bounds: control: sh(multi(1,15 keys)) still accepted" {
+    try multiBoundsExpectAddr("sh(multi(1," ++ comptime mkJoin("mk_K", 15) ++ "))", "2MsdqUB2wSVARYcGjQQ3j6pdz9B6yib7DWN");
+}
+
+test "multi_bounds: control: sh(multi(1,7 uncompressed keys)) still accepted" {
+    try multiBoundsExpectAddr("sh(multi(1," ++ comptime mkJoin("mk_U", 7) ++ "))", "2N9SEpRaeYtAQXSTtxMxDgmaPbDRQ1EWj2H");
+}
+
+test "multi_bounds: k and n of 17 are pushed as script numbers, not OP_NOP bytes" {
+    const allocator = std.testing.allocator;
+    var desc = try parseDescriptor(allocator, "wsh(multi(17," ++ comptime mkJoin("mk_K", 17) ++ "))");
+    defer desc.deinit(allocator);
+    const ws = try deriveScript(allocator, desc.wsh, 0);
+    defer allocator.free(ws);
+    // Core: `script << 17` = 0x01 0x11 (one-byte push), never 0x61 (OP_NOP).
+    try std.testing.expectEqualSlices(u8, &[_]u8{ 0x01, 0x11 }, ws[0..2]);
+    try std.testing.expectEqualSlices(u8, &[_]u8{ 0x01, 0x11, 0xae }, ws[ws.len - 3 ..]);
+    try std.testing.expectEqual(@as(usize, 2 + 17 * 34 + 3), ws.len);
+}
+
+// Last on purpose: on a build without the bound this aborts the test
+// binary (@intCast panic), so every other multi_bounds test runs first.
+test "multi_bounds: wsh(multi(176,K1,K2)) is refused, not a u8 overflow" {
+    try multiBoundsExpectRefused("wsh(multi(176," ++ comptime mkJoin("mk_K", 2) ++ "))", error.MultiThresholdTooLarge, "Multisig threshold cannot be larger than the number of keys; threshold is 176 but only 2 keys specified");
 }
