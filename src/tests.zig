@@ -1074,6 +1074,7 @@ comptime {
     _ = @import("tests_sec_rpc_payjoin_auth_args.zig"); // security audit C6/H4/H5/H6: payjoin auth, RPC casts, serial RPC, descriptor range
     _ = @import("tests_rpc_current_wallet_lifetime.zig"); // per-request wallet routing: no stale/freed current_wallet across a batch
     _ = @import("tests_version_frelay.zig"); // version fRelay stored; no tx inv to fRelay=false / block-relay-only peers
+    _ = @import("tests_psbt_tap_leaf_count.zig"); // PSBT TAP_BIP32_DERIVATION leaf-hash count bounded before alloc (C6 class)
     // rpc.zig is exercised in its own dedicated test step (`zig build
     // test-rpc` and folded into `zig build test` via build.zig). Importing
     // it here would transitively pull wallet.zig, which uses an

@@ -1850,6 +1850,12 @@ fn parseInputMap(allocator: std.mem.Allocator, reader: *serialize_mod.Reader, in
                 @memcpy(&xonly, key_data[0..32]);
                 var val_reader = serialize_mod.Reader{ .data = value };
                 const n_leaf_hashes = try val_reader.readCompactSize();
+                // Each leaf hash is 32 bytes, so a count above the bytes left
+                // cannot be honest.  Unbounded, a 10-byte value claiming
+                // MAX_SIZE hashes asked for 1 GiB before reading one (same
+                // class as the audit C6 witness-count fix; reachable via an
+                // opted-in /payjoin).
+                if (n_leaf_hashes > (value.len - val_reader.pos) / 32) return error.EndOfStream;
                 const leaf_hashes = try allocator.alloc([32]u8, @intCast(n_leaf_hashes));
                 errdefer allocator.free(leaf_hashes);
                 for (0..@intCast(n_leaf_hashes)) |i| {
@@ -1956,6 +1962,8 @@ fn parseOutputMap(allocator: std.mem.Allocator, reader: *serialize_mod.Reader, o
                 @memcpy(&xonly, key_data[0..32]);
                 var val_reader = serialize_mod.Reader{ .data = value };
                 const n_leaf_hashes = try val_reader.readCompactSize();
+                // Bounded by the bytes left, as in the input twin above.
+                if (n_leaf_hashes > (value.len - val_reader.pos) / 32) return error.EndOfStream;
                 const leaf_hashes = try allocator.alloc([32]u8, @intCast(n_leaf_hashes));
                 errdefer allocator.free(leaf_hashes);
                 for (0..@intCast(n_leaf_hashes)) |i| {
