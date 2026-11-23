@@ -583,7 +583,7 @@ test "w136/G29: clearbit handshake order is sendheaders -> sendcmpct -> feefilte
 // (behaviour pinned in tests_version_frelay.zig). Empty-mempool GetMinFee() == DEFAULT_MIN_RELAY_TX_FEE
 // in Core, so the constant is the right empty-mempool value. Periodic
 // updates from the live rolling min still need a maybeSendFeefilter caller (G2).
-test "w136/G30: handshake feefilter sends mempool MIN_RELAY_FEE gated on relay_txs" {
+test "w136/G30: handshake feefilter sends mempool MIN_RELAY_FEE gated on relay_self" {
     const allocator = testing.allocator;
     const peer_src = try readPeerSrc(allocator);
     defer allocator.free(peer_src);
