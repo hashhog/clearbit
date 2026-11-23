@@ -1083,6 +1083,11 @@ pub const MempoolEntry = struct {
     /// (validation.h `MempoolAcceptResult`) which is collected from
     /// `MemPoolAccept::PreChecks` and stored alongside the workspace.
     replaces: ?[]types.Hash256 = null,
+    /// Mempool sequence at admission (Core `CTxMemPoolEntry::entry_sequence`).
+    /// 0 for a tx re-added from a disconnected block (bypass_limits), so it
+    /// is servable to every peer. getdata serves the tx to a peer only when
+    /// this is below that peer's `last_inv_sequence` (Core info_for_relay).
+    entry_sequence: u64 = 0,
 
     /// Compute the ancestor fee rate (used for mining prioritization).
     /// This is the fee rate of the transaction including all unconfirmed ancestors.
@@ -1218,6 +1223,12 @@ pub const Mempool = struct {
     /// eviction; every other check still runs.  `updateForReorg` trims the
     /// pool afterwards (Core LimitMempoolSize).
     bypass_limits: bool = false,
+
+    /// Core `CTxMemPool::m_sequence_number`: starts at 1 and is bumped on
+    /// every admission. A peer's `last_inv_sequence` is set to this after a
+    /// tx inv, so a tx admitted later is not served to it by getdata until
+    /// it has been announced (Core FindTxForGetData / info_for_relay).
+    sequence_number: u64 = 1,
 
     /// testmempoolaccept with several txs: the earlier txs of the array, whose
     /// outputs the later ones may spend (Core AcceptMultipleTransactions:
@@ -1443,6 +1454,41 @@ pub const Mempool = struct {
         self.mutex.lock();
         defer self.mutex.unlock();
         return self.unbroadcast.count();
+    }
+
+    /// Core CTxMemPool::GetSequence.
+    pub fn getSequence(self: *Mempool) u64 {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        return self.sequence_number;
+    }
+
+    /// Sequence for an entry being admitted now, and advance the counter
+    /// (Core: entry_sequence = GetSequence(), 0 under bypass_limits; then
+    /// GetAndIncrementSequence on TransactionAddedToMempool). Caller holds
+    /// `mutex`.
+    fn takeEntrySequence(self: *Mempool) u64 {
+        const seq: u64 = if (self.bypass_limits) 0 else self.sequence_number;
+        self.sequence_number += 1;
+        return seq;
+    }
+
+    /// Core CTxMemPool::info_for_relay: the entry for `txid`, only if it was
+    /// admitted before `last_sequence` (a peer's last tx inv). null otherwise.
+    pub fn entryForRelay(self: *Mempool, txid: types.Hash256, last_sequence: u64) ?*MempoolEntry {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        const entry = self.entries.get(txid) orelse return null;
+        return if (entry.entry_sequence < last_sequence) entry else null;
+    }
+
+    /// `entryForRelay` keyed by wtxid (BIP-339 MSG_WTX).
+    pub fn entryForRelayByWtxid(self: *Mempool, wtxid: types.Hash256, last_sequence: u64) ?*MempoolEntry {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        const txid = self.by_wtxid.get(wtxid) orelse return null;
+        const entry = self.entries.get(txid) orelse return null;
+        return if (entry.entry_sequence < last_sequence) entry else null;
     }
 
     /// Attempt to add a transaction to the mempool.
@@ -1809,6 +1855,7 @@ pub const Mempool = struct {
             .cluster_index = cluster_idx,
             .mining_score = fee_rate, // Initial score is individual fee rate
             .replaces = replaces_owned,
+            .entry_sequence = self.takeEntrySequence(),
         };
 
         self.entries.put(tx_hash, entry) catch return MempoolError.OutOfMemory;
@@ -6085,6 +6132,7 @@ pub const Mempool = struct {
             .cluster_index = cluster_idx,
             .mining_score = individual_fee_rate, // Initial score
             .replaces = replaces_owned_pkg,
+            .entry_sequence = self.takeEntrySequence(),
         };
 
         self.entries.put(tx_hash, entry) catch return MempoolError.OutOfMemory;

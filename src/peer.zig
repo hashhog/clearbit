@@ -918,7 +918,7 @@ pub fn getMappedAS(asmap_data: []const u8, address: std.net.Address) u32 {
 /// advertised NODE_BLOOM (otherwise the peer should be disconnected).
 pub fn sendMempoolInventory(
     peer: *Peer,
-    pool: *const mempool_mod.Mempool,
+    pool: *mempool_mod.Mempool,
     allocator: std.mem.Allocator,
 ) !void {
     const inv = try mempool_mod.buildMempoolInventory(
@@ -937,6 +937,9 @@ pub fn sendMempoolInventory(
         peer.sendMessage(&inv_msg) catch {};
         i = end;
     }
+    // Core SendMessages: after the tx inv trickle, m_last_inv_sequence =
+    // GetSequence(), so getdata may now fetch everything just announced.
+    peer.noteTxInvSent(pool.getSequence());
 }
 
 // ============================================================================
@@ -1092,6 +1095,11 @@ pub const Peer = struct {
     min_ping_time: i64,
     /// Whether this peer relays transactions.
     relay_txs: bool,
+    /// Mempool sequence at our last tx inv to this peer (Core
+    /// `TxRelay::m_last_inv_sequence`, starts at 1). getdata MSG_TX/MSG_WTX
+    /// serves only txs admitted before it, so a peer cannot fetch a mempool
+    /// tx we never announced to it (Core FindTxForGetData).
+    last_inv_sequence: u64 = 1,
     /// Whether this is a protected peer (cannot be evicted).
     is_protected: bool,
     /// Time when connection was established.
@@ -1826,6 +1834,20 @@ pub const Peer = struct {
         const n = send_data.len;
         t.markBytesSent(n);
         self.bytes_sent += n;
+    }
+
+    /// Record a tx inv to this peer at mempool sequence `seq` (Core
+    /// SendMessages: m_last_inv_sequence = GetSequence()). Keeps the larger
+    /// value: the RPC thread (broadcastTxInv) and the P2P thread both write
+    /// it, and a late store of an older sequence must not lower it, or a tx
+    /// just announced on the other thread would answer notfound.
+    pub fn noteTxInvSent(self: *Peer, seq: u64) void {
+        _ = @atomicRmw(u64, &self.last_inv_sequence, .Max, seq, .monotonic);
+    }
+
+    /// Sequence at our last tx inv to this peer (see `last_inv_sequence`).
+    pub fn lastInvSequence(self: *const Peer) u64 {
+        return @atomicLoad(u64, &self.last_inv_sequence, .monotonic);
     }
 
     /// Best-effort, NON-BLOCKING relay send (Fault B fix).
@@ -9758,6 +9780,10 @@ pub const PeerManager = struct {
                             // single P2P thread under a mempool flood. The skipped
                             // peer learns the tx via its own mempool / next inv.
                             _ = relay_peer.trySendMessageNonBlocking(&inv_msg);
+                            // Core stamps after every tx inv trickle, sent or
+                            // not; a queued (not yet flushed) inv must still
+                            // be fetchable when the peer asks for it.
+                            relay_peer.noteTxInvSent(pool.getSequence());
                         }
                         std.debug.print("MEMPOOL: accepted tx, relaying to peers\n", .{});
                     } else if (result.reject_reason) |reason| {
@@ -9964,8 +9990,12 @@ pub const PeerManager = struct {
                     } else if (base_type == @as(u32, @intFromEnum(p2p.InvType.msg_tx))) {
                         // Serve transaction from mempool by txid (legacy getdata).
                         // MSG_TX -> no witness; MSG_WITNESS_TX -> with witness.
+                        // Core FindTxForGetData: only a tx that was in the
+                        // mempool before our last tx inv to this peer
+                        // (info_for_relay); anything else is notfound, so a
+                        // peer cannot probe for txs we never announced to it.
                         if (self.mempool) |pool| {
-                            if (pool.entries.get(item.hash)) |entry| {
+                            if (pool.entryForRelay(item.hash, peer.lastInvSequence())) |entry| {
                                 const tx_msg = if (want_witness)
                                     p2p.Message{ .tx = entry.tx }
                                 else
@@ -9987,13 +10017,12 @@ pub const PeerManager = struct {
                         // Consult by_wtxid secondary index to resolve wtxid → txid,
                         // then serve via the primary entries map.
                         // Core: net_processing.cpp FindTxForGetData (GenTxid lookup).
+                        // Gated on this peer's last tx inv like MSG_TX above.
                         if (self.mempool) |pool| {
-                            const txid_opt = pool.by_wtxid.get(item.hash);
-                            const entry_opt = if (txid_opt) |txid| pool.entries.get(txid) else null;
-                            if (entry_opt) |entry| {
+                            if (pool.entryForRelayByWtxid(item.hash, peer.lastInvSequence())) |entry| {
                                 const tx_msg = p2p.Message{ .tx = entry.tx };
                                 peer.sendMessage(&tx_msg) catch {};
-                                pool.removeUnbroadcastTx(txid_opt.?);
+                                pool.removeUnbroadcastTx(entry.txid);
                             } else {
                                 const not_found_inv = [_]p2p.InvVector{.{
                                     .inv_type = item.inv_type,
@@ -14254,6 +14283,20 @@ pub const PeerManager = struct {
         const cs = self.chain_state orelse return null;
         const db = cs.utxo_set.db orelse return null;
         return db.get(storage.CF_BLOCKS, hash) catch null;
+    }
+
+    /// `broadcast` for a tx inv, then let each peer fetch what was announced
+    /// by getdata: Core sets every tx-relay peer's m_last_inv_sequence to
+    /// GetSequence() after the tx inv trickle, whether or not the inv was
+    /// queued. The sequence is read before the send, so a tx admitted
+    /// meanwhile stays gated. Block invs keep using plain `broadcast`.
+    pub fn broadcastTxInv(self: *PeerManager, msg: *const p2p.Message) void {
+        const pool = self.mempool orelse return self.broadcast(msg);
+        const seq = pool.getSequence();
+        self.broadcast(msg);
+        for (self.peers.items) |peer| {
+            if (peer.state == .handshake_complete) peer.noteTxInvSent(seq);
+        }
     }
 
     /// BIP-130 block announcement.  For each connected peer:
