@@ -18,6 +18,7 @@ const testing = std.testing;
 const p2p = @import("p2p.zig");
 const types = @import("types.zig");
 const crypto = @import("crypto.zig");
+const serialize = @import("serialize.zig");
 const peer_mod = @import("peer.zig");
 const mempool_mod = @import("mempool.zig");
 const Mempool = mempool_mod.Mempool;
@@ -211,6 +212,38 @@ test "getdata_tx_announced: the RPC broadcast inv (broadcastTxInv) opens the tx 
     try discard(p.remote);
 
     const got = try ask(&fx, p.remote, .msg_tx, ids.txid);
+    try testing.expectEqual(@as(usize, 1), got.tx);
+    try testing.expectEqual(@as(usize, 0), got.notfound);
+}
+
+test "getdata_tx_announced: a tx relayed by inv after a peer sent it is served to the peer it was relayed to" {
+    // The P2P relay loop only invs peers in `.connected` state (it skips
+    // `.handshake_complete`, a separate pre-existing issue), so P is put in
+    // that state to reach it. Q sends the tx; the node relays an inv to P.
+    var fx: Fixture = undefined;
+    fx.init(testing.allocator);
+    defer fx.deinit();
+    // The accept path keeps the wire-decoded tx in the entry and pool.deinit
+    // does not free it (mempool.zig contract); free it here, before deinit.
+    defer {
+        var it = fx.pool.entries.iterator();
+        while (it.next()) |kv| serialize.freeTransaction(testing.allocator, &kv.value_ptr.*.tx);
+    }
+    const p = try addPeer(&fx.pm, testing.allocator, .{ 8, 8, 4, 9 }, false);
+    defer std.posix.close(p.remote);
+    const q = try addPeer(&fx.pm, testing.allocator, .{ 8, 8, 4, 10 }, false);
+    defer std.posix.close(q.remote);
+    p.peer.state = .connected;
+    const tx = mkTx(0x29);
+    try sendFrom(q.remote, .{ .tx = tx });
+    try fx.pm.processAllMessages();
+    const txid = try crypto.computeTxid(&tx, testing.allocator);
+    try testing.expect(fx.pool.entries.contains(txid));
+    var buf = std.ArrayList(u8).init(testing.allocator);
+    defer buf.deinit();
+    try testing.expectEqual(@as(usize, 1), try countFrames(p.remote, &buf, "inv", null));
+
+    const got = try ask(&fx, p.remote, .msg_tx, txid);
     try testing.expectEqual(@as(usize, 1), got.tx);
     try testing.expectEqual(@as(usize, 0), got.notfound);
 }
