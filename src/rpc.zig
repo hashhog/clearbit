@@ -1933,6 +1933,11 @@ pub const RpcServer = struct {
     /// is the queue depth, not the thread count.
     pub const MAX_CONN_WORKERS: u32 = 64;
 
+    /// Overall time a client gets to deliver its request headers, counted
+    /// from accept (audit H5 residual).  Same value as Core's
+    /// -rpcservertimeout default (DEFAULT_HTTP_SERVER_TIMEOUT = 30).
+    pub const RPC_HEADER_DEADLINE_S: u64 = 30;
+
     fn connWorker(self: *RpcServer, conn: std.net.Server.Connection) void {
         defer _ = self.conn_workers.fetchSub(1, .release);
         self.handleConnection(conn) catch {};
@@ -2017,7 +2022,39 @@ pub const RpcServer = struct {
         // SO_RCVTIMEO 30s timeout firing on a silent / half-open client. This is
         // the eviction that un-wedges the thread; we log the timeout case so the
         // public-peer soak can confirm stalled clients are being dropped.
+        //
+        // Security audit H5 residual: SO_RCVTIMEO bounds each read() on its
+        // own, and every byte that arrives starts the 30s over again.  A
+        // client that drips one byte every few seconds therefore held a
+        // connection worker for as long as it liked, and 64 of them filled
+        // MAX_CONN_WORKERS so every later client got 503.  The header read
+        // now runs against ONE absolute deadline (RPC_HEADER_DEADLINE_S from
+        // accept): before each read the socket timeout is cut down to the
+        // time left, and once it is spent the connection is dropped however
+        // recently a byte came in.
+        const header_start = std.time.Instant.now() catch null;
         while (total_read < buf.len) {
+            if (header_start) |hdr_t0| {
+                const now = std.time.Instant.now() catch hdr_t0;
+                const elapsed_ns = now.since(hdr_t0);
+                const limit_ns: u64 = RPC_HEADER_DEADLINE_S * std.time.ns_per_s;
+                if (elapsed_ns >= limit_ns) {
+                    std.debug.print("RPC: dropping stalled client (header deadline)\n", .{});
+                    return;
+                }
+                const left_ns = limit_ns - elapsed_ns;
+                const left_us = @max(left_ns / std.time.ns_per_us, 1);
+                const left_tv = std.posix.timeval{
+                    .tv_sec = @intCast(left_us / std.time.us_per_s),
+                    .tv_usec = @intCast(left_us % std.time.us_per_s),
+                };
+                std.posix.setsockopt(
+                    conn.stream.handle,
+                    std.posix.SOL.SOCKET,
+                    std.posix.SO.RCVTIMEO,
+                    std.mem.asBytes(&left_tv),
+                ) catch {};
+            }
             const n = conn.stream.read(buf[total_read..]) catch |err| {
                 if (err == error.WouldBlock)
                     std.debug.print("RPC: dropping stalled client (header read timeout)\n", .{});
@@ -2029,6 +2066,13 @@ pub const RpcServer = struct {
             // Check for end of headers
             if (std.mem.indexOf(u8, buf[0..total_read], "\r\n\r\n")) |_| break;
         }
+        // Body reads and response writes keep the per-operation 30s timeout.
+        std.posix.setsockopt(
+            conn.stream.handle,
+            std.posix.SOL.SOCKET,
+            std.posix.SO.RCVTIMEO,
+            std.mem.asBytes(&rpc_io_timeout),
+        ) catch {};
 
         // Parse HTTP request
         const request_data = buf[0..total_read];
