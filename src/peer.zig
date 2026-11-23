@@ -2598,7 +2598,10 @@ pub const Peer = struct {
         // could lower it (maybeSendFeefilter below) has no caller. Under BIP-133
         // peers withhold everything below the advertised rate, so we asked the
         // network for near-zero transaction relay permanently.
-        if (self.relay_txs and common >= p2p.FEEFILTER_VERSION) {
+        // Core MaybeSendFeefilter gates on IsBlockOnlyConn (our side), not on
+        // the peer's fRelay: a peer that said fRelay=false may still send us
+        // txs after filterload, so it still gets our fee floor.
+        if (self.relay_self and common >= p2p.FEEFILTER_VERSION) {
             const ff = p2p.Message{ .feefilter = .{ .feerate = mempool_mod.MIN_RELAY_FEE } };
             try self.sendMessage(&ff);
         }
@@ -2761,8 +2764,9 @@ pub const Peer = struct {
         // cannot parse it.
         if (self.commonVersion() < p2p.FEEFILTER_VERSION) return;
 
-        // Don't send if peer doesn't relay transactions
-        if (!self.relay_txs) return;
+        // Our side of a block-relay-only / feeler link (Core IsBlockOnlyConn);
+        // the peer's own fRelay does not gate feefilter in Core.
+        if (!self.relay_self) return;
 
         // Determine the filter value to send
         const MAX_MONEY: u64 = 2_100_000_000_000_000;
@@ -2884,8 +2888,29 @@ pub const Peer = struct {
         self.version_info = stored;
         self.services = v.services;
         self.start_height = v.start_height;
+        // Peer's fRelay (BIP-37 version field). Core net_processing.cpp
+        // VERSION handler: tx relay is set up only when the link is not
+        // block-relay-only, and then `tx_relay->m_relay_txs = fRelay`. On our
+        // own block-relay-only / feeler links we advertised fRelay=false
+        // (`relay_self`), so no tx relay exists in either direction there.
+        // This field was decoded but never stored, so every peer — including
+        // ones that asked for no tx invs — was treated as tx-relaying.
+        self.relay_txs = v.relay and self.relay_self;
         self.is_witness_capable = (v.services & p2p.NODE_WITNESS) != 0;
         self.time_offset = v.timestamp - std.time.timestamp();
+    }
+
+    /// Whether transaction announcements may be sent to this peer. Core
+    /// RelayTransaction only announces to peers with a TxRelay whose
+    /// m_relay_txs is set: never on a block-relay-only link (no TxRelay at
+    /// all; the peer disconnects us for a tx inv there) nor to a peer whose
+    /// version said fRelay=false.
+    pub fn wantsTxRelay(self: *const Peer) bool {
+        if (!self.relay_txs or !self.relay_self) return false;
+        return switch (self.conn_type) {
+            .block_relay, .feeler => false,
+            else => true,
+        };
     }
 
     /// Disconnect from the peer.
@@ -9714,7 +9739,7 @@ pub const PeerManager = struct {
                         // is a getdata-only flag for witness-serialised block data.
                         for (self.peers.items) |relay_peer| {
                             if (relay_peer == peer) continue; // Don't relay back to sender
-                            if (!relay_peer.relay_txs) continue; // Respect fRelay
+                            if (!relay_peer.wantsTxRelay()) continue; // Respect fRelay + block-relay-only links
                             if (relay_peer.state != .connected) continue;
                             // BIP-133 feefilter: skip peers whose fee filter exceeds tx fee rate
                             if (relay_peer.fee_filter_received > 0 and result.fee > 0 and result.vsize > 0) {
@@ -14193,11 +14218,32 @@ pub const PeerManager = struct {
     }
 
     /// Broadcast a message to all connected peers.
+    ///
+    /// A tx announcement (an inv carrying MSG_TX / MSG_WTX / MSG_WITNESS_TX)
+    /// goes only to peers that want tx relay (`Peer.wantsTxRelay`), as in
+    /// Core's RelayTransaction; every other message goes to all peers.
     pub fn broadcast(self: *PeerManager, msg: *const p2p.Message) void {
+        const tx_inv = isTxInv(msg);
         for (self.peers.items) |peer| {
             if (peer.state == .handshake_complete) {
+                if (tx_inv and !peer.wantsTxRelay()) continue;
                 peer.sendMessage(msg) catch continue;
             }
+        }
+    }
+
+    /// True when `msg` is an inv announcing at least one transaction.
+    fn isTxInv(msg: *const p2p.Message) bool {
+        switch (msg.*) {
+            .inv => |inv| {
+                for (inv.inventory) |item| {
+                    const base = @as(u32, @intFromEnum(item.inv_type)) & ~@as(u32, 0x40000000);
+                    if (base == @as(u32, @intFromEnum(p2p.InvType.msg_tx)) or
+                        base == @as(u32, @intFromEnum(p2p.InvType.msg_wtx))) return true;
+                }
+                return false;
+            },
+            else => return false,
         }
     }
 
