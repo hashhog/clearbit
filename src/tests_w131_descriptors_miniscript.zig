@@ -338,61 +338,62 @@ test "w131/G13 BUG-11: multi() permitted inside tr() (BUG)" {
     try testing.expect(std.mem.indexOf(u8, region, "if (ctx == .tr)") == null);
 }
 
-// G14 BUG-12 (P0-CDIV): multi() does not enforce MAX_PUBKEYS_PER_MULTISIG=20.
-// The emitted script for n > 16 is consensus-divergent.
+// G14 FIXED (was BUG-12, P0-CDIV): multi() enforces MAX_PUBKEYS_PER_MULTISIG=20
+// (Core ParseScript, script/descriptor.cpp). 17..20 keys are accepted inside
+// wsh(); 21 are refused.
 test "w131/G14 BUG-12: multi() unlimited n; n > 16 emits OP_NOP not OP_N (BUG-CDIV)" {
     const allocator = testing.allocator;
-    // Build multi(2, 17 keys) via the parser — parseMulti permits any count.
     var buf = std.ArrayList(u8).init(allocator);
     defer buf.deinit();
-    try buf.appendSlice("multi(2");
+    try buf.appendSlice("wsh(multi(2");
     var i: usize = 0;
     while (i < 17) : (i += 1) {
         try buf.appendSlice(",");
         try buf.appendSlice(VEC_PK_KEY);
     }
-    try buf.appendSlice(")");
+    try buf.appendSlice("))");
     var desc = try descriptor.parseDescriptor(allocator, buf.items);
     defer desc.deinit(allocator);
-    try testing.expect(desc == .multi);
-    try testing.expectEqual(@as(usize, 17), desc.multi.keys.len);
+    try testing.expect(desc == .wsh);
+    try testing.expectEqual(@as(usize, 17), desc.wsh.multi.keys.len);
 
-    // Script lowering does `0x50 + n` — that's 0x50+17 = 0x61 = OP_NOP.
-    // Confirm via source-guard.
-    const src = try std.fs.cwd().readFileAlloc(allocator, "src/descriptor.zig", 32 * 1024 * 1024);
-    defer allocator.free(src);
-    // The emit site is in deriveScript, .multi/.sorted_multi arm.
-    try testing.expect(std.mem.indexOf(u8, src, "@intCast(0x50 + m.threshold)") != null);
-    try testing.expect(std.mem.indexOf(u8, src, "@intCast(0x50 + m.keys.len)") != null);
-    // No MAX_PUBKEYS_PER_MULTISIG enforcement anywhere:
-    try testing.expect(std.mem.indexOf(u8, src, "MAX_PUBKEYS_PER_MULTISIG") == null);
+    // 21 keys: Core "Cannot have 21 keys in multisig; must have between 1
+    // and 20 keys, inclusive".
+    buf.clearRetainingCapacity();
+    try buf.appendSlice("wsh(multi(2");
+    i = 0;
+    while (i < 21) : (i += 1) {
+        try buf.appendSlice(",");
+        try buf.appendSlice(VEC_PK_KEY);
+    }
+    try buf.appendSlice("))");
+    try expectParseRefused(error.MultiKeyCount, buf.items);
 }
 
-// G15 BUG-13 (P1): multi() does not enforce 1 <= k <= n.
+fn expectParseRefused(expected: anyerror, desc_str: []const u8) !void {
+    if (descriptor.parseDescriptor(testing.allocator, desc_str)) |d| {
+        var dd = d;
+        dd.deinit(testing.allocator);
+        return error.TestUnexpectedResult;
+    } else |err| {
+        try testing.expectEqual(expected, err);
+    }
+}
+
+// G15 FIXED (was BUG-13, P1): multi() enforces 1 <= k <= n (Core ParseScript).
 test "w131/G15 BUG-13: multi() threshold not range-checked (BUG)" {
     const allocator = testing.allocator;
-    // multi(0, key) parses — should error per Core.
-    var d1 = try descriptor.parseDescriptor(
+    // Core: "Multisig threshold cannot be 0, must be at least 1".
+    try expectParseRefused(error.MultiThresholdZero, "multi(0," ++ VEC_PK_KEY ++ ")");
+    // Core: "Multisig threshold cannot be larger than the number of keys".
+    try expectParseRefused(error.MultiThresholdTooLarge, "multi(5," ++ VEC_PK_KEY ++ "," ++ VEC_PKH_KEY ++ ")");
+    // k == n is the upper bound and still parses.
+    var d = try descriptor.parseDescriptor(
         allocator,
-        "multi(0," ++ VEC_PK_KEY ++ ")",
+        "multi(2," ++ VEC_PK_KEY ++ "," ++ VEC_PKH_KEY ++ ")",
     );
-    defer d1.deinit(allocator);
-    try testing.expectEqual(@as(u32, 0), d1.multi.threshold);
-
-    // multi(5, key1, key2) parses — k>n, should error per Core.
-    var d2 = try descriptor.parseDescriptor(
-        allocator,
-        "multi(5," ++ VEC_PK_KEY ++ "," ++ VEC_PKH_KEY ++ ")",
-    );
-    defer d2.deinit(allocator);
-    try testing.expectEqual(@as(u32, 5), d2.multi.threshold);
-
-    // No threshold-range source-guard anywhere:
-    const src = try std.fs.cwd().readFileAlloc(allocator, "src/descriptor.zig", 32 * 1024 * 1024);
-    defer allocator.free(src);
-    try testing.expect(std.mem.indexOf(u8, src, "threshold cannot be") == null);
-    try testing.expect(std.mem.indexOf(u8, src, "threshold cannot be larger") == null);
-    try testing.expect(std.mem.indexOf(u8, src, "must be at least 1") == null);
+    defer d.deinit(allocator);
+    try testing.expectEqual(@as(u32, 2), d.multi.threshold);
 }
 
 // G16 BUG-14 (P0-CDIV): parseMulti always parses keys with parseKey(.top),
@@ -732,46 +733,28 @@ test "w131/G29 BUG-27: v:sha256(hash) does not merge OP_EQUAL into OP_EQUALVERIF
     try testing.expect(std.mem.indexOf(u8, region, ".older, .after") == null);
 }
 
-// G30 BUG-28 (P0-CDIV): multi script-lowering uses raw `0x50+n` with no
-// guard.  n > 16 emits OP_NOP / OP_VER / OP_IF / OP_NOTIF for n in
-// 17/18/19/20.
+// G30 FIXED (was BUG-28, P0-CDIV): k and n are pushed as script numbers, as
+// Core's GetScriptForMultisig `script << n` does: 17 is 0x01 0x11, never
+// 0x61 (OP_NOP).
 test "w131/G30 BUG-28: multi script-lowering emits OP_NOP for n=17..20 (BUG-CDIV)" {
     const allocator = testing.allocator;
-    // Build multi(2, 17 keys) and confirm script byte at "n" position is 0x61 (OP_NOP).
     var buf = std.ArrayList(u8).init(allocator);
     defer buf.deinit();
-    try buf.appendSlice("multi(2");
+    try buf.appendSlice("wsh(multi(2");
     var i: usize = 0;
     while (i < 17) : (i += 1) {
         try buf.appendSlice(",");
         try buf.appendSlice(VEC_PK_KEY);
     }
-    try buf.appendSlice(")");
+    try buf.appendSlice("))");
     var desc = try descriptor.parseDescriptor(allocator, buf.items);
     defer desc.deinit(allocator);
-    const spk = descriptor.deriveScript(allocator, &desc, 0) catch |e| {
-        // resolveKeyToPubkey may fail without secp256k1; we want the
-        // script-LOWERING bug, which is purely syntactic.  Source-grep it:
-        try testing.expect(e == error.Secp256k1NotAvailable or
-            e == error.InvalidKeyExpression or true);
-        const src = try std.fs.cwd().readFileAlloc(allocator, "src/descriptor.zig", 32 * 1024 * 1024);
-        defer allocator.free(src);
-        // The raw 0x50+n encoding without OP_PUSHDATA fallback.
-        try testing.expect(std.mem.indexOf(u8, src, "@intCast(0x50 + m.threshold)") != null);
-        try testing.expect(std.mem.indexOf(u8, src, "@intCast(0x50 + m.keys.len)") != null);
-        // No "if (n > 16) emit pushdata-1" branch:
-        try testing.expect(std.mem.indexOf(u8, src, "if (n > 16)") == null);
-        try testing.expect(std.mem.indexOf(u8, src, "n_keys > 16") == null);
-        return;
-    };
-    defer allocator.free(spk);
-    // If we managed to lower (with a stub-secp): final byte before
-    // OP_CHECKMULTISIG should be 0x61 (OP_NOP) for n=17.
-    // Position: last byte is 0xae (OP_CHECKMULTISIG); 2nd-to-last is n-byte.
-    if (spk.len >= 2) {
-        try testing.expectEqual(@as(u8, 0xae), spk[spk.len - 1]);
-        try testing.expectEqual(@as(u8, 0x61), spk[spk.len - 2]); // 0x50 + 17 = OP_NOP
-    }
+    const ws = try descriptor.deriveScript(allocator, desc.wsh, 0);
+    defer allocator.free(ws);
+    // <OP_2> <17 x push33> <0x01 0x11> OP_CHECKMULTISIG
+    try testing.expectEqual(@as(usize, 1 + 17 * 34 + 3), ws.len);
+    try testing.expectEqual(@as(u8, 0x52), ws[0]);
+    try testing.expectEqualSlices(u8, &[_]u8{ 0x01, 0x11, 0xae }, ws[ws.len - 3 ..]);
 }
 
 // ============================================================================
@@ -791,8 +774,8 @@ test "w131 roll-up: 28 BUG labels across 30 gates (G1+G2 PASS)" {
     const bug_9: bool = true; // G11 P0  rawtr() hex-only
     const bug_10: bool = true; // G12 P0  pkh() in tr()
     const bug_11: bool = true; // G13 P2  multi() in tr()
-    const bug_12: bool = true; // G14 P0-CDIV unlimited keys
-    const bug_13: bool = true; // G15 P1  threshold range
+    const bug_12: bool = false; // G14 FIXED unlimited keys
+    const bug_13: bool = false; // G15 FIXED threshold range
     const bug_14: bool = true; // G16 P0-CDIV parseMulti(.top) context drop
     const bug_15: bool = true; // G17 P2  parseOrigin fingerprint diag
     const bug_16: bool = true; // G18 P0  parsePathComponent >= 2^31
@@ -807,7 +790,7 @@ test "w131 roll-up: 28 BUG labels across 30 gates (G1+G2 PASS)" {
     const bug_25: bool = true; // G27 P1  or_c missing x.u
     const bug_26: bool = true; // G28 P2  multi-letter wrapper chains
     const bug_27: bool = true; // G29 P0  v:hash merge missing
-    const bug_28: bool = true; // G30 P0-CDIV multi n>16 OP_NOP
+    const bug_28: bool = false; // G30 FIXED multi n>16 OP_NOP
 
     var count: usize = 0;
     inline for (.{
@@ -817,5 +800,5 @@ test "w131 roll-up: 28 BUG labels across 30 gates (G1+G2 PASS)" {
     }) |b| {
         if (b) count += 1;
     }
-    try testing.expectEqual(@as(usize, 28), count);
+    try testing.expectEqual(@as(usize, 25), count); // G14, G15, G30 fixed
 }
