@@ -384,6 +384,36 @@ pub fn build(b: *std.Build) void {
         test_step.dependOn(&run_rest_cl_tests.step);
     }
 
+    // The RPC header read runs against one overall deadline, not only a
+    // per-read() timeout: a one-byte-per-second drip must not hold a
+    // connection worker forever (audit H5 residual).  Real HTTP against an
+    // ephemeral-port server.
+    {
+        const hdr_dl_tests = b.addTest(.{
+            .root_source_file = b.path("tests_rpc_header_deadline.zig"),
+            .target = target,
+            .optimize = optimize,
+            .filters = &[_][]const u8{"tests_rpc_header_deadline"},
+        });
+        hdr_dl_tests.linkSystemLibrary("rocksdb");
+        hdr_dl_tests.linkSystemLibrary("secp256k1");
+        hdr_dl_tests.addIncludePath(.{ .cwd_relative = secp256k1_include });
+        hdr_dl_tests.linkLibC();
+        if (target.result.cpu.arch == .x86_64) {
+            hdr_dl_tests.addCSourceFile(.{ .file = b.path("src/sha256_shani.c"), .flags = shani_cflags });
+        }
+        if (minisketch_enabled) {
+            hdr_dl_tests.linkSystemLibrary("minisketch");
+            hdr_dl_tests.addIncludePath(.{ .cwd_relative = minisketch_include });
+        }
+        hdr_dl_tests.root_module.addOptions("build_options", build_options);
+        const run_hdr_dl_tests = b.addRunArtifact(hdr_dl_tests);
+        run_hdr_dl_tests.has_side_effects = true;
+        const hdr_dl_step = b.step("test-rpc-header-deadline", "RPC header read must have an overall deadline");
+        hdr_dl_step.dependOn(&run_hdr_dl_tests.step);
+        test_step.dependOn(&run_hdr_dl_tests.step);
+    }
+
     // Reorg disconnect -> spent-coin RESTORE persistence tests.  Dedicated
     // root (imports storage.zig only) with a name-substring filter so it does
     // not drag in drifted inline tests from heavier modules.
