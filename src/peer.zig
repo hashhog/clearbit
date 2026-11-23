@@ -1836,6 +1836,20 @@ pub const Peer = struct {
         self.bytes_sent += n;
     }
 
+    /// Record a tx inv to this peer at mempool sequence `seq` (Core
+    /// SendMessages: m_last_inv_sequence = GetSequence()). Keeps the larger
+    /// value: the RPC thread (broadcastTxInv) and the P2P thread both write
+    /// it, and a late store of an older sequence must not lower it, or a tx
+    /// just announced on the other thread would answer notfound.
+    pub fn noteTxInvSent(self: *Peer, seq: u64) void {
+        _ = @atomicRmw(u64, &self.last_inv_sequence, .Max, seq, .monotonic);
+    }
+
+    /// Sequence at our last tx inv to this peer (see `last_inv_sequence`).
+    pub fn lastInvSequence(self: *const Peer) u64 {
+        return @atomicLoad(u64, &self.last_inv_sequence, .monotonic);
+    }
+
     /// Best-effort, NON-BLOCKING relay send (Fault B fix).
     ///
     /// The single P2P thread relays every accepted tx to all peers
@@ -1869,18 +1883,6 @@ pub const Peer = struct {
     ///   attempt a single non-blocking drain. Unsent bytes stay buffered via
     ///   `markBytesSent`, so the cipher stream never desyncs; they flush on the
     ///   next send to this peer. We never block the relay thread.
-    /// Record a tx inv to this peer at mempool sequence `seq` (Core
-    /// SendMessages: m_last_inv_sequence = GetSequence()). Atomic: the RPC
-    /// thread writes it (broadcastTxInv) while the P2P thread reads it.
-    pub fn noteTxInvSent(self: *Peer, seq: u64) void {
-        @atomicStore(u64, &self.last_inv_sequence, seq, .monotonic);
-    }
-
-    /// Sequence at our last tx inv to this peer (see `last_inv_sequence`).
-    pub fn lastInvSequence(self: *const Peer) u64 {
-        return @atomicLoad(u64, &self.last_inv_sequence, .monotonic);
-    }
-
     pub fn trySendMessageNonBlocking(self: *Peer, msg: *const p2p.Message) bool {
         // Handshake-complete peers have a send queue: relay is skipped only
         // while the peer is over the pause limit (Core never relays to a
@@ -14227,7 +14229,6 @@ pub const PeerManager = struct {
             }
         }
     }
-
 
     /// Raw bytes of a stored block body from CF_BLOCKS, or null (not stored,
     /// pruned, no chainstate/db, or read error).  Caller owns the returned
