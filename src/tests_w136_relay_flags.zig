@@ -576,11 +576,14 @@ test "w136/G29: clearbit handshake order is sendheaders -> sendcmpct -> feefilte
     try testing.expect(sc_pos < ff_pos);
 }
 
-// G30: handshake feefilter is gated on relay_txs and sends the mempool
-// MIN_RELAY_FEE floor. Empty-mempool GetMinFee() == DEFAULT_MIN_RELAY_TX_FEE
+// G30: handshake feefilter is gated on our side of the link (relay_self,
+// Core MaybeSendFeefilter's IsBlockOnlyConn) and sends the mempool
+// MIN_RELAY_FEE floor. It used to read relay_txs, which was always true; now
+// that relay_txs holds the peer's fRelay, Core does not gate feefilter on it
+// (behaviour pinned in tests_version_frelay.zig). Empty-mempool GetMinFee() == DEFAULT_MIN_RELAY_TX_FEE
 // in Core, so the constant is the right empty-mempool value. Periodic
 // updates from the live rolling min still need a maybeSendFeefilter caller (G2).
-test "w136/G30: handshake feefilter sends mempool MIN_RELAY_FEE gated on relay_txs" {
+test "w136/G30: handshake feefilter sends mempool MIN_RELAY_FEE gated on relay_self" {
     const allocator = testing.allocator;
     const peer_src = try readPeerSrc(allocator);
     defer allocator.free(peer_src);
@@ -591,8 +594,8 @@ test "w136/G30: handshake feefilter sends mempool MIN_RELAY_FEE gated on relay_t
     const ff_block_end = @min(ff_block_start + 2000, peer_src.len);
     const window = peer_src[ff_block_start..ff_block_end];
 
-    // Gated on relay_txs AND (Core MaybeSendFeefilter) the common version.
-    try testing.expect(std.mem.indexOf(u8, window, "if (self.relay_txs and common >= p2p.FEEFILTER_VERSION)") != null);
+    // Gated on relay_self AND (Core MaybeSendFeefilter) the common version.
+    try testing.expect(std.mem.indexOf(u8, window, "if (self.relay_self and common >= p2p.FEEFILTER_VERSION)") != null);
     try testing.expect(std.mem.indexOf(u8, window, "mempool_mod.MIN_RELAY_FEE") != null);
 }
 
