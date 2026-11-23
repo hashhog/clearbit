@@ -438,8 +438,44 @@ pub const ParseError = error{
     NestedShNotAllowed,
     NestedWshNotAllowed,
     UncompressedNotAllowed,
+    /// multi()/sortedmulti() key count outside 1..MAX_PUBKEYS_PER_MULTISIG.
+    MultiKeyCount,
+    /// multi()/sortedmulti() threshold of 0.
+    MultiThresholdZero,
+    /// multi()/sortedmulti() threshold larger than the key count.
+    MultiThresholdTooLarge,
+    /// Top-level (bare) multi()/sortedmulti() with more than 3 keys.
+    BareMultiTooManyKeys,
+    /// sh(multi()) redeem script larger than MAX_SCRIPT_ELEMENT_SIZE.
+    P2shScriptTooLarge,
     OutOfMemory,
     BufferTooSmall,
+};
+
+/// Core MAX_PUBKEYS_PER_MULTISIG (script/script.h).
+pub const MAX_PUBKEYS_PER_MULTISIG: usize = 20;
+/// Core MAX_SCRIPT_ELEMENT_SIZE (script/script.h); bounds an sh() redeem script.
+pub const MAX_SCRIPT_ELEMENT_SIZE: usize = 520;
+
+/// Optional human-readable reason for a parse failure, worded as Core's
+/// ParseScript error string so RPCs can return it verbatim. Only set for the
+/// errors that carry one (today: the multi() bounds).
+pub const Diagnostic = struct {
+    buf: [256]u8 = undefined,
+    len: usize = 0,
+
+    pub fn message(self: *const Diagnostic) ?[]const u8 {
+        if (self.len == 0) return null;
+        return self.buf[0..self.len];
+    }
+
+    fn set(self: *Diagnostic, comptime fmt: []const u8, args: anytype) void {
+        const out = std.fmt.bufPrint(&self.buf, fmt, args) catch {
+            self.len = 0;
+            return;
+        };
+        self.len = out.len;
+    }
 };
 
 /// Parser state
@@ -447,6 +483,7 @@ pub const Parser = struct {
     input: []const u8,
     pos: usize,
     allocator: std.mem.Allocator,
+    diag: ?*Diagnostic = null,
 
     pub fn init(allocator: std.mem.Allocator, input: []const u8) Parser {
         return .{
@@ -454,6 +491,11 @@ pub const Parser = struct {
             .pos = 0,
             .allocator = allocator,
         };
+    }
+
+    fn fail(self: *Parser, err: ParseError, comptime fmt: []const u8, args: anytype) ParseError {
+        if (self.diag) |d| d.set(fmt, args);
+        return err;
     }
 
     fn peek(self: *Parser) ?u8 {
@@ -578,9 +620,9 @@ pub const Parser = struct {
                 },
             };
         } else if (std.mem.eql(u8, name, "multi")) {
-            return self.parseMulti(false);
+            return self.parseMulti(false, ctx);
         } else if (std.mem.eql(u8, name, "sortedmulti")) {
-            return self.parseMulti(true);
+            return self.parseMulti(true, ctx);
         } else if (std.mem.eql(u8, name, "addr")) {
             try self.expect('(');
             const addr_str = self.readUntil(')');
@@ -620,7 +662,7 @@ pub const Parser = struct {
         }
     }
 
-    fn parseMulti(self: *Parser, sorted: bool) ParseError!Descriptor {
+    fn parseMulti(self: *Parser, sorted: bool, ctx: Context) ParseError!Descriptor {
         try self.expect('(');
 
         // Parse threshold
@@ -645,6 +687,34 @@ pub const Parser = struct {
         }
 
         try self.expect(')');
+
+        // Core ParseScript (script/descriptor.cpp), same check order: key
+        // count, threshold >= 1, threshold <= n, bare n <= 3, then the sh()
+        // redeem-script size. Without these, deriveScript encoded k=0 as
+        // OP_RESERVED (0x50), n in 17..20 as OP_NOP-range bytes, and k or
+        // n >= 176 overflowed the u8 in @intCast (UB in ReleaseFast).
+        const n = keys.items.len;
+        if (n == 0 or n > MAX_PUBKEYS_PER_MULTISIG) {
+            return self.fail(error.MultiKeyCount, "Cannot have {d} keys in multisig; must have between 1 and {d} keys, inclusive", .{ n, MAX_PUBKEYS_PER_MULTISIG });
+        }
+        if (threshold < 1) {
+            return self.fail(error.MultiThresholdZero, "Multisig threshold cannot be {d}, must be at least 1", .{threshold});
+        }
+        if (threshold > n) {
+            return self.fail(error.MultiThresholdTooLarge, "Multisig threshold cannot be larger than the number of keys; threshold is {d} but only {d} keys specified", .{ threshold, n });
+        }
+        if (ctx == .top and n > 3) {
+            return self.fail(error.BareMultiTooManyKeys, "Cannot have {d} pubkeys in bare multisig; only at most 3 pubkeys", .{n});
+        }
+        if (ctx == .sh) {
+            // Core: script_size = sum(pubkey size + 1 push byte), plus 3 for
+            // <k> <n> OP_CHECKMULTISIG. Limits compressed keys to 15.
+            var script_size: usize = 0;
+            for (keys.items) |k| script_size += multiKeySize(k.key) + 1;
+            if (script_size + 3 > MAX_SCRIPT_ELEMENT_SIZE) {
+                return self.fail(error.P2shScriptTooLarge, "P2SH script is too large, {d} bytes is larger than {d} bytes", .{ script_size + 3, MAX_SCRIPT_ELEMENT_SIZE });
+            }
+        }
 
         const multi = MultiDescriptor{
             .threshold = threshold,
@@ -1053,7 +1123,9 @@ pub fn deriveScript(allocator: std.mem.Allocator, desc: *const Descriptor, index
         },
         .multi, .sorted_multi => |m| {
             // multisig: <threshold> <pubkey1> ... <pubkeyn> <n> OP_CHECKMULTISIG
-            try script.append(@intCast(0x50 + m.threshold)); // OP_1..OP_16
+            // Core GetScriptForMultisig: `script << nRequired` pushes a
+            // script number (OP_1..OP_16, else a minimal data push).
+            try pushScriptInt(&script, m.threshold);
 
             // Get all pubkeys
             var pubkeys = std.ArrayList([]const u8).init(allocator);
@@ -1080,7 +1152,7 @@ pub fn deriveScript(allocator: std.mem.Allocator, desc: *const Descriptor, index
                 try pushData(&script, pk);
             }
 
-            try script.append(@intCast(0x50 + m.keys.len)); // OP_1..OP_16
+            try pushScriptInt(&script, m.keys.len);
             try script.append(0xae); // OP_CHECKMULTISIG
         },
         .addr => |addr_str| {
@@ -1119,6 +1191,37 @@ pub fn deriveScript(allocator: std.mem.Allocator, desc: *const Descriptor, index
     }
 
     return script.toOwnedSlice();
+}
+
+/// Push a non-negative integer the way Core's `CScript << int64` does:
+/// OP_0 for 0, OP_1..OP_16 for 1..16, else a minimal CScriptNum data push.
+fn pushScriptInt(script: *std.ArrayList(u8), value: u64) !void {
+    if (value == 0) return script.append(0x00);
+    if (value <= 16) return script.append(@intCast(0x50 + value));
+    var buf: [9]u8 = undefined;
+    var len: usize = 0;
+    var v = value;
+    while (v > 0) : (v >>= 8) {
+        buf[len] = @truncate(v);
+        len += 1;
+    }
+    // A set top bit would read as negative; add a 0x00 sign byte.
+    if (buf[len - 1] & 0x80 != 0) {
+        buf[len] = 0x00;
+        len += 1;
+    }
+    try pushData(script, buf[0..len]);
+}
+
+/// Serialized pubkey size Core counts for the sh(multi()) size limit
+/// (PubkeyProvider::GetSize): 65 for an uncompressed key, else 33.
+fn multiKeySize(k: KeyExpression) usize {
+    return switch (k) {
+        .pubkey => |p| if (p.data.len == 130) 65 else 33,
+        // Base58 WIF: 51 chars = uncompressed, 52 = compressed (0x01 suffix).
+        .wif => |w| if (w.len == 51) 65 else 33,
+        .xpub, .xprv => 33,
+    };
 }
 
 fn pushData(script: *std.ArrayList(u8), data: []const u8) !void {
@@ -1716,6 +1819,12 @@ fn writeTapTree(out: *std.ArrayList(u8), leaves: []const TapLeaf) std.mem.Alloca
 
 /// Parse a descriptor string (with or without checksum)
 pub fn parseDescriptor(allocator: std.mem.Allocator, input: []const u8) !Descriptor {
+    return parseDescriptorDiag(allocator, input, null);
+}
+
+/// parseDescriptor that also fills `diag` with Core's ParseScript wording when
+/// the failure carries one (see Diagnostic).
+pub fn parseDescriptorDiag(allocator: std.mem.Allocator, input: []const u8, diag: ?*Diagnostic) !Descriptor {
     // Strip checksum if present
     var desc_str = input;
     if (std.mem.lastIndexOf(u8, input, "#")) |hash_pos| {
@@ -1727,6 +1836,7 @@ pub fn parseDescriptor(allocator: std.mem.Allocator, input: []const u8) !Descrip
     }
 
     var parser = Parser.init(allocator, desc_str);
+    parser.diag = diag;
     return parser.parse();
 }
 

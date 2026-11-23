@@ -11567,8 +11567,11 @@ pub const RpcServer = struct {
         }
 
         // Parse and analyze the descriptor
-        var desc = descriptor.parseDescriptor(self.allocator, desc_str) catch {
-            return self.jsonRpcError(RPC_INVALID_ADDRESS_OR_KEY, "Invalid descriptor", id);
+        // Core returns the ParseScript error string verbatim (-5); use it
+        // where the parser supplies one (multi() bounds).
+        var diag: descriptor.Diagnostic = .{};
+        var desc = descriptor.parseDescriptorDiag(self.allocator, desc_str, &diag) catch {
+            return self.jsonRpcError(RPC_INVALID_ADDRESS_OR_KEY, diag.message() orelse "Invalid descriptor", id);
         };
         defer desc.deinit(self.allocator);
 
@@ -11704,8 +11707,11 @@ pub const RpcServer = struct {
             return self.jsonRpcError(RPC_INVALID_ADDRESS_OR_KEY, "Invalid characters in payload", id);
         }
 
-        var parsed_desc = descriptor.parseDescriptor(self.allocator, desc_str) catch {
-            return self.jsonRpcError(RPC_INVALID_ADDRESS_OR_KEY, "Cannot derive addresses from descriptor", id);
+        // Core deriveaddresses throws the ParseScript error verbatim (-5),
+        // e.g. "Multisig threshold cannot be 0, must be at least 1".
+        var diag: descriptor.Diagnostic = .{};
+        var parsed_desc = descriptor.parseDescriptorDiag(self.allocator, desc_str, &diag) catch {
+            return self.jsonRpcError(RPC_INVALID_ADDRESS_OR_KEY, diag.message() orelse "Cannot derive addresses from descriptor", id);
         };
         defer parsed_desc.deinit(self.allocator);
         if (!parsed_desc.isRange() and range_specified) {
