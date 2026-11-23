@@ -2089,6 +2089,38 @@ pub fn build(b: *std.Build) void {
         test_step.dependOn(&run_reag_tests.step);
     }
 
+    // getdata MSG_TX / MSG_WTX serves only txs that were in the mempool before
+    // the last tx inv sent to that peer (Core FindTxForGetData). Socket-pair
+    // peers against a real PeerManager; also part of `test`.
+    {
+        const gdta_tests = b.addTest(.{
+            .root_source_file = b.path("tests_getdata_tx_announced.zig"),
+            .target = target,
+            .optimize = optimize,
+            .filters = &[_][]const u8{"tests_getdata_tx_announced"},
+        });
+        gdta_tests.linkSystemLibrary("rocksdb");
+        gdta_tests.linkSystemLibrary("secp256k1");
+        gdta_tests.addIncludePath(.{ .cwd_relative = secp256k1_include });
+        gdta_tests.linkLibC();
+        if (target.result.cpu.arch == .x86_64) {
+            gdta_tests.addCSourceFile(.{
+                .file = b.path("src/sha256_shani.c"),
+                .flags = shani_cflags,
+            });
+        }
+        if (minisketch_enabled) {
+            gdta_tests.linkSystemLibrary("minisketch");
+            gdta_tests.addIncludePath(.{ .cwd_relative = minisketch_include });
+        }
+        gdta_tests.root_module.addOptions("build_options", build_options);
+
+        const run_gdta_tests = b.addRunArtifact(gdta_tests);
+        const gdta_step = b.step("test-getdata-tx-announced", "Run getdata tx announced-only tests (unannounced mempool tx gets notfound)");
+        gdta_step.dependOn(&run_gdta_tests.step);
+        test_step.dependOn(&run_gdta_tests.step);
+    }
+
     // BIP-68 coin nCoinTime from the connecting block's ancestor chain (not
     // the sparse H: index).  Same rig as test-rbf-diagram-reason; part of `test`.
     {
