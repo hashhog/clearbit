@@ -10239,8 +10239,8 @@ pub const RpcServer = struct {
             .inv = p2p.InvMessage{ .inventory = &inventory },
         };
 
-        // Broadcast to all connected peers
-        self.peer_manager.broadcast(&inv_msg);
+        // Broadcast to all connected peers; they may then getdata it.
+        self.peer_manager.broadcastTxInv(&inv_msg);
     }
 
     fn handleGetRawTransaction(self: *RpcServer, params: std.json.Value, id: ?std.json.Value) ![]const u8 {
