@@ -1076,6 +1076,7 @@ comptime {
     _ = @import("tests_rpc_current_wallet_lifetime.zig"); // per-request wallet routing: no stale/freed current_wallet across a batch
     _ = @import("tests_version_frelay.zig"); // version fRelay stored; no tx inv to fRelay=false / block-relay-only peers
     _ = @import("tests_psbt_tap_leaf_count.zig"); // PSBT TAP_BIP32_DERIVATION leaf-hash count bounded before alloc (C6 class)
+    _ = @import("tests_neon_script_findings.zig"); // 2026-11-24 audit F1-F4: empty-sig FindAndDelete/encoding checks, P2SH-P2A discourage, disabled CLTV/CSV NOPs
     // rpc.zig is exercised in its own dedicated test step (`zig build
     // test-rpc` and folded into `zig build test` via build.zig). Importing
     // it here would transitively pull wallet.zig, which uses an
