@@ -5949,7 +5949,10 @@ test "BIP-65 gate-1: CLTV flag off → NOP, no error" {
 }
 
 // --- CLTV gate 2: flag off + discourage_upgradable_nops → DiscourageUpgradableNops ---
-test "BIP-65 gate-2: CLTV flag off + DISCOURAGE_UPGRADABLE_NOPS → error" {
+test "BIP-65 gate-2: CLTV flag off + DISCOURAGE_UPGRADABLE_NOPS → plain NOP2, not discouraged (Core)" {
+    // Core interpreter.cpp `case OP_CHECKLOCKTIMEVERIFY`: with the flag off it
+    // is `break` (a NOP2); only NOP1 and NOP4..NOP10 consult
+    // DISCOURAGE_UPGRADABLE_NOPS.  The old assertion here pinned the divergence.
     const allocator = std.testing.allocator;
     const tx = types.Transaction{
         .version = 1,
@@ -5963,7 +5966,7 @@ test "BIP-65 gate-2: CLTV flag off + DISCOURAGE_UPGRADABLE_NOPS → error" {
     var engine = ScriptEngine.init(allocator, &tx, 0, 0, flags);
     defer engine.deinit();
     const s = [_]u8{0xb1};
-    try std.testing.expectError(ScriptError.DiscourageUpgradableNops, engine.execute(&s));
+    try engine.execute(&s);
 }
 
 // --- CLTV gate 3: empty stack → StackUnderflow ---
@@ -6294,7 +6297,10 @@ test "BIP-112 gate-9: CSV flag off → NOP, no error" {
 }
 
 // --- CSV gate 10: flag off + discourage_upgradable_nops → error ---
-test "BIP-112 gate-10: CSV flag off + DISCOURAGE_UPGRADABLE_NOPS → error" {
+test "BIP-112 gate-10: CSV flag off + DISCOURAGE_UPGRADABLE_NOPS → plain NOP3, not discouraged (Core)" {
+    // Core interpreter.cpp `case OP_CHECKSEQUENCEVERIFY`: with the flag off it
+    // is `break` (a NOP3), never discouraged.  The old assertion here pinned
+    // the divergence.
     const allocator = std.testing.allocator;
     const tx = types.Transaction{
         .version = 1,
@@ -6308,7 +6314,7 @@ test "BIP-112 gate-10: CSV flag off + DISCOURAGE_UPGRADABLE_NOPS → error" {
     var engine = ScriptEngine.init(allocator, &tx, 0, 0, flags);
     defer engine.deinit();
     const s = [_]u8{0xb2};
-    try std.testing.expectError(ScriptError.DiscourageUpgradableNops, engine.execute(&s));
+    try engine.execute(&s);
 }
 
 // --- CSV gate 11: empty stack → StackUnderflow ---

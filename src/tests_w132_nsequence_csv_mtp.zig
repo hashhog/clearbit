@@ -408,9 +408,11 @@ test "w132 G16: composition: calculate + check matches Core SequenceLocks() (PRE
 // OP_CSV / CheckSequence script-level (G17-G22)
 // ===========================================================================
 
-// G17 — flag-off ⇒ NOP3, flag-off + discourage_upgradable_nops ⇒ error.
-// Core: interpreter.cpp:561-566, 595-601.
-test "w132 G17: OP_CSV flag-off NOP and DISCOURAGE_UPGRADABLE_NOPS (PRESENT)" {
+// G17 — flag-off ⇒ NOP3, with or without discourage_upgradable_nops.
+// Core: interpreter.cpp:561-566 (`if (!(flags & SCRIPT_VERIFY_CHECKSEQUENCEVERIFY))
+// break;`).  DISCOURAGE_UPGRADABLE_NOPS (595-601) covers only NOP1 and
+// NOP4..NOP10; this test used to assert the opposite.
+test "w132 G17: OP_CSV flag-off is a NOP3 even with DISCOURAGE_UPGRADABLE_NOPS (PRESENT)" {
     const allocator = testing.allocator;
     const tx = Transaction{
         .version = 2,
@@ -433,7 +435,7 @@ test "w132 G17: OP_CSV flag-off NOP and DISCOURAGE_UPGRADABLE_NOPS (PRESENT)" {
         const s = [_]u8{ 0x51, 0xb2 }; // OP_1 OP_CSV
         try engine.execute(&s);
     }
-    // flag-off + discourage → error
+    // flag-off + discourage → still a NOP (Core)
     {
         var flags = ScriptFlags{};
         flags.verify_checksequenceverify = false;
@@ -441,7 +443,7 @@ test "w132 G17: OP_CSV flag-off NOP and DISCOURAGE_UPGRADABLE_NOPS (PRESENT)" {
         var engine = ScriptEngine.init(allocator, &tx, 0, 0, flags);
         defer engine.deinit();
         const s = [_]u8{ 0x51, 0xb2 };
-        try testing.expectError(ScriptError.DiscourageUpgradableNops, engine.execute(&s));
+        try engine.execute(&s);
     }
 }
 
