@@ -20,9 +20,10 @@
 //!     NOPs (`break`) and discourages only NOP1 and NOP4..NOP10.
 //!
 //! Every "Core:" verdict below is what Core v31.1's EvalScript / VerifyScript
-//! returns for the same script, flags and signatures; F1's two blocks are
-//! also replayed against a real Core v31.1 regtest node by the companion
-//! script in the PR (neon_f1_core_regtest.py).
+//! returns for the same script, flags and signatures.  F1's two blocks and
+//! the F1-F3 policy cases are also replayed against a real Core v31.1 regtest
+//! node by docs/repro/script-empty-sig-p2sh-anchor/repro.py (outputs for
+//! master and this branch are committed next to it).
 
 const std = @import("std");
 const testing = std.testing;

@@ -2531,8 +2531,8 @@ pub const ScriptEngine = struct {
 
             // Errors from verifySignature (DER/LOW_S/encoding) must propagate,
             // only treat verification failure (false return) as non-match.
-            // Encoding checks above already fired; verifySignature will re-check
-            // them for non-empty sigs (idempotent) and skip them for empty sigs.
+            // Encoding checks above already fired; verifySignature re-checks
+            // them in the same order (idempotent), for empty sigs too.
             const valid = try self.verifySignature(cur_sig, cur_key);
             if (valid) {
                 sig_idx += 1;
@@ -5948,7 +5948,7 @@ test "BIP-65 gate-1: CLTV flag off → NOP, no error" {
     try engine.execute(&s); // must not fail
 }
 
-// --- CLTV gate 2: flag off + discourage_upgradable_nops → DiscourageUpgradableNops ---
+// --- CLTV gate 2: flag off + discourage_upgradable_nops → plain NOP2 (Core) ---
 test "BIP-65 gate-2: CLTV flag off + DISCOURAGE_UPGRADABLE_NOPS → plain NOP2, not discouraged (Core)" {
     // Core interpreter.cpp `case OP_CHECKLOCKTIMEVERIFY`: with the flag off it
     // is `break` (a NOP2); only NOP1 and NOP4..NOP10 consult
@@ -6296,7 +6296,7 @@ test "BIP-112 gate-9: CSV flag off → NOP, no error" {
     try engine.execute(&s); // must not fail
 }
 
-// --- CSV gate 10: flag off + discourage_upgradable_nops → error ---
+// --- CSV gate 10: flag off + discourage_upgradable_nops → plain NOP3 (Core) ---
 test "BIP-112 gate-10: CSV flag off + DISCOURAGE_UPGRADABLE_NOPS → plain NOP3, not discouraged (Core)" {
     // Core interpreter.cpp `case OP_CHECKSEQUENCEVERIFY`: with the flag off it
     // is `break` (a NOP3), never discouraged.  The old assertion here pinned
