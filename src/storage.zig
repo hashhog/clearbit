@@ -6803,11 +6803,13 @@ pub const ChainState = struct {
     /// With pruning ON, clearbit's pruners (`pruneToTarget`, `pruneToHeight`)
     /// delete each pruned height's CF_BLOCK_UNDO record together with its
     /// CF_BLOCKS body, as Core unlinks the rev file with the blk file
-    /// (`UnlinkPrunedFiles`).  Undo below the prune watermark is therefore
-    /// gone, and a disconnect walk cannot cross it.  The pruners never delete
-    /// above `best_height - MIN_BLOCKS_TO_KEEP`, so 288 is the retention
-    /// floor: the depth to which this node is guaranteed to still have the
-    /// undo (and bodies) a reorg needs.  That is why the cap is 288 when
+    /// (`UnlinkPrunedFiles`).  Undo at or below the prune watermark is
+    /// therefore gone, and a disconnect walk cannot cross it.  The pruners
+    /// never delete above `best_height - MIN_BLOCKS_TO_KEEP` (the tip they
+    /// read under cs_main), so 288 is the retention floor: the depth below
+    /// that tip to which the undo (and bodies) a reorg needs are kept.  A
+    /// later invalidateblock that lowers the tip can leave less than 288
+    /// below the new tip.  That is why the cap is 288 when
     /// pruning is enabled; it also bounds the in-memory reorg batch.  With
     /// pruning OFF (`prune_target_mib == 0`, the default archive config)
     /// nothing is deleted, undo exists at any depth, and the cap is lifted
