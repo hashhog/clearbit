@@ -5250,8 +5250,25 @@ pub const ChainState = struct {
     /// the day a CF_BLOCKS populator lands. The `prune_height`
     /// watermark advances regardless so getblock RPC reflects the
     /// pruning policy.
+    ///
+    /// Takes cs_main (`connect_mutex`) for the whole sweep.  The caller is
+    /// the MAIN thread (main.zig, every 60 s) while the P2P thread connects
+    /// and disconnects blocks and RPC `invalidateblock` walks the tip down,
+    /// all under cs_main.  Without the lock the sweep worked from a stale
+    /// `best_height`: a tip lowered mid-sweep left it deleting blocks that
+    /// were now inside the MIN_BLOCKS_TO_KEEP window — the bodies a <=288
+    /// reorg disconnects and NODE_NETWORK_LIMITED promises to serve.  Core
+    /// FlushStateToDisk holds LOCK(cs_main) around FindFilesToPrune and
+    /// UnlinkPrunedFiles the same way.  Bounded by MAX_PRUNE_BATCH deletes,
+    /// so the hold is short.
+    ///
+    /// Each pruned height loses its CF_BLOCK_UNDO record as well as its
+    /// body (Core UnlinkPrunedFiles removes rev files with blk files).  Undo
+    /// alone is useless: every reader of it reads the body first.
     pub fn pruneToTarget(self: *ChainState) u32 {
         if (self.prune_target_mib == 0) return 0;
+        self.connect_mutex.lock();
+        defer self.connect_mutex.unlock();
         // Bitcoin Core `-prune=1` manual-only mode (init.cpp:524 /
         // blockmanager_args.cpp:27): prune mode is on (NODE_NETWORK_LIMITED
         // advertised, getblockchaininfo.pruned=true) but the auto-prune
@@ -5290,6 +5307,7 @@ pub const ChainState = struct {
             // deletes are no-ops). Errors are non-fatal — they don't
             // corrupt the chain state, only leave stale bytes around.
             db.delete(CF_BLOCKS, &hash) catch {};
+            db.delete(CF_BLOCK_UNDO, &hash) catch {};
             self.prune_height = h;
             pruned += 1;
 
@@ -5312,9 +5330,12 @@ pub const ChainState = struct {
     /// advance the watermark.  Unlike `pruneToTarget` there is no size stop and
     /// no batch cap — the operator asked for exactly this height.  The caller
     /// clamps `target` to best_height - MIN_BLOCKS_TO_KEEP.  Returns the number
-    /// of heights pruned.
+    /// of heights pruned.  Takes cs_main (recursive; the RPC thread already
+    /// holds it) and deletes the undo record with each body, as pruneToTarget.
     pub fn pruneToHeight(self: *ChainState, target: u32) u32 {
         if (self.prune_target_mib == 0) return 0;
+        self.connect_mutex.lock();
+        defer self.connect_mutex.unlock();
         if (target <= self.prune_height) return 0;
         const db = self.utxo_set.db;
         var pruned: u32 = 0;
@@ -5323,6 +5344,7 @@ pub const ChainState = struct {
             if (db) |d| {
                 if (self.getBlockHashByHeight(h)) |hash| {
                     d.delete(CF_BLOCKS, &hash) catch {};
+                    d.delete(CF_BLOCK_UNDO, &hash) catch {};
                 }
             }
             self.prune_height = h;
@@ -6778,12 +6800,20 @@ pub const ChainState = struct {
     /// fork point is — refusing (and staying on the lower-work chain) is a
     /// Class-A consensus split.
     ///
-    /// clearbit's pruner (`pruneToTarget`) only evicts CF_BLOCKS bodies and
-    /// NEVER CF_BLOCK_UNDO, so the disconnect walk's undo is present at any
-    /// depth even under pruning.  We still retain the 288 bound when pruning
-    /// is enabled as a conservative in-memory-batch / retention guard, but
-    /// with pruning OFF (`prune_target_mib == 0`, the default archive config)
-    /// the cap is lifted entirely so deep most-work reorgs match Core.
+    /// With pruning ON, clearbit's pruners (`pruneToTarget`, `pruneToHeight`)
+    /// delete each pruned height's CF_BLOCK_UNDO record together with its
+    /// CF_BLOCKS body, as Core unlinks the rev file with the blk file
+    /// (`UnlinkPrunedFiles`).  Undo at or below the prune watermark is
+    /// therefore gone, and a disconnect walk cannot cross it.  The pruners
+    /// never delete above `best_height - MIN_BLOCKS_TO_KEEP` (the tip they
+    /// read under cs_main), so 288 is the retention floor: the depth below
+    /// that tip to which the undo (and bodies) a reorg needs are kept.  A
+    /// later invalidateblock that lowers the tip can leave less than 288
+    /// below the new tip.  That is why the cap is 288 when
+    /// pruning is enabled; it also bounds the in-memory reorg batch.  With
+    /// pruning OFF (`prune_target_mib == 0`, the default archive config)
+    /// nothing is deleted, undo exists at any depth, and the cap is lifted
+    /// entirely so deep most-work reorgs match Core.
     pub fn reorgDepthCap(self: *const ChainState) u32 {
         if (self.prune_target_mib == 0) return std.math.maxInt(u32);
         return MAX_REORG_DEPTH;
