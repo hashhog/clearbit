@@ -1046,6 +1046,7 @@ comptime {
     _ = @import("tests_tip_liveness_fix.zig"); // 2026-10-05 tip stalls + send-stall wedge (new API)
     _ = @import("tests_cmpct_rpc_mined.zig"); // BIP-152 serve + HB announce for RPC-mined blocks
     _ = @import("tests_sec_p2p_cmpct_inv.zig"); // audit 2026-10-29 H1/H2: cmpctblock gate, inv throttles
+    _ = @import("tests_neon_header_bad_version.zig"); // 2026-11-24 audit F10: obsolete nVersion refused at header receipt (bad-version)
     _ = @import("tests_p2p_loop_fairness.zig"); // 2026-11-11: one busy peer must not hold up accept and dial adoption
     _ = @import("tests_tip_lag_front_block.zig"); // at-tip DRAIN-BREAK-WEDGE lag: ask only peers that have the block
     _ = @import("tests_sec_p2p_decode_alloc.zig"); // security audit C1/C4/C5: decode allocs + leaks
