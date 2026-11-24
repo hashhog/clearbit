@@ -826,7 +826,13 @@ pub fn checkBlockHeader(
     header: *const types.BlockHeader,
     params: *const consensus.NetworkParams,
 ) ValidationError!void {
-    // 1. Proof of work: hash must meet the target specified by bits
+    // 1. Proof of work: hash must meet the target specified by bits.  Core's
+    //    CheckProofOfWorkImpl first refuses a negative, zero or overflowed
+    //    compact target (SetCompact fNegative / bnTarget == 0 / fOverflow);
+    //    bitsToTarget would otherwise truncate an overflowed one into range.
+    if (!consensus.compactTargetValid(header.bits)) {
+        return ValidationError.BadDifficulty;
+    }
     const target = consensus.bitsToTarget(header.bits);
 
     // 2. Target must not exceed PoW limit

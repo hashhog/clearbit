@@ -1162,8 +1162,27 @@ pub fn hashMeetsTarget(hash: *const types.Hash256, target: *const [32]u8) bool {
     return true; // equal
 }
 
+/// Core's compact-target sanity in CheckProofOfWorkImpl (pow.cpp): the nBits
+/// must decode (arith_uint256::SetCompact) to a target that is not negative,
+/// not zero and did not overflow 256 bits.  bitsToTarget silently drops
+/// mantissa bytes shifted past byte 31 and returns zero for a negative value,
+/// so callers that gate PoW must check this first.  The powLimit bound is
+/// separate (hashMeetsTarget(target, pow_limit)).
+pub fn compactTargetValid(bits: u32) bool {
+    const size: u32 = bits >> 24;
+    const word: u32 = bits & 0x007fffff;
+    if (word == 0) return false; // zero target (SetCompact clears the sign bit too)
+    if ((bits & 0x00800000) != 0) return false; // fNegative
+    // fOverflow, verbatim from SetCompact.
+    if (size > 34 or (word > 0xff and size > 33) or (word > 0xffff and size > 32)) return false;
+    // nSize <= 3 shifts the word right; it can become zero (bnTarget == 0).
+    if (size <= 3 and (word >> @intCast(8 * (3 - size))) == 0) return false;
+    return true;
+}
+
 /// Validate that a block hash meets the proof-of-work requirement.
 pub fn validateProofOfWork(header: *const types.BlockHeader, params: *const NetworkParams) bool {
+    if (!compactTargetValid(header.bits)) return false;
     const target = bitsToTarget(header.bits);
 
     // Check target is not above pow_limit
