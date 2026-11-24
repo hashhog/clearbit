@@ -6800,12 +6800,18 @@ pub const ChainState = struct {
     /// fork point is — refusing (and staying on the lower-work chain) is a
     /// Class-A consensus split.
     ///
-    /// clearbit's pruner (`pruneToTarget`) only evicts CF_BLOCKS bodies and
-    /// NEVER CF_BLOCK_UNDO, so the disconnect walk's undo is present at any
-    /// depth even under pruning.  We still retain the 288 bound when pruning
-    /// is enabled as a conservative in-memory-batch / retention guard, but
-    /// with pruning OFF (`prune_target_mib == 0`, the default archive config)
-    /// the cap is lifted entirely so deep most-work reorgs match Core.
+    /// With pruning ON, clearbit's pruners (`pruneToTarget`, `pruneToHeight`)
+    /// delete each pruned height's CF_BLOCK_UNDO record together with its
+    /// CF_BLOCKS body, as Core unlinks the rev file with the blk file
+    /// (`UnlinkPrunedFiles`).  Undo below the prune watermark is therefore
+    /// gone, and a disconnect walk cannot cross it.  The pruners never delete
+    /// above `best_height - MIN_BLOCKS_TO_KEEP`, so 288 is the retention
+    /// floor: the depth to which this node is guaranteed to still have the
+    /// undo (and bodies) a reorg needs.  That is why the cap is 288 when
+    /// pruning is enabled; it also bounds the in-memory reorg batch.  With
+    /// pruning OFF (`prune_target_mib == 0`, the default archive config)
+    /// nothing is deleted, undo exists at any depth, and the cap is lifted
+    /// entirely so deep most-work reorgs match Core.
     pub fn reorgDepthCap(self: *const ChainState) u32 {
         if (self.prune_target_mib == 0) return std.math.maxInt(u32);
         return MAX_REORG_DEPTH;
