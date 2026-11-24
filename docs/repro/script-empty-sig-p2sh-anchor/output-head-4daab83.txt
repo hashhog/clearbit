@@ -1,5 +1,5 @@
 bitcoind: Bitcoin Core daemon version v31.1.0 bitcoind
-clearbit: clearbit f26ba05 (this branch)
+clearbit: clearbit 4daab83 (this branch)
 scriptPubKey: 0075532102f9308a019258c31049344f85f89d5229b531c845836f99b08601f113bce036f92102c6047f9441ed7d6d3045406e95c07cd85c778e4b8cef3ca7abac09b95c709ee5210279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f8179853ae91
 case A (sig0 over OP_0-deleted scriptCode): core submitblock='block-script-verify-flag-failed (Non-canonical DER signature)' height=101 | clearbit submitblock='block-script-verify-flag-failed' height=101 | AGREE
 case B (sig0 over scriptCode with OP_0): core submitblock=None height=102 | clearbit submitblock=None height=102 | AGREE
