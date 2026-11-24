@@ -61,6 +61,11 @@ const DbState = struct {
 /// process. Deleting it before every open (as this function used to) let a
 /// second process open a live chainstate and destroy acknowledged blocks
 /// (security audit H10).
+/// Compact-on-deletion thresholds for the CFs --prune deletes from (see
+/// openDatabase): 96 deletions in any 128 consecutive entries of one SST.
+pub const PRUNE_DELS_WINDOW: usize = 128;
+pub const PRUNE_DELS_TRIGGER: usize = 96;
+
 pub fn openDatabase(path: []const u8, block_cache_mib: u64, allocator: std.mem.Allocator) storage.StorageError!storage.Database {
     var errptr: ?[*:0]u8 = null;
 
@@ -99,7 +104,26 @@ pub fn openDatabase(path: []const u8, block_cache_mib: u64, allocator: std.mem.A
     c.rocksdb_options_set_block_based_table_factory(options, block_based_options);
 
     const N_CF: usize = cf_names.len; // 8 as of 2026-05-05 (CF_BLOCK_FILTER + CF_BLOCK_FILTER_HEADER added)
-    const cf_options = [_]?*c.rocksdb_options_t{options} ** N_CF;
+    // CF_BLOCKS and CF_BLOCK_UNDO are where --prune deletes in bulk.  A
+    // RocksDB delete is a tombstone; the bytes come back only when a
+    // compaction carries the tombstone down to the file holding the value.
+    // Leveled compaction is driven by level size, so a burst of prune
+    // deletes (the first sweep after enabling --prune, pruneblockchain, a
+    // pruned IBD) can sit in L0 with the deleted bodies still on disk.  The
+    // compact-on-deletion collector marks an SST for compaction when at
+    // least PRUNE_DELS_TRIGGER of any PRUNE_DELS_WINDOW consecutive entries
+    // are deletions, so RocksDB's background threads reclaim that space
+    // without a manual CompactRange on the main thread.  Steady-state at
+    // the tip (about one delete per put) stays below the trigger and keeps
+    // the normal compaction schedule.  Archive nodes never bulk-delete these
+    // CFs, so the collector never fires there.  Other CFs (UTXO) keep the
+    // shared options.
+    const prune_cf_options = c.rocksdb_options_create_copy(options);
+    defer c.rocksdb_options_destroy(prune_cf_options);
+    c.rocksdb_options_add_compact_on_deletion_collector_factory(prune_cf_options, PRUNE_DELS_WINDOW, PRUNE_DELS_TRIGGER);
+    var cf_options = [_]?*c.rocksdb_options_t{options} ** N_CF;
+    cf_options[storage.CF_BLOCKS] = prune_cf_options;
+    cf_options[storage.CF_BLOCK_UNDO] = prune_cf_options;
     var cf_handles: [N_CF]?*c.rocksdb_column_family_handle_t = undefined;
 
     const path_z = allocator.dupeZ(u8, path) catch return storage.StorageError.OutOfMemory;
