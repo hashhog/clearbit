@@ -25,6 +25,7 @@ comptime {
     _ = @import("chainwork.zig");
     _ = @import("historical_backfill.zig");
     _ = @import("tests_backfill_peer_safety.zig"); // fix-clearbit-backfill-peer-safety
+    _ = @import("tests_prune_chain_lock.zig"); // investigate-clearbit-prune-race
     _ = @import("tests_sec_metrics_bind.zig"); // security audit H7: metrics bind, timeout, routes
 }
 
