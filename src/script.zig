@@ -1548,7 +1548,12 @@ pub const ScriptEngine = struct {
                         // mainnet (TRUC v3 ephemeral anchor outputs) so it
                         // must NOT be tripped by the discourage gate. P2A
                         // is witversion=1 + program 0x4e73 (2 bytes).
-                        if (!(wp.version == 1 and wp.program.len == 2 and
+                        // Only the NATIVE anchor is exempt: Core's branch is
+                        // `!is_p2sh && IsPayToAnchor(...)` (interpreter.cpp
+                        // VerifyWitnessProgram); a P2SH-wrapped anchor falls
+                        // to the generic arm and is discouraged like any
+                        // other unknown witness program.
+                        if (via_p2sh or !(wp.version == 1 and wp.program.len == 2 and
                             wp.program[0] == 0x4e and wp.program[1] == 0x73))
                         {
                             return ScriptError.WitnessProgramMismatch;
@@ -2234,10 +2239,12 @@ pub const ScriptEngine = struct {
             // Locktime
             .op_checklocktimeverify => {
                 if (!self.flags.verify_checklocktimeverify) {
-                    if (self.flags.discourage_upgradable_nops) {
-                        return ScriptError.DiscourageUpgradableNops;
-                    }
-                    return; // NOP behavior
+                    // Not enabled: a plain NOP2. Core does NOT consult
+                    // DISCOURAGE_UPGRADABLE_NOPS here (interpreter.cpp
+                    // `case OP_CHECKLOCKTIMEVERIFY: if (!(flags &
+                    // SCRIPT_VERIFY_CHECKLOCKTIMEVERIFY)) break;`); only
+                    // NOP1 and NOP4..NOP10 are discouraged.
+                    return;
                 }
 
                 const data = try self.peek(); // Don't pop
@@ -2270,10 +2277,9 @@ pub const ScriptEngine = struct {
 
             .op_checksequenceverify => {
                 if (!self.flags.verify_checksequenceverify) {
-                    if (self.flags.discourage_upgradable_nops) {
-                        return ScriptError.DiscourageUpgradableNops;
-                    }
-                    return; // NOP behavior
+                    // Not enabled: a plain NOP3, never discouraged (Core
+                    // interpreter.cpp `case OP_CHECKSEQUENCEVERIFY`).
+                    return;
                 }
 
                 const data = try self.peek(); // Don't pop
@@ -2433,7 +2439,13 @@ pub const ScriptEngine = struct {
                 var cur = self.allocator.dupe(u8, truncated) catch return ScriptError.OutOfMemory;
                 for (0..n_sigs) |i| {
                     const s = sigs[i];
-                    if (s.len == 0) continue;
+                    // An EMPTY signature is not skipped: Core runs
+                    // FindAndDelete(scriptCode, CScript() << vchSig) for it
+                    // too, and `CScript() << {}` is the single byte 0x00
+                    // (OP_0), so every opcode-aligned OP_0 is removed from
+                    // the scriptCode the other signatures are hashed over
+                    // (and CONST_SCRIPTCODE fails if one was present).
+                    // pushEncode("") == {0x00}, matching that encoding.
                     const push_sig = pushEncode(self.allocator, s) catch {
                         self.allocator.free(cur);
                         return ScriptError.OutOfMemory;
@@ -2479,8 +2491,9 @@ pub const ScriptEngine = struct {
             // CheckSignatureEncoding returns true for empty sigs, so sig encoding
             // checks are only enforced for non-empty sigs.  But CheckPubKeyEncoding
             // fires unconditionally for every (sig, key) pair iterated — even when
-            // the sig is empty.  verifySignature() returns false early for empty sigs
-            // (skipping pubkey checks), so we must enforce them here explicitly.
+            // the sig is empty.  verifySignature() now applies the same checks in
+            // the same order before its empty-sig `return false`, so running them
+            // here first is redundant but harmless (same verdict, same error).
 
             const cur_sig = sigs[sig_idx];
             const cur_key = pubkeys[key_idx];
@@ -2552,13 +2565,15 @@ pub const ScriptEngine = struct {
     }
 
     fn verifySignature(self: *ScriptEngine, sig: []const u8, pubkey: []const u8) !bool {
-        // Empty signature: allowed by CheckSignatureEncoding (returns true) but always
-        // fails crypto verification.  Encoding checks below are skipped for empty sigs
-        // exactly as Core does (CheckSignatureEncoding returns early for size==0).
-        // NOTE: pubkey encoding checks (STRICTENC / WITNESS_PUBKEYTYPE) ARE still
-        // enforced even for empty sigs when called from CHECKMULTISIG — the caller
-        // (executeCheckMultisig) handles that path directly.
-        if (sig.len == 0) return false;
+        // Empty signature: Core's EvalChecksigPreTapscript has NO early exit for
+        // it.  It still runs FindAndDelete(scriptCode, CScript() << vchSig) --
+        // `CScript() << {}` is OP_0, so CONST_SCRIPTCODE fails when the
+        // scriptCode holds an OP_0 -- then CheckSignatureEncoding (which passes
+        // an empty sig) and CheckPubKeyEncoding (STRICTENC / WITNESS_PUBKEYTYPE,
+        // enforced whatever the sig).  Only the crypto check is skipped: an
+        // empty sig never verifies.  So the sig-encoding checks below are gated
+        // on a non-empty sig, and the empty-sig `return false` comes after the
+        // pubkey checks.
 
         // SCRIPT_VERIFY_CONST_SCRIPTCODE — FindAndDelete reject (interpreter.cpp:329-333).
         // In pre-segwit (BASE) scripts Core drops the signature from the scriptCode via
@@ -2589,33 +2604,34 @@ pub const ScriptEngine = struct {
             }
         }
 
-        // DER signature encoding validation — Core: CheckSignatureEncoding (line 207).
-        // Must come BEFORE pubkey check (matches Core's ordering in EvalChecksigPreTapscript
-        // line 335: CheckSignatureEncoding first, CheckPubKeyEncoding second).
-        if (self.flags.verify_dersig or self.flags.verify_low_s or self.flags.verify_strictenc) {
-            if (!isValidSignatureEncoding(sig)) {
-                return ScriptError.InvalidSignatureEncoding;
+        // CheckSignatureEncoding returns true for an empty sig (interpreter.cpp
+        // `if (vchSig.size() == 0) return true;`), so these run only for a
+        // non-empty one.
+        if (sig.len > 0) {
+            // DER signature encoding validation — Core: CheckSignatureEncoding (line 207).
+            // Must come BEFORE pubkey check (matches Core's ordering in EvalChecksigPreTapscript
+            // line 335: CheckSignatureEncoding first, CheckPubKeyEncoding second).
+            if (self.flags.verify_dersig or self.flags.verify_low_s or self.flags.verify_strictenc) {
+                if (!isValidSignatureEncoding(sig)) {
+                    return ScriptError.InvalidSignatureEncoding;
+                }
             }
-        }
 
-        // Low-S check (BIP-62 rule 5 / BIP-146) — Core: IsLowDERSignature, sets
-        // SCRIPT_ERR_SIG_HIGH_S.  Must come after DER check (requires valid DER to parse).
-        if (self.flags.verify_low_s) {
-            const sig_data_for_low_s = sig[0 .. sig.len - 1];
-            if (!(crypto.isLowDERSignatureChecked(sig_data_for_low_s) catch return ScriptError.InternalError)) {
-                return ScriptError.SigHighS;
+            // Low-S check (BIP-62 rule 5 / BIP-146) — Core: IsLowDERSignature, sets
+            // SCRIPT_ERR_SIG_HIGH_S.  Must come after DER check (requires valid DER to parse).
+            if (self.flags.verify_low_s) {
+                const sig_data_for_low_s = sig[0 .. sig.len - 1];
+                if (!(crypto.isLowDERSignatureChecked(sig_data_for_low_s) catch return ScriptError.InternalError)) {
+                    return ScriptError.SigHighS;
+                }
             }
-        }
 
-        // Extract hash type from last byte
-        const hash_type = sig[sig.len - 1];
-        const sig_data = sig[0 .. sig.len - 1];
-
-        // STRICTENC: check hashtype validity (low bits without SIGHASH_ANYONECANPAY must be 1-3)
-        // Core: IsDefinedHashtypeSignature, sets SCRIPT_ERR_SIG_HASHTYPE.
-        if (self.flags.verify_strictenc) {
-            if (!isDefinedHashtype(hash_type)) {
-                return ScriptError.InvalidSigHashType;
+            // STRICTENC: check hashtype validity (low bits without SIGHASH_ANYONECANPAY must be 1-3)
+            // Core: IsDefinedHashtypeSignature, sets SCRIPT_ERR_SIG_HASHTYPE.
+            if (self.flags.verify_strictenc) {
+                if (!isDefinedHashtype(sig[sig.len - 1])) {
+                    return ScriptError.InvalidSigHashType;
+                }
             }
         }
 
@@ -2634,6 +2650,14 @@ pub const ScriptEngine = struct {
                 return ScriptError.InvalidPubkeyType;
             }
         }
+
+        // An empty signature never verifies (Core: CheckECDSASignature returns
+        // false for an empty vchSig).  Every encoding check above has run.
+        if (sig.len == 0) return false;
+
+        // Extract hash type from last byte
+        const hash_type = sig[sig.len - 1];
+        const sig_data = sig[0 .. sig.len - 1];
 
         // Compute sighash using the script_pubkey_for_sighash set during verify().
         // OP_CODESEPARATOR: the scriptCode is `CScript(pbegincodehash, pend)` —
