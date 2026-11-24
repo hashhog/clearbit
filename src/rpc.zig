@@ -11152,6 +11152,12 @@ pub const RpcServer = struct {
             .mtp_violation => return self.jsonRpcError(RPC_VERIFY_ERROR, "time-too-old", id),
             .timewarp => return self.jsonRpcError(RPC_VERIFY_ERROR, "time-timewarp-attack", id),
             .bad_diffbits => return self.jsonRpcError(RPC_VERIFY_ERROR, "bad-diffbits", id),
+            .bad_version => {
+                // Core: strprintf("bad-version(0x%08x)", block.nVersion).
+                var vbuf: [32]u8 = undefined;
+                const reason = std.fmt.bufPrint(&vbuf, "bad-version(0x{x:0>8})", .{@as(u32, @bitCast(header.version))}) catch "bad-version";
+                return self.jsonRpcError(RPC_VERIFY_ERROR, reason, id);
+            },
         }
 
         // ── Step 6: admit into the block index (Core AcceptBlockHeader) ─────
