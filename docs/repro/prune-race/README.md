@@ -15,14 +15,20 @@ serialised with the walk (both under cs_main) can only end in one of two states:
 
 Any other end state means the sweep read a tip that the walk was still moving.
 
-`output/` is the recorded run from 2026-11-24, ReleaseFast binaries of master
-6510c80 (`base`) and of this branch's fix commit b8eb835 (`head`):
+Run it in a local scratch workdir of your own (not committed), once per
+binary, then summarise both runs:
 
 ```
-base: interleaved rounds 5/5   (5x "Failed to disconnect block"; watermark above the tip in 2)
-head: interleaved rounds 0/5   (5x invalidateblock ok, tip = X-1, watermark unchanged)
+python3 prune_race_regtest.py <base-clearbit-bin> <workdir> base 5
+python3 prune_race_regtest.py <head-clearbit-bin> <workdir> head 5
+python3 analyze_stress.py <workdir>/summary-base.json <workdir>/summary-head.json
 ```
 
-The 60 s tick fell inside the `invalidateblock` window in 5/5 base rounds and
-4/5 head rounds (`output/analysis.txt`; the window is computed from the tick
-schedule, since a pruner with nothing to delete prints nothing).
+The script writes `datadir-<label>/`, `node-<label>.log` and
+`summary-<label>.json` under `<workdir>`; delete the workdir when done. The
+2026-11-24 runs used ReleaseFast builds (`zig build -Doptimize=ReleaseFast`).
+On a binary with the race, rounds end INTERLEAVED
+(`invalidateblock` fails with "Failed to disconnect block", sometimes with the
+watermark above the tip); with the pruners under cs_main every round ends
+prune-first or walk-first. The tick window is computed from the tick
+schedule, since a pruner with nothing to delete prints nothing.

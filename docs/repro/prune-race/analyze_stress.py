@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Summarise stress/summary-<label>.json from prune_race_regtest.py.
+"""Summarise <workdir>/summary-<label>.json from prune_race_regtest.py.
 
 Per round, a pruner serialised with invalidateblock (both under cs_main) can
 only end in one of two states:
