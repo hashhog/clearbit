@@ -1,0 +1,9 @@
+bitcoind: Bitcoin Core daemon version v31.1.0 bitcoind
+clearbit: clearbit 1ac29f4 (master)
+submitheader nVersion=1 height=1: core=bad-version(0x00000001) | clearbit=null | VERDICT SPLIT
+submitheader nVersion=2 height=1: core=bad-version(0x00000002) | clearbit=null | VERDICT SPLIT
+submitheader nVersion=3 height=1: core=bad-version(0x00000003) | clearbit=null | VERDICT SPLIT
+control submitheader nVersion=4 height=1: core=null | clearbit=null | SAME
+side branch bad-diffbits (nBits 0x207ffffe): core='bad-diffbits' clearbit='bad-diffbits'; core='prev-blk-not-found' clearbit='prev-blk-not-found'; core='prev-blk-not-found' clearbit='prev-blk-not-found' | tip core=71ee8ca2191f80c5 clearbit=71ee8ca2191f80c5 | SAME TIP
+side branch time-too-new (nTime now+3h): core='time-too-new' clearbit='time-too-new'; core='prev-blk-not-found' clearbit='prev-blk-not-found'; core='prev-blk-not-found' clearbit='prev-blk-not-found' | tip core=71ee8ca2191f80c5 clearbit=71ee8ca2191f80c5 | SAME TIP
+RESULT: VERDICT SPLIT

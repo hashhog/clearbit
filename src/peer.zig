@@ -12205,6 +12205,10 @@ pub const PeerManager = struct {
         /// block of a difficulty period is more than MAX_TIMEWARP seconds
         /// earlier than its parent (validation.cpp:4097-4105).
         timewarp,
+        /// nVersion obsolete for the height (< 2 after BIP34, < 3 after BIP66,
+        /// < 4 after BIP65): Core's "bad-version(0x%08x)", the last gate of
+        /// ContextualCheckBlockHeader (validation.cpp), BLOCK_INVALID_HEADER.
+        bad_version,
         /// WE could not evaluate the prev-relative rules — the header's parent
         /// (or an ancestor the retarget needs) is not in our view.
         ///
@@ -12590,10 +12594,9 @@ pub const PeerManager = struct {
     /// outside the batch path.
     ///
     /// bad-version note: gate (5) is Core's LAST check, so a bad-version-only
-    /// header can never mask an earlier verdict.  clearbit has never enforced
-    /// it at header-receipt time (it IS enforced on the block-body path via the
-    /// same function), and this wave deliberately does not change that: the
-    /// verdict is mapped to `.ok` so this fix stays scoped to bad-diffbits.
+    /// header can never mask an earlier verdict.  Core runs it for every
+    /// header (AcceptBlockHeader -> ContextualCheckBlockHeader), so it is
+    /// enforced here too (`.bad_version`), not only on the block-body path.
     pub fn validateHeaderContextualStrict(
         self: *PeerManager,
         header: *const types.BlockHeader,
@@ -12645,8 +12648,8 @@ pub const PeerManager = struct {
                 error.BadTimestamp => .mtp_violation,
                 error.TimewarpAttack => .timewarp,
                 error.FutureTimestamp => .future_time,
-                // See the bad-version note above: not enforced at header time.
-                error.BadVersion => .ok,
+                // See the bad-version note above.
+                error.BadVersion => .bad_version,
                 else => .undecidable,
             };
         };
@@ -12801,6 +12804,8 @@ pub const PeerManager = struct {
             .mtp_violation => peer.misbehaving(50, "header timestamp violates MTP (BIP-113)"),
             .timewarp => peer.misbehaving(100, "header violates BIP-94 timewarp rule (time-timewarp-attack)"),
             .bad_diffbits => peer.misbehaving(100, "header nBits does not match required difficulty (bad-diffbits)"),
+            // Core: BLOCK_INVALID_HEADER -> Misbehaving (MaybePunishNodeForBlock).
+            .bad_version => peer.misbehaving(100, "header nVersion obsolete for its height (bad-version)"),
         }
     }
 
