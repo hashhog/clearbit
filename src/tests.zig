@@ -1053,6 +1053,7 @@ comptime {
     _ = @import("tests_sec_p2p_block_buffer.zig"); // security audit C5: mutated bodies refused on receipt, block_buffer byte cap
     _ = @import("tests_mtp_bip68.zig"); // 2026-10-05 mempool MTP / BIP68 + MTP ring rewind (base-comparable)
     _ = @import("tests_mtp_bip68_fix.zig"); // 2026-10-05 mempool MTP / BIP68 (new API: removeForReorg, tipMtp)
+    _ = @import("tests_neon_bip68_version.zig"); // 2026-11-24 audit F7: BIP-68 version compared unsigned in the height-only sequence-lock arm
     _ = @import("mempool.zig");
     _ = @import("tests_unbroadcast.zig"); // unbroadcast set (Core m_unbroadcast_txids)
     _ = @import("tests_sec_wallet_files_perms.zig"); // security audit H8/H9/H11: datadir paths, private umask + wallet modes, label escaping

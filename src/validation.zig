@@ -2917,7 +2917,8 @@ test "bip68VersionActive compares version unsigned (Core uint32_t)" {
 /// cannot be evaluated without an MTP source, and skipping it false-accepts
 /// (w132 G15).  Reference: Core tx_verify.cpp:41-55 (lock applicability).
 pub fn txHasTimeBasedLock(tx: *const types.Transaction) bool {
-    if (tx.version < 2) return false;
+    // Unsigned, like Core's uint32_t version (see bip68VersionActive).
+    if (!bip68VersionActive(tx.version)) return false;
     for (tx.inputs) |input| {
         const seq = input.sequence;
         if ((seq & consensus.SEQUENCE_LOCKTIME_DISABLE_FLAG) != 0) continue;
