@@ -1,0 +1,5 @@
+bitcoind: Bitcoin Core daemon version v31.1.0 bitcoind
+clearbit: clearbit 1ac29f4 (master)
+submitheader nBits=0x21010001 (overflow), hash <= 2^240: core=high-hash | clearbit=bad-diffbits | REASON DIFFERS
+control submitheader nBits=0x207fffff: core=null | clearbit=null | SAME
+RESULT: NO VERDICT SPLIT

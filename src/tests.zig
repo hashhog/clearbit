@@ -1062,6 +1062,7 @@ comptime {
     _ = @import("compressor.zig"); // CompressAmount / CompressScript (Coin wire format)
     _ = @import("perf.zig");
     _ = @import("bench.zig");
+    _ = @import("tests_neon_compact_target.zig"); // 2026-11-24 audit F8: SetCompact overflow/zero/negative refused by the PoW gate (Core CheckProofOfWorkImpl)
     _ = @import("indexes.zig");
     _ = @import("v2_transport.zig");
     _ = @import("tests_sec_p2p_trickle.zig"); // security audit C3/H3: trickled v1 messages + handshake deadline

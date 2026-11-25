@@ -1,0 +1,5 @@
+bitcoind: Bitcoin Core daemon version v31.1.0 bitcoind
+clearbit: clearbit 80f7d20 (this branch)
+submitheader nBits=0x21010001 (overflow), hash <= 2^240: core=high-hash | clearbit=high-hash | SAME
+control submitheader nBits=0x207fffff: core=null | clearbit=null | SAME
+RESULT: NO VERDICT SPLIT
