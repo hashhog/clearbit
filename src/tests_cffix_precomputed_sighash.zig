@@ -265,20 +265,23 @@ fn ratio(small_total: usize, large_total: usize) f64 {
 // (A) Allocation instrument — master API only
 // ---------------------------------------------------------------------------
 
-/// Bytes allocated by the block path (single-threaded branch) verifying the
-/// fixture's N inputs.
-fn blockAllocBytes(kind: Kind, n: usize, keys: *const Keys) !usize {
+const Work = struct { alloc: usize, digest: usize };
+
+/// Bytes allocated (and, on head, whole-tx digest bytes hashed) by the block
+/// path (single-threaded branch) verifying the fixture's N inputs.
+fn blockWork(kind: Kind, n: usize, keys: *const Keys) !Work {
     const f = try buildFixture(kind, n, keys, null);
     defer destroyFixture(f);
     const blk = f.block();
     const v = f.view();
     var ca = CountingAllocator{ .child = testing.allocator };
+    const d0 = counterNow();
     const ok = try validation.verifyBlockScriptsParallel(&blk, 800_000, &consensus.MAINNET, &v, .{ .enabled = false }, ca.allocator());
     try testing.expect(ok);
-    return ca.bytes;
+    return .{ .alloc = ca.bytes, .digest = @intCast(counterNow() - d0) };
 }
 
-fn mempoolAllocBytes(kind: Kind, n: usize, keys: *const Keys) !usize {
+fn mempoolWork(kind: Kind, n: usize, keys: *const Keys) !Work {
     const f = try buildFixture(kind, n, keys, null);
     defer destroyFixture(f);
     var chain_state = storage.ChainState.init(null, 64, testing.allocator);
@@ -295,12 +298,13 @@ fn mempoolAllocBytes(kind: Kind, n: usize, keys: *const Keys) !usize {
     // measure nothing.  The corrupted-signature control below pins that this
     // path really verifies every input.
     const before = ca.bytes;
+    const d0 = counterNow();
     _ = pool.addTransaction(f.tx) catch |e| {
         std.debug.print("cffix mempool fixture rejected: {s}\n", .{@errorName(e)});
         return e;
     };
     try testing.expectEqual(@as(usize, 1), pool.entries.count());
-    return ca.bytes - before;
+    return .{ .alloc = ca.bytes - before, .digest = @intCast(counterNow() - d0) };
 }
 
 fn expectFlat(label: []const u8, small: usize, large: usize) !void {
@@ -317,25 +321,45 @@ fn expectFlat(label: []const u8, small: usize, large: usize) !void {
 test "cffix precomputed sighash: block verify, N segwit v0 inputs, allocation per input flat in N" {
     var keys = try Keys.init();
     defer keys.deinit();
-    try expectFlat("block P2WPKH alloc", try blockAllocBytes(.p2wpkh, N_SMALL, &keys), try blockAllocBytes(.p2wpkh, N_LARGE, &keys));
+    const small = try blockWork(.p2wpkh, N_SMALL, &keys);
+    const large = try blockWork(.p2wpkh, N_LARGE, &keys);
+    try expectFlat("block P2WPKH alloc", small.alloc, large.alloc);
+    // Head only: the digest counter on the same run must be flat too, so
+    // the pass comes from sharing the digests, not from cheaper rebuilds.
+    if (comptime HAS_TXDATA) try expectFlat("block P2WPKH digest", small.digest, large.digest);
 }
 
 test "cffix precomputed sighash: block verify, N taproot key-path inputs, allocation per input flat in N" {
     var keys = try Keys.init();
     defer keys.deinit();
-    try expectFlat("block P2TR alloc", try blockAllocBytes(.p2tr, N_SMALL, &keys), try blockAllocBytes(.p2tr, N_LARGE, &keys));
+    const small = try blockWork(.p2tr, N_SMALL, &keys);
+    const large = try blockWork(.p2tr, N_LARGE, &keys);
+    try expectFlat("block P2TR alloc", small.alloc, large.alloc);
+    // Head only: the digest counter on the same run must be flat too, so
+    // the pass comes from sharing the digests, not from cheaper rebuilds.
+    if (comptime HAS_TXDATA) try expectFlat("block P2TR digest", small.digest, large.digest);
 }
 
 test "cffix precomputed sighash: mempool accept, N segwit v0 inputs, allocation per input flat in N" {
     var keys = try Keys.init();
     defer keys.deinit();
-    try expectFlat("mempool P2WPKH alloc", try mempoolAllocBytes(.p2wpkh, N_SMALL, &keys), try mempoolAllocBytes(.p2wpkh, N_LARGE, &keys));
+    const small = try mempoolWork(.p2wpkh, N_SMALL, &keys);
+    const large = try mempoolWork(.p2wpkh, N_LARGE, &keys);
+    try expectFlat("mempool P2WPKH alloc", small.alloc, large.alloc);
+    // Head only: the digest counter on the same run must be flat too, so
+    // the pass comes from sharing the digests, not from cheaper rebuilds.
+    if (comptime HAS_TXDATA) try expectFlat("mempool P2WPKH digest", small.digest, large.digest);
 }
 
 test "cffix precomputed sighash: mempool accept, N taproot key-path inputs, allocation per input flat in N" {
     var keys = try Keys.init();
     defer keys.deinit();
-    try expectFlat("mempool P2TR alloc", try mempoolAllocBytes(.p2tr, N_SMALL, &keys), try mempoolAllocBytes(.p2tr, N_LARGE, &keys));
+    const small = try mempoolWork(.p2tr, N_SMALL, &keys);
+    const large = try mempoolWork(.p2tr, N_LARGE, &keys);
+    try expectFlat("mempool P2TR alloc", small.alloc, large.alloc);
+    // Head only: the digest counter on the same run must be flat too, so
+    // the pass comes from sharing the digests, not from cheaper rebuilds.
+    if (comptime HAS_TXDATA) try expectFlat("mempool P2TR digest", small.digest, large.digest);
 }
 
 // ---------------------------------------------------------------------------
