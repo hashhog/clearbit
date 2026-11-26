@@ -492,6 +492,52 @@ pub fn isFinalTx(tx: *const types.Transaction, block_height: u32, lock_time_cuto
 // Transaction Validation
 // ============================================================================
 
+/// Inputs at or below this count use the pairwise scan: at most 496
+/// comparisons, cheaper than an allocation.
+const DUP_INPUT_PAIRWISE_MAX: usize = 32;
+
+fn outpointLessThan(_: void, a: types.OutPoint, b: types.OutPoint) bool {
+    return switch (std.mem.order(u8, &a.hash, &b.hash)) {
+        .lt => true,
+        .gt => false,
+        .eq => a.index < b.index,
+    };
+}
+
+fn hasDuplicateOutpointPairwise(inputs: []const types.TxIn) bool {
+    for (inputs, 0..) |input_a, i| {
+        for (inputs[i + 1 ..]) |input_b| {
+            if (std.mem.eql(u8, &input_a.previous_output.hash, &input_b.previous_output.hash) and
+                input_a.previous_output.index == input_b.previous_output.index)
+            {
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
+/// True if two inputs spend the same outpoint (hash and index both equal).
+/// Same verdict as Core's std::set<COutPoint> insert loop: sort a copy of
+/// the outpoints and compare neighbours, O(n log n).  If the scratch copy
+/// cannot be allocated, fall back to the pairwise scan so the verdict never
+/// depends on memory pressure.
+pub fn hasDuplicateOutpoint(inputs: []const types.TxIn) bool {
+    if (inputs.len <= DUP_INPUT_PAIRWISE_MAX) return hasDuplicateOutpointPairwise(inputs);
+
+    const allocator = std.heap.c_allocator;
+    const outpoints = allocator.alloc(types.OutPoint, inputs.len) catch
+        return hasDuplicateOutpointPairwise(inputs);
+    defer allocator.free(outpoints);
+
+    for (inputs, outpoints) |input, *op| op.* = input.previous_output;
+    std.sort.pdq(types.OutPoint, outpoints, {}, outpointLessThan);
+    for (outpoints[0 .. outpoints.len - 1], outpoints[1..]) |a, b| {
+        if (std.mem.eql(u8, &a.hash, &b.hash) and a.index == b.index) return true;
+    }
+    return false;
+}
+
 /// Check transaction rules that do not require context (no UTXO lookups).
 /// These are "sanity checks" that can be performed without accessing the chain state.
 pub fn checkTransactionSanity(tx: *const types.Transaction) ValidationError!void {
@@ -516,15 +562,11 @@ pub fn checkTransactionSanity(tx: *const types.Transaction) ValidationError!void
     }
 
     // 3. Check for duplicate inputs (same outpoint)
-    for (tx.inputs, 0..) |input_a, i| {
-        for (tx.inputs[i + 1 ..]) |input_b| {
-            if (std.mem.eql(u8, &input_a.previous_output.hash, &input_b.previous_output.hash) and
-                input_a.previous_output.index == input_b.previous_output.index)
-            {
-                return ValidationError.DuplicateInput;
-            }
-        }
-    }
+    // Core: consensus/tx_check.cpp:41-44 inserts every prevout into a
+    // std::set<COutPoint> (O(n log n)).  Step 1b allows up to ~24,389 inputs,
+    // so a pairwise scan here is ~3e8 comparisons per relayed 1 MB tx, all of
+    // it under the chain+pool lock.
+    if (hasDuplicateOutpoint(tx.inputs)) return ValidationError.DuplicateInput;
 
     // 4. Coinbase-specific checks
     if (tx.isCoinbase()) {
