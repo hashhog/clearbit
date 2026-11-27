@@ -10228,6 +10228,10 @@ pub const RpcServer = struct {
                     defer if (details) |d| self.allocator.free(d);
                     return self.jsonRpcError(RPC_VERIFY_REJECTED, details orelse "bad-txns-in-belowout", id);
                 },
+                // AreInputsStandard's P2SH redeemScript sigop limit: Core's
+                // state ToString, "bad-txns-nonstandard-inputs" (no debug
+                // message), MEMPOOL_REJECTED -> RPC_TRANSACTION_REJECTED.
+                mempool_mod.MempoolError.NonStandardInputs => self.jsonRpcError(RPC_VERIFY_REJECTED, "bad-txns-nonstandard-inputs", id),
                 else => self.jsonRpcError(RPC_VERIFY_REJECTED, "transaction rejected", id),
             };
         };
@@ -25607,6 +25611,9 @@ fn rejectDetailsEqualReason(reason: []const u8) bool {
         "scriptsig-size",
         "scriptsig-not-pushonly",
         "dust",
+        // AreInputsStandard: state.Invalid(TX_INPUTS_NOT_STANDARD,
+        // "bad-txns-nonstandard-inputs") with no debug message.
+        "bad-txns-nonstandard-inputs",
     };
     for (bare) |t| if (std.mem.eql(u8, reason, t)) return true;
     return false;
