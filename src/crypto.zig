@@ -1460,68 +1460,187 @@ pub fn legacySighash(
     return hash256(data);
 }
 
-/// Precomputed hashes for BIP-143 segwit sighash optimization
-pub const SegwitSighashCache = struct {
-    hash_prevouts: Hash256,
-    hash_sequence: Hash256,
-    hash_outputs: Hash256,
+/// TEST-ONLY instrument: bytes fed to SHA-256 while building the whole-tx
+/// sighash digests (BIP-143 hashPrevouts / hashSequence / hashOutputs, BIP-341
+/// sha_prevouts / sha_amounts / sha_scriptpubkeys / sha_sequences /
+/// sha_outputs), whether built once by `PrecomputedTxData.init` or rebuilt by
+/// a sighash builder that was given no precomputed data.  Only ever touched in
+/// test builds.
+pub var test_txwide_digest_bytes = std.atomic.Value(u64).init(0);
 
-    pub fn init(tx: *const types.Transaction, allocator: std.mem.Allocator) !SegwitSighashCache {
-        _ = allocator;
-        var prevouts_data: [36 * 256]u8 = undefined; // Assuming max 256 inputs
-        var prevouts_len: usize = 0;
-        for (tx.inputs) |input| {
-            @memcpy(prevouts_data[prevouts_len..][0..32], &input.previous_output.hash);
-            std.mem.writeInt(u32, prevouts_data[prevouts_len + 32 ..][0..4], input.previous_output.index, .little);
-            prevouts_len += 36;
-        }
+pub inline fn noteTxwideDigestBytes(n: usize) void {
+    if (builtin.is_test) _ = test_txwide_digest_bytes.fetchAdd(n, .monotonic);
+}
 
-        var sequence_data: [4 * 256]u8 = undefined;
-        var sequence_len: usize = 0;
-        for (tx.inputs) |input| {
-            std.mem.writeInt(u32, sequence_data[sequence_len..][0..4], input.sequence, .little);
-            sequence_len += 4;
-        }
+fn compactSizeLen(n: usize) usize {
+    if (n < 0xFD) return 1;
+    if (n <= 0xFFFF) return 3;
+    if (n <= 0xFFFF_FFFF) return 5;
+    return 9;
+}
 
-        // For outputs, we need dynamic sizing
-        var outputs_hasher = std.crypto.hash.sha2.Sha256.init(.{});
-        for (tx.outputs) |output| {
-            var value_buf: [8]u8 = undefined;
-            std.mem.writeInt(i64, &value_buf, output.value, .little);
-            outputs_hasher.update(&value_buf);
+/// Streaming SHA-256 over a tx's whole-tx sighash fields.  Each function
+/// hashes exactly the serialization the BIP-143 / BIP-341 builders hash.
+fn shaTxPrevouts(tx: *const types.Transaction) Hash256 {
+    var h = std.crypto.hash.sha2.Sha256.init(.{});
+    for (tx.inputs) |input| {
+        h.update(&input.previous_output.hash);
+        var idx: [4]u8 = undefined;
+        std.mem.writeInt(u32, &idx, input.previous_output.index, .little);
+        h.update(&idx);
+    }
+    noteTxwideDigestBytes(36 * tx.inputs.len);
+    return h.finalResult();
+}
 
-            // CompactSize for script length (all four ranges — must match
-            // appendCompactSize / serialize.h::WriteCompactSize; the prior
-            // two-case form dropped the length entirely for scripts > 0xFFFF).
-            const spk_len = output.script_pubkey.len;
-            if (spk_len < 0xFD) {
-                outputs_hasher.update(&[_]u8{@intCast(spk_len)});
-            } else if (spk_len <= 0xFFFF) {
-                var size_buf: [3]u8 = undefined;
-                size_buf[0] = 0xFD;
-                std.mem.writeInt(u16, size_buf[1..3], @intCast(spk_len), .little);
-                outputs_hasher.update(&size_buf);
-            } else if (spk_len <= 0xFFFFFFFF) {
-                var size_buf: [5]u8 = undefined;
-                size_buf[0] = 0xFE;
-                std.mem.writeInt(u32, size_buf[1..5], @intCast(spk_len), .little);
-                outputs_hasher.update(&size_buf);
+fn shaTxSequences(tx: *const types.Transaction) Hash256 {
+    var h = std.crypto.hash.sha2.Sha256.init(.{});
+    for (tx.inputs) |input| {
+        var seq: [4]u8 = undefined;
+        std.mem.writeInt(u32, &seq, input.sequence, .little);
+        h.update(&seq);
+    }
+    noteTxwideDigestBytes(4 * tx.inputs.len);
+    return h.finalResult();
+}
+
+fn shaTxOutputs(tx: *const types.Transaction) Hash256 {
+    var h = std.crypto.hash.sha2.Sha256.init(.{});
+    var n: usize = 0;
+    for (tx.outputs) |output| {
+        var value: [8]u8 = undefined;
+        std.mem.writeInt(i64, &value, output.value, .little);
+        h.update(&value);
+        appendCompactSize(&h, output.script_pubkey.len);
+        n += 8 + compactSizeLen(output.script_pubkey.len);
+        h.update(output.script_pubkey);
+        n += output.script_pubkey.len;
+    }
+    noteTxwideDigestBytes(n);
+    return h.finalResult();
+}
+
+fn shaSpentAmounts(spent_amounts: []const i64) Hash256 {
+    var h = std.crypto.hash.sha2.Sha256.init(.{});
+    for (spent_amounts) |amount| {
+        var value: [8]u8 = undefined;
+        std.mem.writeInt(i64, &value, amount, .little);
+        h.update(&value);
+    }
+    noteTxwideDigestBytes(8 * spent_amounts.len);
+    return h.finalResult();
+}
+
+fn shaSpentScripts(spent_scripts: []const []const u8) Hash256 {
+    var h = std.crypto.hash.sha2.Sha256.init(.{});
+    var n: usize = 0;
+    for (spent_scripts) |spk| {
+        appendCompactSize(&h, spk.len);
+        n += compactSizeLen(spk.len);
+        h.update(spk);
+        n += spk.len;
+    }
+    noteTxwideDigestBytes(n);
+    return h.finalResult();
+}
+
+/// Whole-transaction sighash digests, computed once per transaction and shared
+/// by every signature check of every input of that transaction.  Mirrors
+/// Core's `PrecomputedTransactionData::Init` (script/interpreter.cpp:1403-1460):
+///
+///   - The BIP-341 single-SHA256 digests (`m_prevouts_single_hash`,
+///     `m_sequences_single_hash`, `m_outputs_single_hash`,
+///     `m_spent_amounts_single_hash`, `m_spent_scripts_single_hash`) are built
+///     when some input with a witness spends a P2TR output and the spent
+///     outputs are known.
+///   - The BIP-143 digests (`hashPrevouts`, `hashSequence`, `hashOutputs`) are
+///     SHA256 of those single hashes (Core `SHA256Uint256`), built when some
+///     input with a witness spends anything else (or the spent outputs are
+///     unknown).
+///
+/// A builder handed a `PrecomputedTxData` whose relevant half is not ready
+/// computes that digest from the transaction itself, as Core's
+/// `SignatureHash` does when `cache->m_bip143_segwit_ready` is false, so the
+/// digest never depends on whether the cache was used.
+///
+/// The struct is plain data (no allocation, no pointers into the tx), so one
+/// instance built on the submitting thread can be read by every script-check
+/// worker.  It must be built from the same transaction and the same
+/// `spent_amounts` / `spent_scripts` slices that the checks are given.
+pub const PrecomputedTxData = struct {
+    prevouts_single_hash: Hash256 = [_]u8{0} ** 32,
+    sequences_single_hash: Hash256 = [_]u8{0} ** 32,
+    outputs_single_hash: Hash256 = [_]u8{0} ** 32,
+    spent_amounts_single_hash: Hash256 = [_]u8{0} ** 32,
+    spent_scripts_single_hash: Hash256 = [_]u8{0} ** 32,
+    hash_prevouts: Hash256 = [_]u8{0} ** 32,
+    hash_sequence: Hash256 = [_]u8{0} ** 32,
+    hash_outputs: Hash256 = [_]u8{0} ** 32,
+    /// Shape of the tx the digests were built for.  A builder only uses the
+    /// digests when the tx it is given has the same shape (cheap guard against
+    /// handing one tx's data to another).
+    n_inputs: usize = 0,
+    n_outputs: usize = 0,
+    bip143_ready: bool = false,
+    bip341_ready: bool = false,
+
+    /// `spent_amounts` / `spent_scripts` are the values and scriptPubKeys of
+    /// the outputs spent by `tx.inputs[i]`; pass empty slices when unknown
+    /// (then only the BIP-143 half can be ready, as in Core).
+    pub fn init(
+        tx: *const types.Transaction,
+        spent_amounts: []const i64,
+        spent_scripts: []const []const u8,
+    ) PrecomputedTxData {
+        var self = PrecomputedTxData{ .n_inputs = tx.inputs.len, .n_outputs = tx.outputs.len };
+        const spent_ready = spent_amounts.len == tx.inputs.len and spent_scripts.len == tx.inputs.len;
+
+        var uses_bip143 = false;
+        var uses_bip341 = false;
+        for (tx.inputs, 0..) |input, i| {
+            if (uses_bip143 and uses_bip341) break;
+            if (input.witness.len == 0) continue; // Core: scriptWitness.IsNull()
+            const spk: []const u8 = if (spent_ready) spent_scripts[i] else &.{};
+            if (spent_ready and spk.len == 34 and spk[0] == 0x51) {
+                uses_bip341 = true;
             } else {
-                var size_buf: [9]u8 = undefined;
-                size_buf[0] = 0xFF;
-                std.mem.writeInt(u64, size_buf[1..9], spk_len, .little);
-                outputs_hasher.update(&size_buf);
+                uses_bip143 = true;
             }
-            outputs_hasher.update(output.script_pubkey);
         }
-        var first_hash: Hash256 = undefined;
-        outputs_hasher.final(&first_hash);
 
-        return .{
-            .hash_prevouts = hash256(prevouts_data[0..prevouts_len]),
-            .hash_sequence = hash256(sequence_data[0..sequence_len]),
-            .hash_outputs = hash256(&first_hash),
-        };
+        if (uses_bip143 or uses_bip341) {
+            self.prevouts_single_hash = shaTxPrevouts(tx);
+            self.sequences_single_hash = shaTxSequences(tx);
+            self.outputs_single_hash = shaTxOutputs(tx);
+        }
+        if (uses_bip143) {
+            self.hash_prevouts = sha256(&self.prevouts_single_hash);
+            self.hash_sequence = sha256(&self.sequences_single_hash);
+            self.hash_outputs = sha256(&self.outputs_single_hash);
+            self.bip143_ready = true;
+        }
+        if (uses_bip341 and spent_ready) {
+            self.spent_amounts_single_hash = shaSpentAmounts(spent_amounts);
+            self.spent_scripts_single_hash = shaSpentScripts(spent_scripts);
+            self.bip341_ready = true;
+        }
+        return self;
+    }
+
+    pub fn fitsTx(self: *const PrecomputedTxData, tx: *const types.Transaction) bool {
+        return self.n_inputs == tx.inputs.len and self.n_outputs == tx.outputs.len;
+    }
+
+    /// The BIP-143 half, if ready for `tx`.
+    pub fn bip143For(txdata: ?*const PrecomputedTxData, tx: *const types.Transaction) ?*const PrecomputedTxData {
+        const t = txdata orelse return null;
+        return if (t.bip143_ready and t.fitsTx(tx)) t else null;
+    }
+
+    /// The BIP-341 half, if ready for `tx`.
+    pub fn bip341For(txdata: ?*const PrecomputedTxData, tx: *const types.Transaction) ?*const PrecomputedTxData {
+        const t = txdata orelse return null;
+        return if (t.bip341_ready and t.fitsTx(tx)) t else null;
     }
 };
 
@@ -1559,7 +1678,8 @@ fn appendCompactSizeList(list: *std.ArrayList(u8), value: u64) !void {
 }
 
 /// Compute BIP-143 segwit sighash for signature verification.
-/// This is used for P2WPKH and P2WSH inputs.
+/// This is used for P2WPKH and P2WSH inputs.  Rebuilds the whole-tx digests;
+/// script checks use `segwitSighashTxData` with the tx's `PrecomputedTxData`.
 pub fn segwitSighash(
     tx: *const types.Transaction,
     input_index: usize,
@@ -1568,6 +1688,23 @@ pub fn segwitSighash(
     hash_type: u32,
     allocator: std.mem.Allocator,
 ) !Hash256 {
+    return segwitSighashTxData(tx, input_index, script_code, value, hash_type, allocator, null);
+}
+
+/// BIP-143 sighash taking hashPrevouts / hashSequence / hashOutputs from
+/// `txdata` when its BIP-143 half is ready for `tx` (Core `SignatureHash`
+/// with `cache->m_bip143_segwit_ready`, interpreter.cpp:1607-1625), else
+/// computing them from `tx`.  The preimage is byte-identical either way.
+pub fn segwitSighashTxData(
+    tx: *const types.Transaction,
+    input_index: usize,
+    script_code: []const u8,
+    value: i64,
+    hash_type: u32,
+    allocator: std.mem.Allocator,
+    txdata: ?*const PrecomputedTxData,
+) !Hash256 {
+    const cache = PrecomputedTxData.bip143For(txdata, tx);
     var writer = serialize.Writer.init(allocator);
     defer writer.deinit();
 
@@ -1578,7 +1715,9 @@ pub fn segwitSighash(
     try writer.writeInt(i32, tx.version);
 
     // 2. hashPrevouts (32 bytes)
-    if (!anyone_can_pay) {
+    if (!anyone_can_pay and cache != null) {
+        try writer.writeBytes(&cache.?.hash_prevouts);
+    } else if (!anyone_can_pay) {
         var prevouts_data = std.ArrayList(u8).init(allocator);
         defer prevouts_data.deinit();
         for (tx.inputs) |input| {
@@ -1587,6 +1726,7 @@ pub fn segwitSighash(
             std.mem.writeInt(u32, &idx_buf, input.previous_output.index, .little);
             try prevouts_data.appendSlice(&idx_buf);
         }
+        noteTxwideDigestBytes(prevouts_data.items.len);
         const hash_prevouts = hash256(prevouts_data.items);
         try writer.writeBytes(&hash_prevouts);
     } else {
@@ -1594,7 +1734,9 @@ pub fn segwitSighash(
     }
 
     // 3. hashSequence (32 bytes)
-    if (!anyone_can_pay and base_type != 0x02 and base_type != 0x03) {
+    if (!anyone_can_pay and base_type != 0x02 and base_type != 0x03 and cache != null) {
+        try writer.writeBytes(&cache.?.hash_sequence);
+    } else if (!anyone_can_pay and base_type != 0x02 and base_type != 0x03) {
         var sequence_data = std.ArrayList(u8).init(allocator);
         defer sequence_data.deinit();
         for (tx.inputs) |input| {
@@ -1602,6 +1744,7 @@ pub fn segwitSighash(
             std.mem.writeInt(u32, &seq_buf, input.sequence, .little);
             try sequence_data.appendSlice(&seq_buf);
         }
+        noteTxwideDigestBytes(sequence_data.items.len);
         const hash_sequence = hash256(sequence_data.items);
         try writer.writeBytes(&hash_sequence);
     } else {
@@ -1624,7 +1767,9 @@ pub fn segwitSighash(
     try writer.writeInt(u32, input.sequence);
 
     // 8. hashOutputs (32 bytes)
-    if (base_type != 0x02 and base_type != 0x03) {
+    if (base_type != 0x02 and base_type != 0x03 and cache != null) {
+        try writer.writeBytes(&cache.?.hash_outputs);
+    } else if (base_type != 0x02 and base_type != 0x03) {
         // SIGHASH_ALL: hash all outputs
         var outputs_data = std.ArrayList(u8).init(allocator);
         defer outputs_data.deinit();
@@ -1637,6 +1782,7 @@ pub fn segwitSighash(
             try appendCompactSizeList(&outputs_data, output.script_pubkey.len);
             try outputs_data.appendSlice(output.script_pubkey);
         }
+        noteTxwideDigestBytes(outputs_data.items.len);
         const hash_outputs = hash256(outputs_data.items);
         try writer.writeBytes(&hash_outputs);
     } else if (base_type == 0x03 and input_index < tx.outputs.len) {

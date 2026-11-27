@@ -823,6 +823,13 @@ pub const ScriptEngine = struct {
     spent_amounts: []const i64,
     spent_scripts: []const []const u8,
 
+    /// Whole-tx sighash digests shared by every input of `tx` (Core's
+    /// `PrecomputedTransactionData`, held by every CScriptCheck of the tx).
+    /// Built once per tx by the caller from the same tx and the same
+    /// `spent_amounts` / `spent_scripts`; null = each signature check
+    /// rebuilds them (same digest, O(tx size) more hashing per check).
+    txdata: ?*const crypto.PrecomputedTxData = null,
+
     /// CHECKMULTISIG (BASE / SegWit-v0) scriptCode override. Core's
     /// OP_CHECKMULTISIG removes EVERY signature from the codesep-truncated
     /// scriptCode via FindAndDelete (in BASE) BEFORE verifying any sig, and
@@ -1422,7 +1429,7 @@ pub const ScriptEngine = struct {
                             .scripts = self.spent_scripts,
                         };
 
-                        const sighash = taproot_sighash.computeTaprootSighash(
+                        const sighash = taproot_sighash.computeTaprootSighashTxData(
                             self.allocator,
                             self.tx,
                             self.input_index,
@@ -1430,6 +1437,7 @@ pub const ScriptEngine = struct {
                             hash_type,
                             self.taproot_annex,
                             null, // ext_flag = 0 (key-path)
+                            self.txdata,
                         ) catch |e| return sighashFailure(e);
 
                         var xonly: [32]u8 = undefined;
@@ -1602,10 +1610,26 @@ pub const ScriptEngine = struct {
         self.stack.append(data) catch return ScriptError.OutOfMemory;
     }
 
+    /// Push a buffer the engine takes ownership of. Ownership transfers on
+    /// the call, success or failure: until `data` is recorded in
+    /// `owned_elements` (which `deinit` frees), every error return frees it
+    /// here, so a script rejected on StackOverflow does not leak its result.
+    /// Callers must not free `data` after this call (none has an errdefer).
     fn pushOwned(self: *ScriptEngine, data: []u8) !void {
-        if (self.stack.items.len + self.alt_stack.items.len >= MAX_STACK_SIZE) return ScriptError.StackOverflow;
-        if (data.len > MAX_STACK_ELEMENT_SIZE) return ScriptError.PushSizeExceeded;
-        self.owned_elements.append(data) catch return ScriptError.OutOfMemory;
+        if (self.stack.items.len + self.alt_stack.items.len >= MAX_STACK_SIZE) {
+            self.allocator.free(data);
+            return ScriptError.StackOverflow;
+        }
+        if (data.len > MAX_STACK_ELEMENT_SIZE) {
+            self.allocator.free(data);
+            return ScriptError.PushSizeExceeded;
+        }
+        self.owned_elements.append(data) catch {
+            self.allocator.free(data);
+            return ScriptError.OutOfMemory;
+        };
+        // From here `data` is in owned_elements and deinit frees it; freeing
+        // it on this error would double-free.
         self.stack.append(data) catch return ScriptError.OutOfMemory;
     }
 
@@ -2676,13 +2700,14 @@ pub const ScriptEngine = struct {
             // CHECKMULTISIG passes the same truncated subscript via the override
             // (v0 never FindAndDeletes), so either source yields identical bytes.
             const v0_sc = self.multisig_script_code orelse script_code;
-            const sighash = crypto.segwitSighash(
+            const sighash = crypto.segwitSighashTxData(
                 self.tx,
                 self.input_index,
                 v0_sc,
                 self.amount,
                 @as(u32, hash_type),
                 self.allocator,
+                self.txdata,
             ) catch |e| return sighashFailure(e);
             return crypto.verifyEcdsaChecked(sig_data, pubkey, &sighash) catch ScriptError.InternalError;
         }
@@ -2778,7 +2803,7 @@ pub const ScriptEngine = struct {
             .codesep_pos = self.codesep_pos,
         };
 
-        const sighash = taproot_sighash.computeTaprootSighash(
+        const sighash = taproot_sighash.computeTaprootSighashTxData(
             self.allocator,
             self.tx,
             self.input_index,
@@ -2786,6 +2811,7 @@ pub const ScriptEngine = struct {
             hash_type,
             self.taproot_annex,
             tapscript_ctx,
+            self.txdata,
         ) catch |e| return sighashFailure(e);
 
         var xonly: [32]u8 = undefined;

@@ -27,6 +27,7 @@ comptime {
     _ = @import("tests_backfill_peer_safety.zig"); // fix-clearbit-backfill-peer-safety
     _ = @import("tests_prune_chain_lock.zig"); // investigate-clearbit-prune-race
     _ = @import("tests_sec_metrics_bind.zig"); // security audit H7: metrics bind, timeout, routes
+    _ = @import("tests_cffix_dup_input_quadratic.zig"); // cffix: duplicate-input check O(n log n) (Core std::set<COutPoint>)
 }
 
 // ============================================================
@@ -1068,6 +1069,7 @@ comptime {
     _ = @import("tests_sec_p2p_trickle.zig"); // security audit C3/H3: trickled v1 messages + handshake deadline
     _ = @import("tests_bip324_w98.zig"); // W98 BIP-324 gate audit
     _ = @import("tests_v2_unknown_shortid.zig"); // BIP-324 unknown short IDs: bounded discard, no recursion
+    _ = @import("tests_pushowned_overflow_leak.zig"); // pushOwned frees the result on StackOverflow/PushSizeExceeded (secscan2 S1-F2 leak)
     _ = @import("tests_importdescriptors_private_keys.zig"); // importdescriptors: -13 on a locked wallet, public form at rest + in listdescriptors
     _ = @import("erlay.zig");
     _ = @import("tests_w104_addrman.zig"); // W104 AddrMan 30-gate fleet audit
@@ -1080,6 +1082,7 @@ comptime {
     _ = @import("tests_version_frelay.zig"); // version fRelay stored; no tx inv to fRelay=false / block-relay-only peers
     _ = @import("tests_psbt_tap_leaf_count.zig"); // PSBT TAP_BIP32_DERIVATION leaf-hash count bounded before alloc (C6 class)
     _ = @import("tests_neon_script_findings.zig"); // 2026-11-24 audit F1-F4: empty-sig FindAndDelete/encoding checks, P2SH-P2A discourage, disabled CLTV/CSV NOPs
+    _ = @import("tests_cffix_precomputed_sighash.zig"); // cffix: whole-tx sighash digests once per tx (Core PrecomputedTransactionData)
     // rpc.zig is exercised in its own dedicated test step (`zig build
     // test-rpc` and folded into `zig build test` via build.zig). Importing
     // it here would transitively pull wallet.zig, which uses an

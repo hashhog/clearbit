@@ -60,9 +60,25 @@ pub fn computeTaprootSighash(
     annex: ?[]const u8,
     script_path: ?TapscriptContext,
 ) TaprootSighashError![32]u8 {
+    return computeTaprootSighashTxData(allocator, tx, input_index, prevouts, hash_type, annex, script_path, null);
+}
+
+/// `computeTaprootSighash` taking the whole-tx digests from `txdata` (the
+/// tx's `crypto.PrecomputedTxData`, built once per tx from the same
+/// `prevouts`) when its BIP-341 half is ready.  Same 32 bytes either way.
+pub fn computeTaprootSighashTxData(
+    allocator: std.mem.Allocator,
+    tx: *const types.Transaction,
+    input_index: usize,
+    prevouts: TaprootPrevouts,
+    hash_type: u8,
+    annex: ?[]const u8,
+    script_path: ?TapscriptContext,
+    txdata: ?*const crypto.PrecomputedTxData,
+) TaprootSighashError![32]u8 {
     var preimage = std.ArrayList(u8).init(allocator);
     defer preimage.deinit();
-    try buildSigMsg(&preimage, tx, input_index, prevouts, hash_type, annex, script_path);
+    try buildSigMsgTxData(&preimage, tx, input_index, prevouts, hash_type, annex, script_path, txdata);
     return crypto.taggedHash("TapSighash", preimage.items);
 }
 
@@ -79,6 +95,25 @@ pub fn buildSigMsg(
     hash_type: u8,
     annex: ?[]const u8,
     script_path: ?TapscriptContext,
+) TaprootSighashError!void {
+    return buildSigMsgTxData(out, tx, input_index, prevouts, hash_type, annex, script_path, null);
+}
+
+/// `buildSigMsg` with optional per-tx precomputed digests.  With `txdata`
+/// whose BIP-341 half is ready for `tx`, sha_prevouts / sha_amounts /
+/// sha_scriptpubkeys / sha_sequences / sha_outputs come from it (Core
+/// `SignatureHashSchnorr` reading `cache.m_*_single_hash`,
+/// interpreter.cpp:1530-1541); otherwise they are hashed from `tx` and
+/// `prevouts` here.  The preimage bytes are identical either way.
+pub fn buildSigMsgTxData(
+    out: *std.ArrayList(u8),
+    tx: *const types.Transaction,
+    input_index: usize,
+    prevouts: TaprootPrevouts,
+    hash_type: u8,
+    annex: ?[]const u8,
+    script_path: ?TapscriptContext,
+    txdata: ?*const crypto.PrecomputedTxData,
 ) TaprootSighashError!void {
     if (input_index >= tx.inputs.len) return TaprootSighashError.InputIndexOutOfRange;
     if (prevouts.amounts.len != tx.inputs.len or prevouts.scripts.len != tx.inputs.len) {
@@ -101,8 +136,16 @@ pub fn buildSigMsg(
     // 4. nLockTime (u32 LE).
     try out.appendSlice(&std.mem.toBytes(std.mem.nativeToLittle(u32, tx.lock_time)));
 
+    const cache = crypto.PrecomputedTxData.bip341For(txdata, tx);
+
     // 5-8. sha_prevouts / sha_amounts / sha_scriptpubkeys / sha_sequences
-    if (!anyone_can_pay) {
+    if (!anyone_can_pay and cache != null) {
+        const c = cache.?;
+        try out.appendSlice(&c.prevouts_single_hash);
+        try out.appendSlice(&c.spent_amounts_single_hash);
+        try out.appendSlice(&c.spent_scripts_single_hash);
+        try out.appendSlice(&c.sequences_single_hash);
+    } else if (!anyone_can_pay) {
         // sha_prevouts = SHA256(concat(outpoint serialization for each input))
         var prevouts_buf = std.ArrayList(u8).init(out.allocator);
         defer prevouts_buf.deinit();
@@ -110,6 +153,7 @@ pub fn buildSigMsg(
             try prevouts_buf.appendSlice(&inp.previous_output.hash);
             try prevouts_buf.appendSlice(&std.mem.toBytes(std.mem.nativeToLittle(u32, inp.previous_output.index)));
         }
+        crypto.noteTxwideDigestBytes(prevouts_buf.items.len);
         try out.appendSlice(&crypto.sha256(prevouts_buf.items));
 
         // sha_amounts
@@ -118,6 +162,7 @@ pub fn buildSigMsg(
         for (prevouts.amounts) |amt| {
             try amounts_buf.appendSlice(&std.mem.toBytes(std.mem.nativeToLittle(i64, amt)));
         }
+        crypto.noteTxwideDigestBytes(amounts_buf.items.len);
         try out.appendSlice(&crypto.sha256(amounts_buf.items));
 
         // sha_scriptpubkeys
@@ -127,6 +172,7 @@ pub fn buildSigMsg(
             try writeCompactSize(&scripts_buf, spk.len);
             try scripts_buf.appendSlice(spk);
         }
+        crypto.noteTxwideDigestBytes(scripts_buf.items.len);
         try out.appendSlice(&crypto.sha256(scripts_buf.items));
 
         // sha_sequences
@@ -135,16 +181,20 @@ pub fn buildSigMsg(
         for (tx.inputs) |inp| {
             try seqs_buf.appendSlice(&std.mem.toBytes(std.mem.nativeToLittle(u32, inp.sequence)));
         }
+        crypto.noteTxwideDigestBytes(seqs_buf.items.len);
         try out.appendSlice(&crypto.sha256(seqs_buf.items));
     }
 
     // 9. sha_outputs (skipped for SIGHASH_NONE/SINGLE).
-    if (output_type != SIGHASH_NONE and output_type != SIGHASH_SINGLE) {
+    if (output_type != SIGHASH_NONE and output_type != SIGHASH_SINGLE and cache != null) {
+        try out.appendSlice(&cache.?.outputs_single_hash);
+    } else if (output_type != SIGHASH_NONE and output_type != SIGHASH_SINGLE) {
         var outputs_buf = std.ArrayList(u8).init(out.allocator);
         defer outputs_buf.deinit();
         for (tx.outputs) |o| {
             try encodeTxOut(&outputs_buf, o);
         }
+        crypto.noteTxwideDigestBytes(outputs_buf.items.len);
         try out.appendSlice(&crypto.sha256(outputs_buf.items));
     }
 

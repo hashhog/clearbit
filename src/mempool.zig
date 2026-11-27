@@ -4245,6 +4245,11 @@ pub const Mempool = struct {
     /// the script error as the reject reason for a stripped witness,
     /// validation.cpp PolicyScriptChecks).
     fn runScriptChecks(self: *Mempool, tx: *const types.Transaction, spent_amounts: []const i64, spent_scripts: []const []const u8, flags: script.ScriptFlags, consensus_flags: script.ScriptFlags, fail: *?ScriptFailure) MempoolError!void {
+        // Whole-tx sighash digests, once for this tx, shared by every input
+        // check below under both flag sets (Core: one
+        // PrecomputedTransactionData per tx in MemPoolAccept, ws.m_precomputed_txdata).
+        const txdata = crypto.PrecomputedTxData.init(tx, spent_amounts, spent_scripts);
+
         // Now actually run the script engine against each input.
         for (tx.inputs, 0..) |input, input_index| {
             var engine = script.ScriptEngine.initWithPrevouts(
@@ -4257,6 +4262,7 @@ pub const Mempool = struct {
                 spent_scripts,
             );
             defer engine.deinit();
+            engine.txdata = &txdata;
 
             const result = engine.verify(
                 input.script_sig,
@@ -4322,6 +4328,7 @@ pub const Mempool = struct {
                 spent_scripts,
             );
             defer engine.deinit();
+            engine.txdata = &txdata;
 
             const result = engine.verify(
                 input.script_sig,
