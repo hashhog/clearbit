@@ -249,3 +249,75 @@ test "tests_r3fix_tma_single control: the same oversized tx as version 2 is allo
     const row = try tma(a, r.srv, &tx);
     try testing.expect(row.get("allowed").?.bool);
 }
+
+test "tests_r3fix_tma_single order: a fee-paying dust tx is dust before the sigops-cost reject (Core order)" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    // Five P2WSH coins whose witness script is 3,600 OP_CHECKSIG: 18,000
+    // witness sigops > MAX_STANDARD_TX_SIGOPS_COST (16,000).  The script
+    // is within IsWitnessStandard's 3,600-byte limit, so the inputs pass
+    // AreInputsStandard / IsWitnessStandard.  The tx pays a fee and has one
+    // dust output.  Core v31.1 PreChecks runs PreCheckEphemeralTx before
+    // the sigops reject (validation.cpp), so the reason is dust, not
+    // bad-txns-too-many-sigops.
+    const N_IN: usize = 5;
+    const ws = try a.alloc(u8, 3600);
+    @memset(ws, 0xac); // OP_CHECKSIG
+    const spk = try p2wshOf(a, ws);
+    const cs = try chainWithCoin(a, .{ .hash = PREV, .index = 0 }, 100_000, spk);
+    const ins = try a.alloc(types.TxIn, N_IN);
+    for (ins, 0..) |*in, i| {
+        const op = types.OutPoint{ .hash = PREV, .index = @intCast(i) };
+        if (i > 0) {
+            const out = types.TxOut{ .value = 100_000, .script_pubkey = spk };
+            try cs.utxo_set.add(&op, &out, 799_000, false);
+        }
+        in.* = .{
+            .previous_output = op,
+            .script_sig = &.{},
+            .sequence = 0xFFFFFFFD,
+            .witness = try a.dupe([]const u8, &.{ws}),
+        };
+    }
+    const r = try rig(a, cs);
+    const outs = try a.alloc(types.TxOut, 2);
+    const out_spk = try p2wshOf(a, &SCRIPT_OP_TRUE);
+    outs[0] = .{ .value = 400_000, .script_pubkey = out_spk };
+    outs[1] = .{ .value = 0, .script_pubkey = out_spk }; // the one dust output
+    const tx = types.Transaction{ .version = 2, .inputs = ins, .outputs = outs, .lock_time = 0 };
+    try testing.expectEqual(@as(usize, 1), mempool_mod.Mempool.dustOutputCount(&tx));
+
+    try expectRejected(try tma(a, r.srv, &tx), "dust");
+}
+
+test "tests_r3fix_tma_single control: the same sigops-heavy tx without the dust output is bad-txns-too-many-sigops" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const N_IN: usize = 5;
+    const ws = try a.alloc(u8, 3600);
+    @memset(ws, 0xac);
+    const spk = try p2wshOf(a, ws);
+    const cs = try chainWithCoin(a, .{ .hash = PREV, .index = 0 }, 100_000, spk);
+    const ins = try a.alloc(types.TxIn, N_IN);
+    for (ins, 0..) |*in, i| {
+        const op = types.OutPoint{ .hash = PREV, .index = @intCast(i) };
+        if (i > 0) {
+            const out = types.TxOut{ .value = 100_000, .script_pubkey = spk };
+            try cs.utxo_set.add(&op, &out, 799_000, false);
+        }
+        in.* = .{
+            .previous_output = op,
+            .script_sig = &.{},
+            .sequence = 0xFFFFFFFD,
+            .witness = try a.dupe([]const u8, &.{ws}),
+        };
+    }
+    const r = try rig(a, cs);
+    const outs = try a.alloc(types.TxOut, 1);
+    outs[0] = .{ .value = 400_000, .script_pubkey = try p2wshOf(a, &SCRIPT_OP_TRUE) };
+    const tx = types.Transaction{ .version = 2, .inputs = ins, .outputs = outs, .lock_time = 0 };
+
+    try expectRejected(try tma(a, r.srv, &tx), "bad-txns-too-many-sigops");
+}
