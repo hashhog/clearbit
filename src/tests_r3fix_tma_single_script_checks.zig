@@ -250,17 +250,13 @@ test "tests_r3fix_tma_single control: the same oversized tx as version 2 is allo
     try testing.expect(row.get("allowed").?.bool);
 }
 
-test "tests_r3fix_tma_single order: a fee-paying dust tx is dust before the sigops-cost reject (Core order)" {
-    var arena = std.heap.ArenaAllocator.init(testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
-    // Five P2WSH coins whose witness script is 3,600 OP_CHECKSIG: 18,000
-    // witness sigops > MAX_STANDARD_TX_SIGOPS_COST (16,000).  The script
-    // is within IsWitnessStandard's 3,600-byte limit, so the inputs pass
-    // AreInputsStandard / IsWitnessStandard.  The tx pays a fee and has one
-    // dust output.  Core v31.1 PreChecks runs PreCheckEphemeralTx before
-    // the sigops reject (validation.cpp), so the reason is dust, not
-    // bad-txns-too-many-sigops.
+/// A tx spending five P2WSH coins whose witness script is 3,600 OP_CHECKSIG:
+/// 18,000 witness sigops > MAX_STANDARD_TX_SIGOPS_COST (16,000).  The script
+/// is within IsWitnessStandard's 3,600-byte limit, so the inputs pass
+/// AreInputsStandard / IsWitnessStandard.  Pays 100,000 sat of fee; with
+/// `with_dust` it also has one 0-sat output (one dust output is allowed by
+/// IsStandardTx, MAX_DUST_OUTPUTS_PER_TX = 1).
+fn sigopsHeavy(a: std.mem.Allocator, with_dust: bool) !struct { r: Rig, tx: types.Transaction } {
     const N_IN: usize = 5;
     const ws = try a.alloc(u8, 3600);
     @memset(ws, 0xac); // OP_CHECKSIG
@@ -280,44 +276,93 @@ test "tests_r3fix_tma_single order: a fee-paying dust tx is dust before the sigo
             .witness = try a.dupe([]const u8, &.{ws}),
         };
     }
-    const r = try rig(a, cs);
-    const outs = try a.alloc(types.TxOut, 2);
     const out_spk = try p2wshOf(a, &SCRIPT_OP_TRUE);
+    const outs = try a.alloc(types.TxOut, if (with_dust) 2 else 1);
     outs[0] = .{ .value = 400_000, .script_pubkey = out_spk };
-    outs[1] = .{ .value = 0, .script_pubkey = out_spk }; // the one dust output
-    const tx = types.Transaction{ .version = 2, .inputs = ins, .outputs = outs, .lock_time = 0 };
-    try testing.expectEqual(@as(usize, 1), mempool_mod.Mempool.dustOutputCount(&tx));
+    if (with_dust) outs[1] = .{ .value = 0, .script_pubkey = out_spk };
+    return .{ .r = try rig(a, cs), .tx = .{ .version = 2, .inputs = ins, .outputs = outs, .lock_time = 0 } };
+}
 
-    try expectRejected(try tma(a, r.srv, &tx), "dust");
+test "tests_r3fix_tma_single order: a fee-paying dust tx is dust before the sigops-cost reject (Core order)" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    // Core v31.1 PreChecks runs PreCheckEphemeralTx before the sigops
+    // reject (validation.cpp), so the reason is dust, not
+    // bad-txns-too-many-sigops.
+    const f = try sigopsHeavy(a, true);
+    try testing.expectEqual(@as(usize, 1), mempool_mod.Mempool.dustOutputCount(&f.tx));
+    try expectRejected(try tma(a, f.r.srv, &f.tx), "dust");
 }
 
 test "tests_r3fix_tma_single control: the same sigops-heavy tx without the dust output is bad-txns-too-many-sigops" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
-    const N_IN: usize = 5;
-    const ws = try a.alloc(u8, 3600);
-    @memset(ws, 0xac);
-    const spk = try p2wshOf(a, ws);
-    const cs = try chainWithCoin(a, .{ .hash = PREV, .index = 0 }, 100_000, spk);
-    const ins = try a.alloc(types.TxIn, N_IN);
-    for (ins, 0..) |*in, i| {
-        const op = types.OutPoint{ .hash = PREV, .index = @intCast(i) };
-        if (i > 0) {
-            const out = types.TxOut{ .value = 100_000, .script_pubkey = spk };
-            try cs.utxo_set.add(&op, &out, 799_000, false);
-        }
-        in.* = .{
-            .previous_output = op,
-            .script_sig = &.{},
-            .sequence = 0xFFFFFFFD,
-            .witness = try a.dupe([]const u8, &.{ws}),
-        };
-    }
-    const r = try rig(a, cs);
-    const outs = try a.alloc(types.TxOut, 1);
-    outs[0] = .{ .value = 400_000, .script_pubkey = try p2wshOf(a, &SCRIPT_OP_TRUE) };
-    const tx = types.Transaction{ .version = 2, .inputs = ins, .outputs = outs, .lock_time = 0 };
+    const f = try sigopsHeavy(a, false);
+    try expectRejected(try tma(a, f.r.srv, &f.tx), "bad-txns-too-many-sigops");
+}
 
-    try expectRejected(try tma(a, r.srv, &tx), "bad-txns-too-many-sigops");
+/// A pool parent with one dust output, and a child that spends the parent's
+/// P2WSH(OP_0) output with the witness OP_0 (EVAL_FALSE).  The parent spends
+/// the confirmed P2WSH(OP_TRUE) coin PREV:0 and pays no fee (outputs: 0 =
+/// 100,000 sat to P2WSH(OP_0), 1 = 0 sat to P2WSH(OP_TRUE), the dust).  It
+/// enters the pool under bypass_limits (Core: a disconnected block's tx), as
+/// in the r3fix ephemeral-dust tests.  With `spend_dust` the child also
+/// spends output 1 with OP_TRUE.
+fn dustParentAndFailingChild(a: std.mem.Allocator, spend_dust: bool) !struct { r: Rig, child: types.Transaction } {
+    const r = try rig(a, try chainWithCoin(a, .{ .hash = PREV, .index = 0 }, 100_000, try p2wshOf(a, &SCRIPT_OP_TRUE)));
+    const pins = try a.alloc(types.TxIn, 1);
+    pins[0] = .{
+        .previous_output = .{ .hash = PREV, .index = 0 },
+        .script_sig = &.{},
+        .sequence = 0xFFFFFFFD,
+        .witness = try a.dupe([]const u8, &.{&SCRIPT_OP_TRUE}),
+    };
+    const pouts = try a.alloc(types.TxOut, 2);
+    pouts[0] = .{ .value = 100_000, .script_pubkey = try p2wshOf(a, &SCRIPT_OP_0) };
+    pouts[1] = .{ .value = 0, .script_pubkey = try p2wshOf(a, &SCRIPT_OP_TRUE) };
+    const parent = types.Transaction{ .version = 2, .inputs = pins, .outputs = pouts, .lock_time = 0 };
+    r.mp.bypass_limits = true;
+    try r.mp.addTransaction(parent);
+    r.mp.bypass_limits = false;
+    try testing.expectEqual(@as(usize, 1), r.mp.entries.count());
+    const ptxid = try crypto.computeTxid(&parent, a);
+
+    const cins = try a.alloc(types.TxIn, if (spend_dust) 2 else 1);
+    cins[0] = .{
+        .previous_output = .{ .hash = ptxid, .index = 0 },
+        .script_sig = &.{},
+        .sequence = 0xFFFFFFFD,
+        .witness = try a.dupe([]const u8, &.{&SCRIPT_OP_0}),
+    };
+    if (spend_dust) cins[1] = .{
+        .previous_output = .{ .hash = ptxid, .index = 1 },
+        .script_sig = &.{},
+        .sequence = 0xFFFFFFFD,
+        .witness = try a.dupe([]const u8, &.{&SCRIPT_OP_TRUE}),
+    };
+    const couts = try a.alloc(types.TxOut, 1);
+    couts[0] = .{ .value = 90_000, .script_pubkey = try p2wshOf(a, &SCRIPT_OP_TRUE) };
+    return .{ .r = r, .child = .{ .version = 2, .inputs = cins, .outputs = couts, .lock_time = 0 } };
+}
+
+test "tests_r3fix_tma_single order: missing-ephemeral-spends is reported before a failing script (Core order)" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    // The child leaves the pool parent's dust unspent and fails its script.
+    // Core v31.1 AcceptSingleTransactionInternal runs CheckEphemeralSpends
+    // before PolicyScriptChecks, so the reason is missing-ephemeral-spends.
+    const f = try dustParentAndFailingChild(a, false);
+    try expectRejected(try tma(a, f.r.srv, &f.child), "missing-ephemeral-spends");
+    try testing.expectEqual(@as(usize, 1), f.r.mp.entries.count());
+}
+
+test "tests_r3fix_tma_single control: the same failing child that spends the dust is the script error" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const f = try dustParentAndFailingChild(a, true);
+    try expectRejected(try tma(a, f.r.srv, &f.child), EVAL_FALSE_REASON);
 }

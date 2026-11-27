@@ -4564,9 +4564,9 @@ pub const Mempool = struct {
     /// on m_test_accept after ConsensusScriptChecks).  For a single tx this
     /// therefore runs, in Core's order: IsStandardTx (checkStandard + dust),
     /// finality, inputs, BIP-68, CheckTxInputs, AreInputsStandard,
-    /// IsWitnessStandard, the sigops-cost gate, the fee floor, TRUC, RBF, and
-    /// the STANDARD and consensus script checks; a script failure is recorded
-    /// in `fail`.
+    /// IsWitnessStandard, PreCheckEphemeralTx, the sigops-cost gate, the fee
+    /// floor, TRUC, RBF, CheckEphemeralSpends, and the STANDARD and consensus
+    /// script checks; a script failure is recorded in `fail`.
     ///
     /// Inside testAcceptMultiple (test_disallow_replacement) only the part
     /// up to the fee floor runs here: the package path runs the input policy
@@ -4711,8 +4711,9 @@ pub const Mempool = struct {
         //     ("bad-txns-nonstandard-inputs"), IsWitnessStandard
         //     ("bad-witness-nonstandard"), PreCheckEphemeralTx ("dust") and
         //     the MAX_STANDARD_TX_SIGOPS_COST gate, in that order
-        //     (validation.cpp PreChecks).  The same gates the full path runs
-        //     in verifyInputScriptsDetailed, in Core's order.
+        //     (validation.cpp PreChecks).  Apart from PreCheckEphemeralTx
+        //     (the full path runs it at §5c), these are the gates the full
+        //     path runs in verifyInputScriptsDetailed, in Core's order.
         const params = self.params orelse &consensus.MAINNET;
         var spent: ?SpentOutputs = null;
         defer if (spent) |*sp| sp.deinit();
