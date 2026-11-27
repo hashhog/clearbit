@@ -1045,6 +1045,7 @@ comptime {
     _ = @import("tests_gate6.zig"); // gate 6: fault injection (resource faults are never verdicts)
     _ = @import("tests_tip_liveness.zig"); // 2026-10-05 tip stalls + send-stall wedge (base-comparable)
     _ = @import("tests_tip_liveness_fix.zig"); // 2026-10-05 tip stalls + send-stall wedge (new API)
+    _ = @import("tests_r3fix_ephemeral_dust.zig"); // R3 G5: Core ephemeral dust (MAX_DUST_OUTPUTS_PER_TX, PreCheckEphemeralTx, CheckEphemeralSpends)
     _ = @import("tests_cmpct_rpc_mined.zig"); // BIP-152 serve + HB announce for RPC-mined blocks
     _ = @import("tests_sec_p2p_cmpct_inv.zig"); // audit 2026-10-29 H1/H2: cmpctblock gate, inv throttles
     _ = @import("tests_neon_header_bad_version.zig"); // 2026-11-24 audit F10: obsolete nVersion refused at header receipt (bad-version)
@@ -1056,6 +1057,7 @@ comptime {
     _ = @import("tests_mtp_bip68_fix.zig"); // 2026-10-05 mempool MTP / BIP68 (new API: removeForReorg, tipMtp)
     _ = @import("tests_neon_bip68_version.zig"); // 2026-11-24 audit F7: BIP-68 version compared unsigned in the height-only sequence-lock arm
     _ = @import("mempool.zig");
+    _ = @import("tests_r3fix_p2a_dust_rule.zig"); // R3 G3: P2A takes Core's witness dust threshold (240 sat), no value rule
     _ = @import("tests_unbroadcast.zig"); // unbroadcast set (Core m_unbroadcast_txids)
     _ = @import("tests_sec_wallet_files_perms.zig"); // security audit H8/H9/H11: datadir paths, private umask + wallet modes, label escaping
     _ = @import("mempool_persist.zig"); // mempool.dat dump/load (Bitcoin Core-compatible)

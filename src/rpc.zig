@@ -10174,6 +10174,14 @@ pub const RpcServer = struct {
                 },
                 mempool_mod.MempoolError.InsufficientFee => self.jsonRpcError(RPC_VERIFY_REJECTED, "min relay fee not met", id),
                 mempool_mod.MempoolError.DustOutput => self.jsonRpcError(RPC_VERIFY_REJECTED, "dust output", id),
+                // Core CheckEphemeralSpends (TX_MEMPOOL_POLICY): the state's
+                // ToString, "missing-ephemeral-spends, tx <txid> (wtxid=<wtxid>)
+                // did not spend parent's ephemeral dust".
+                mempool_mod.MempoolError.MissingEphemeralSpends => {
+                    const details = try mempool_mod.Mempool.missingEphemeralSpendsDetails(&tx, self.allocator);
+                    defer self.allocator.free(details);
+                    return self.jsonRpcError(RPC_VERIFY_REJECTED, details, id);
+                },
                 mempool_mod.MempoolError.NonStandard => self.jsonRpcError(RPC_VERIFY_REJECTED, "non-standard transaction", id),
                 mempool_mod.MempoolError.MissingInputs => self.jsonRpcError(RPC_VERIFY_ERROR, "bad-txns-inputs-missingorspent", id),
                 mempool_mod.MempoolError.TooManyAncestors => self.jsonRpcError(RPC_VERIFY_REJECTED, "too many unconfirmed ancestors", id),
