@@ -4708,6 +4708,9 @@ pub const Mempool = struct {
                     return if (err == MempoolError.NonStandard) MempoolError.NonStandardInputs else err;
                 };
                 try checkWitnessStandard(tx, sp.scripts);
+                // Core v31.1 runs PreCheckEphemeralTx here, between
+                // IsWitnessStandard and the sigops reject (validation.cpp
+                // PreChecks); the sigops reject then precedes CheckFeeRate.
                 const std_flags = validation.getStandardScriptFlags(cs.best_height, params);
                 if (standardSigopCost(tx, sp.amounts, sp.scripts, std_flags) > consensus.MAX_STANDARD_TX_SIGOPS_COST) {
                     return MempoolError.TooManySigopsCost;

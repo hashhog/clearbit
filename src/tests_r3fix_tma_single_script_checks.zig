@@ -224,6 +224,20 @@ test "tests_r3fix_tma_single R46: a v3 tx over 10,000 vB is TRUC-violation" {
     try expectRejected(try tma(a, r.srv, &tx), "TRUC-violation");
 }
 
+test "tests_r3fix_tma_single order: TRUC-violation is reported before a failing script (Core order)" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    // Coin locked by P2WSH(OP_0) and spent with OP_0 (EVAL_FALSE), in a v3
+    // tx over 10,000 vB.  Core v31.1 runs SingleTRUCChecks in PreChecks,
+    // before PolicyScriptChecks, so the reason is TRUC-violation.
+    const r = try rig(a, try chainWithCoin(a, .{ .hash = PREV, .index = 0 }, 1_000_000, try p2wshOf(a, &SCRIPT_OP_0)));
+    const witness = try a.dupe([]const u8, &.{&SCRIPT_OP_0});
+    const tx = try spend(a, 3, witness, BIG_N_OUT, 1_000);
+
+    try expectRejected(try tma(a, r.srv, &tx), "TRUC-violation");
+}
+
 test "tests_r3fix_tma_single control: the same oversized tx as version 2 is allowed" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
