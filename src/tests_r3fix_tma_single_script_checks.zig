@@ -208,6 +208,21 @@ test "tests_r3fix_tma_single R4: a nonstandard input is reported before a zero f
     try testing.expectEqualStrings("bad-txns-nonstandard-inputs", row.get("reject-details").?.string);
 }
 
+test "tests_r3fix_tma_single order: a nonstandard input is reported before dust (Core order)" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    // Spends the bare OP_TRUE coin of R10, pays a fee and has one 0-sat
+    // output.  Core v31.1 PreChecks runs AreInputsStandard before
+    // PreCheckEphemeralTx, so the reason is bad-txns-nonstandard-inputs.
+    const r = try rig(a, try chainWithCoin(a, .{ .hash = PREV, .index = 0 }, 100_000, &SCRIPT_OP_TRUE));
+    var tx = try spend(a, 2, &.{}, 2, 49_000);
+    @constCast(&tx.outputs[1]).value = 0;
+    try testing.expectEqual(@as(usize, 1), mempool_mod.Mempool.dustOutputCount(&tx));
+
+    try expectRejected(try tma(a, r.srv, &tx), "bad-txns-nonstandard-inputs");
+}
+
 /// 240 P2WSH outputs: vsize just over TRUC_MAX_VSIZE (10,000 vB).
 const BIG_N_OUT: usize = 240;
 

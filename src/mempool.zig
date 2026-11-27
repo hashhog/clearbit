@@ -4728,10 +4728,12 @@ pub const Mempool = struct {
                 try checkWitnessStandard(tx, sp.scripts);
                 // Core PreCheckEphemeralTx: between IsWitnessStandard and
                 // the sigops reject (validation.cpp PreChecks).  With chain
-                // state every input was valued above, so the fee is known.
-                std.debug.assert(have_inputs);
-                try preCheckEphemeralTx(tx, true, fee, fee + self.applyDelta(tx_hash));
-                ephemeral_checked = true;
+                // state every input was valued above, so the fee is known;
+                // were it not, the call below the block still runs.
+                if (have_inputs) {
+                    try preCheckEphemeralTx(tx, true, fee, fee + self.applyDelta(tx_hash));
+                    ephemeral_checked = true;
+                }
                 const std_flags = validation.getStandardScriptFlags(cs.best_height, params);
                 if (standardSigopCost(tx, sp.amounts, sp.scripts, std_flags) > consensus.MAX_STANDARD_TX_SIGOPS_COST) {
                     return MempoolError.TooManySigopsCost;
