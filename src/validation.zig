@@ -597,6 +597,7 @@ pub fn checkTransactionContextual(
         spent_amounts[i] = utxos[i].value;
         spent_scripts[i] = utxos[i].script_pubkey;
     }
+    const txdata = crypto.PrecomputedTxData.init(tx, spent_amounts, spent_scripts);
 
     for (tx.inputs, 0..) |input, input_index| {
         var engine = script.ScriptEngine.initWithPrevouts(
@@ -609,6 +610,7 @@ pub fn checkTransactionContextual(
             spent_scripts,
         );
         defer engine.deinit();
+        engine.txdata = &txdata;
 
         const result = engine.verify(
             input.script_sig,
@@ -3205,6 +3207,11 @@ pub const ScriptCheckJob = struct {
     /// Empty slices `&.{}` if Taproot won't be exercised.
     spent_amounts: []const i64 = &.{},
     spent_scripts: []const []const u8 = &.{},
+    /// The tx's whole-tx sighash digests, built once per tx from the same
+    /// tx and `spent_amounts` / `spent_scripts` and shared read-only by all
+    /// of its jobs (Core: every CScriptCheck of a tx points at one
+    /// PrecomputedTransactionData).  Null = the job's checks rebuild them.
+    txdata: ?*const crypto.PrecomputedTxData = null,
     /// Result of verification (set by worker thread)
     result: std.atomic.Value(VerifyResult),
     /// Reject reason; 0 on success. Written by the worker that ran this job.
@@ -3717,6 +3724,9 @@ fn verifyScriptJob(job: *ScriptCheckJob, allocator: std.mem.Allocator, cache: *s
         job.spent_scripts,
     );
     defer engine.deinit();
+    // Built from the block's copy of this tx; `tx` above is a byte-exact
+    // re-parse of it, so the digests are the same.
+    engine.txdata = job.txdata;
 
     const result = engine.verify(
         input.script_sig,
@@ -3831,7 +3841,15 @@ pub fn verifyBlockScriptsParallel(
         prevouts_list.deinit();
     }
 
-    for (block.transactions[1..]) |*tx| {
+    // One PrecomputedTxData per tx, built here on the submitting thread
+    // before submit() and only read by the workers.  A fixed-size slice, so
+    // the jobs' pointers into it stay valid until waitAll returns.
+    const txdatas = allocator.alloc(crypto.PrecomputedTxData, block.transactions.len - 1) catch {
+        return ValidationError.OutOfMemory;
+    };
+    defer allocator.free(txdatas);
+
+    for (block.transactions[1..], 0..) |*tx, tx_i| {
         // Serialize transaction once for all its inputs
         var writer = serialize.Writer.init(allocator);
         defer writer.deinit();
@@ -3867,6 +3885,7 @@ pub fn verifyBlockScriptsParallel(
             allocator.free(pt.scripts);
             return ValidationError.OutOfMemory;
         };
+        txdatas[tx_i] = crypto.PrecomputedTxData.init(tx, pt.amounts, pt.scripts);
 
         for (tx.inputs, 0..) |input, input_idx| {
             jobs[job_idx] = ScriptCheckJob.initWithPrevouts(
@@ -3879,6 +3898,7 @@ pub fn verifyBlockScriptsParallel(
                 pt.amounts,
                 pt.scripts,
             );
+            jobs[job_idx].txdata = &txdatas[tx_i];
             job_idx += 1;
         }
     }
@@ -3963,6 +3983,8 @@ fn verifyBlockScriptsSingleThreaded(
             spent_amounts[i] = entry.amount;
             spent_scripts[i] = entry.script_pubkey;
         }
+        // Whole-tx sighash digests, once for all of this tx's inputs.
+        const txdata = crypto.PrecomputedTxData.init(tx, spent_amounts, spent_scripts);
 
         for (tx.inputs, 0..) |input, input_idx| {
             var engine = script.ScriptEngine.initWithPrevouts(
@@ -3975,6 +3997,7 @@ fn verifyBlockScriptsSingleThreaded(
                 spent_scripts,
             );
             defer engine.deinit();
+            engine.txdata = &txdata;
 
             const result = engine.verify(
                 input.script_sig,
@@ -3999,6 +4022,7 @@ fn verifyBlockScriptsSingleThreaded(
                     spent_scripts,
                 );
                 defer retry.deinit();
+                retry.txdata = &txdata;
                 if (retry.verify(input.script_sig, spent_scripts[input_idx], input.witness)) |valid2| {
                     if (!valid2) return false;
                 } else |err2| {

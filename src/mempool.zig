@@ -4162,6 +4162,11 @@ pub const Mempool = struct {
             tx_sigop_cost = sigop_cost;
         }
 
+        // Whole-tx sighash digests, once for this tx, shared by every input
+        // check below under both flag sets (Core: one
+        // PrecomputedTransactionData per tx in MemPoolAccept, ws.m_precomputed_txdata).
+        const txdata = crypto.PrecomputedTxData.init(tx, spent_amounts, spent_scripts);
+
         // Now actually run the script engine against each input.
         for (tx.inputs, 0..) |input, input_index| {
             var engine = script.ScriptEngine.initWithPrevouts(
@@ -4174,6 +4179,7 @@ pub const Mempool = struct {
                 spent_scripts,
             );
             defer engine.deinit();
+            engine.txdata = &txdata;
 
             const result = engine.verify(
                 input.script_sig,
@@ -4240,6 +4246,7 @@ pub const Mempool = struct {
                 spent_scripts,
             );
             defer engine.deinit();
+            engine.txdata = &txdata;
 
             const result = engine.verify(
                 input.script_sig,
