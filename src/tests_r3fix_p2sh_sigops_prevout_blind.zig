@@ -499,3 +499,81 @@ test "tests_r3fix_p2sh_sigops control: a 15-sigop P2SH spend with one fee-paying
     try expectMempoolError("DustOutput", r.mp.addTransaction(tx));
     try testing.expectEqual(@as(usize, 0), r.mp.entries.count());
 }
+
+// --- package RBF (submitpackage): the child's PreChecks run in packageRbf ---
+
+const ACS_SCRIPTSIG = [_]u8{ 0x01, 0x51 }; // push OP_TRUE: spends P2SH(OP_TRUE)
+const RBF_COIN = [_]u8{0x44} ** 32;
+const RBF_VALUE: i64 = 5_000_000_000;
+
+/// One-input, one-output tx spending `prev` with `script_sig`, paying
+/// `value - fee` to `spk`, signalling RBF.
+fn oneToOne(a: std.mem.Allocator, prev: types.OutPoint, script_sig: []const u8, value: i64, fee: i64, spk: []const u8) !types.Transaction {
+    const ins = try a.alloc(types.TxIn, 1);
+    ins[0] = .{ .previous_output = prev, .script_sig = script_sig, .sequence = 0xFFFFFFFD, .witness = &.{} };
+    const outs = try a.alloc(types.TxOut, 1);
+    outs[0] = .{ .value = value - fee, .script_pubkey = spk };
+    return .{ .version = 2, .inputs = ins, .outputs = outs, .lock_time = 0 };
+}
+
+/// submitpackage [parent, child] where the parent conflicts with a pool tx it
+/// cannot pay for alone (so the child's parent is missing and both reach
+/// package RBF), and the child spends the parent's P2SH(redeem) output with
+/// an `n`-sigop redeemScript.  Returns the result object and the rig.
+fn packageRbfWithRedeemSigops(a: std.mem.Allocator, n: usize) !struct { r: Rig, res: std.json.ObjectMap, child: types.Transaction, parent: types.Transaction, conflict: types.Transaction } {
+    const acs = try p2shOf(a, &SCRIPT_OP_TRUE);
+    const coin = types.OutPoint{ .hash = RBF_COIN, .index = 0 };
+    const r = try rig(a, try chainWithCoin(a, coin, RBF_VALUE, acs));
+    const redeem = try skippedSigopsRedeem(a, n);
+
+    // The pool tx: fee 20,000.  The parent pays 6,000, so alone it is
+    // refused (less fees than the tx it replaces).
+    const conflict = try oneToOne(a, coin, &ACS_SCRIPTSIG, RBF_VALUE, 20_000, acs);
+    try r.mp.addTransaction(conflict);
+    const parent = try oneToOne(a, coin, &ACS_SCRIPTSIG, RBF_VALUE, 6_000, try p2shOf(a, redeem));
+    const parent_txid = try crypto.computeTxid(&parent, a);
+    const child = try oneToOne(a, .{ .hash = parent_txid, .index = 0 }, try pushOf(a, redeem), parent.outputs[0].value, 200_000, acs);
+
+    const req = try std.fmt.allocPrint(a, "{{\"id\":1,\"method\":\"submitpackage\",\"params\":[[\"{s}\",\"{s}\"]]}}", .{ try hexOf(a, &parent), try hexOf(a, &child) });
+    const resp = try r.srv.dispatch(req);
+    const p = try std.json.parseFromSlice(std.json.Value, a, resp, .{ .allocate = .alloc_always });
+    return .{ .r = r, .res = p.value.object.get("result").?.object, .child = child, .parent = parent, .conflict = conflict };
+}
+
+fn wtxidHex(a: std.mem.Allocator, tx: *const types.Transaction) ![]const u8 {
+    var h = try crypto.computeWtxid(tx, a);
+    std.mem.reverse(u8, &h);
+    return std.fmt.allocPrint(a, "{s}", .{std.fmt.fmtSliceHexLower(&h)});
+}
+
+fn inPool(a: std.mem.Allocator, mp: *mempool_mod.Mempool, tx: *const types.Transaction) !bool {
+    return mp.entries.contains(try crypto.computeTxid(tx, a));
+}
+
+test "tests_r3fix_p2sh_sigops package RBF control: a child spending a 15-sigop P2SH output replaces the conflict" {
+    // Proves the rig reaches package RBF and that a 15-sigop child passes.
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const s = try packageRbfWithRedeemSigops(a, 15);
+    try testing.expectEqualStrings("success", s.res.get("package_msg").?.string);
+    try testing.expect(try inPool(a, s.r.mp, &s.parent));
+    try testing.expect(try inPool(a, s.r.mp, &s.child));
+    try testing.expect(!try inPool(a, s.r.mp, &s.conflict));
+}
+
+test "tests_r3fix_p2sh_sigops package RBF: a child spending a 16-sigop P2SH output is bad-txns-nonstandard-inputs and the conflict stays" {
+    // Core AcceptPackage -> AcceptMultipleTransactions runs PreChecks on the
+    // child: AreInputsStandard refuses it, package_msg "transaction failed".
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const s = try packageRbfWithRedeemSigops(a, 16);
+    try testing.expectEqualStrings("transaction failed", s.res.get("package_msg").?.string);
+    const results = s.res.get("tx-results").?.object;
+    const c_row = results.get(try wtxidHex(a, &s.child)).?.object;
+    try testing.expectEqualStrings(NSI, c_row.get("error").?.string);
+    try testing.expect(try inPool(a, s.r.mp, &s.conflict));
+    try testing.expect(!try inPool(a, s.r.mp, &s.parent));
+    try testing.expect(!try inPool(a, s.r.mp, &s.child));
+}
