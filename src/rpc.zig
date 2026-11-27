@@ -25599,6 +25599,9 @@ fn rejectDetailsEqualReason(reason: []const u8) bool {
         "scriptsig-size",
         "scriptsig-not-pushonly",
         "dust",
+        // AreInputsStandard: state.Invalid(TX_INPUTS_NOT_STANDARD,
+        // "bad-txns-nonstandard-inputs") with no debug message.
+        "bad-txns-nonstandard-inputs",
     };
     for (bare) |t| if (std.mem.eql(u8, reason, t)) return true;
     return false;

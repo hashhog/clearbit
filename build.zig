@@ -2303,6 +2303,38 @@ pub fn build(b: *std.Build) void {
         test_step.dependOn(&run_mrd_tests.step);
     }
 
+    // The P2SH redeemScript sigop limit applies only to P2SH inputs
+    // (r3fix-clearbit-p2sh-sigops-prevout-blind).  Same rig as
+    // test-mempool-error-strings; also part of `test`.
+    {
+        const p2so_tests = b.addTest(.{
+            .root_source_file = b.path("tests_r3fix_p2sh_sigops_prevout_blind.zig"),
+            .target = target,
+            .optimize = optimize,
+            .filters = &[_][]const u8{"tests_r3fix_p2sh_sigops"},
+        });
+        p2so_tests.linkSystemLibrary("rocksdb");
+        p2so_tests.linkSystemLibrary("secp256k1");
+        p2so_tests.addIncludePath(.{ .cwd_relative = secp256k1_include });
+        p2so_tests.linkLibC();
+        if (target.result.cpu.arch == .x86_64) {
+            p2so_tests.addCSourceFile(.{
+                .file = b.path("src/sha256_shani.c"),
+                .flags = shani_cflags,
+            });
+        }
+        if (minisketch_enabled) {
+            p2so_tests.linkSystemLibrary("minisketch");
+            p2so_tests.addIncludePath(.{ .cwd_relative = minisketch_include });
+        }
+        p2so_tests.root_module.addOptions("build_options", build_options);
+
+        const run_p2so_tests = b.addRunArtifact(p2so_tests);
+        const p2so_step = b.step("test-r3fix-p2sh-sigops", "Run the P2SH-only redeemScript sigop limit tests");
+        p2so_step.dependOn(&run_p2so_tests.step);
+        test_step.dependOn(&run_p2so_tests.step);
+    }
+
     // A tx spending only value-0 coins still gets Core's CheckTxInputs
     // bad-txns-in-belowout and the relay fee floor. Also part of `test`.
     {
