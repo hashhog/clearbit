@@ -1044,6 +1044,7 @@ comptime {
     _ = @import("tests_gate6.zig"); // gate 6: fault injection (resource faults are never verdicts)
     _ = @import("tests_tip_liveness.zig"); // 2026-10-05 tip stalls + send-stall wedge (base-comparable)
     _ = @import("tests_tip_liveness_fix.zig"); // 2026-10-05 tip stalls + send-stall wedge (new API)
+    _ = @import("tests_r3fix_ephemeral_dust.zig"); // R3 G5: Core ephemeral dust (MAX_DUST_OUTPUTS_PER_TX, PreCheckEphemeralTx, CheckEphemeralSpends)
     _ = @import("tests_cmpct_rpc_mined.zig"); // BIP-152 serve + HB announce for RPC-mined blocks
     _ = @import("tests_sec_p2p_cmpct_inv.zig"); // audit 2026-10-29 H1/H2: cmpctblock gate, inv throttles
     _ = @import("tests_neon_header_bad_version.zig"); // 2026-11-24 audit F10: obsolete nVersion refused at header receipt (bad-version)
