@@ -520,7 +520,7 @@ fn oneToOne(a: std.mem.Allocator, prev: types.OutPoint, script_sig: []const u8, 
 /// cannot pay for alone (so the child's parent is missing and both reach
 /// package RBF), and the child spends the parent's P2SH(redeem) output with
 /// an `n`-sigop redeemScript.  Returns the result object and the rig.
-fn packageRbfWithRedeemSigops(a: std.mem.Allocator, n: usize) !struct { r: Rig, res: std.json.ObjectMap, child: types.Transaction, parent: types.Transaction, conflict: types.Transaction } {
+fn packageRbfWithRedeemSigops(a: std.mem.Allocator, n: usize, child_dust: bool) !struct { r: Rig, res: std.json.ObjectMap, child: types.Transaction, parent: types.Transaction, conflict: types.Transaction } {
     const acs = try p2shOf(a, &SCRIPT_OP_TRUE);
     const coin = types.OutPoint{ .hash = RBF_COIN, .index = 0 };
     const r = try rig(a, try chainWithCoin(a, coin, RBF_VALUE, acs));
@@ -532,7 +532,15 @@ fn packageRbfWithRedeemSigops(a: std.mem.Allocator, n: usize) !struct { r: Rig, 
     try r.mp.addTransaction(conflict);
     const parent = try oneToOne(a, coin, &ACS_SCRIPTSIG, RBF_VALUE, 6_000, try p2shOf(a, redeem));
     const parent_txid = try crypto.computeTxid(&parent, a);
-    const child = try oneToOne(a, .{ .hash = parent_txid, .index = 0 }, try pushOf(a, redeem), parent.outputs[0].value, 200_000, acs);
+    var child = try oneToOne(a, .{ .hash = parent_txid, .index = 0 }, try pushOf(a, redeem), parent.outputs[0].value, 200_000, acs);
+    if (child_dust) {
+        // Add one 0-sat output: the child pays a fee, so Core's
+        // PreCheckEphemeralTx would refuse it as "dust" if it ran first.
+        const outs = try a.alloc(types.TxOut, 2);
+        outs[0] = child.outputs[0];
+        outs[1] = .{ .value = 0, .script_pubkey = try p2wshOf(a, &SCRIPT_OP_TRUE) };
+        child.outputs = outs;
+    }
 
     const req = try std.fmt.allocPrint(a, "{{\"id\":1,\"method\":\"submitpackage\",\"params\":[[\"{s}\",\"{s}\"]]}}", .{ try hexOf(a, &parent), try hexOf(a, &child) });
     const resp = try r.srv.dispatch(req);
@@ -555,7 +563,7 @@ test "tests_r3fix_p2sh_sigops package RBF control: a child spending a 15-sigop P
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
-    const s = try packageRbfWithRedeemSigops(a, 15);
+    const s = try packageRbfWithRedeemSigops(a, 15, false);
     try testing.expectEqualStrings("success", s.res.get("package_msg").?.string);
     try testing.expect(try inPool(a, s.r.mp, &s.parent));
     try testing.expect(try inPool(a, s.r.mp, &s.child));
@@ -568,7 +576,7 @@ test "tests_r3fix_p2sh_sigops package RBF: a child spending a 16-sigop P2SH outp
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
-    const s = try packageRbfWithRedeemSigops(a, 16);
+    const s = try packageRbfWithRedeemSigops(a, 16, false);
     try testing.expectEqualStrings("transaction failed", s.res.get("package_msg").?.string);
     const results = s.res.get("tx-results").?.object;
     const c_row = results.get(try wtxidHex(a, &s.child)).?.object;
@@ -576,4 +584,29 @@ test "tests_r3fix_p2sh_sigops package RBF: a child spending a 16-sigop P2SH outp
     try testing.expect(try inPool(a, s.r.mp, &s.conflict));
     try testing.expect(!try inPool(a, s.r.mp, &s.parent));
     try testing.expect(!try inPool(a, s.r.mp, &s.child));
+}
+
+test "tests_r3fix_p2sh_sigops package RBF order: a 16-sigop child with one fee-paying dust output is bad-txns-nonstandard-inputs, not dust" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const s = try packageRbfWithRedeemSigops(a, 16, true);
+    try testing.expectEqualStrings("transaction failed", s.res.get("package_msg").?.string);
+    const results = s.res.get("tx-results").?.object;
+    const c_row = results.get(try wtxidHex(a, &s.child)).?.object;
+    try testing.expectEqualStrings(NSI, c_row.get("error").?.string);
+    try testing.expect(try inPool(a, s.r.mp, &s.conflict));
+}
+
+test "tests_r3fix_p2sh_sigops package RBF control: the same child with 15 sigops and fee-paying dust is refused as dust" {
+    // The dust gate still runs after the sigop gate in package RBF.
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const s = try packageRbfWithRedeemSigops(a, 15, true);
+    try testing.expectEqualStrings("transaction failed", s.res.get("package_msg").?.string);
+    const results = s.res.get("tx-results").?.object;
+    const c_row = results.get(try wtxidHex(a, &s.child)).?.object;
+    try testing.expectEqualStrings("dust", c_row.get("error").?.string);
+    try testing.expect(try inPool(a, s.r.mp, &s.conflict));
 }
