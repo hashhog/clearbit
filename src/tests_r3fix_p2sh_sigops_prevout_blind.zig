@@ -429,3 +429,73 @@ test "tests_r3fix_p2sh_sigops package: a child spending its package parent's P2S
     try expectRejected(crow, NSI);
     try testing.expectEqualStrings(NSI, crow.get("reject-details").?.string);
 }
+
+/// A 16-sigop P2SH spend that pays a 2,000-sat fee and carries one dust
+/// output (a 0-sat P2WSH): two refusals apply.  Core PreChecks runs
+/// AreInputsStandard / ValidateInputsStandardness before PreCheckEphemeralTx
+/// (validation.cpp), so "bad-txns-nonstandard-inputs" wins over "dust".
+fn sigopsAndDustSpend(a: std.mem.Allocator) !struct { r: Rig, tx: types.Transaction } {
+    const redeem = try skippedSigopsRedeem(a, 16);
+    const op = types.OutPoint{ .hash = PREV, .index = 0 };
+    const r = try rig(a, try chainWithCoin(a, op, 100_000, try p2shOf(a, redeem)));
+    const ins = try a.alloc(types.TxIn, 1);
+    ins[0] = .{ .previous_output = op, .script_sig = try pushOf(a, redeem), .sequence = 0xFFFFFFFD, .witness = &.{} };
+    const outs = try a.alloc(types.TxOut, 2);
+    outs[0] = .{ .value = 98_000, .script_pubkey = try p2wshOf(a, &SCRIPT_OP_TRUE) };
+    outs[1] = .{ .value = 0, .script_pubkey = try p2wshOf(a, &SCRIPT_OP_TRUE) };
+    const tx = types.Transaction{ .version = 2, .inputs = ins, .outputs = outs, .lock_time = 0 };
+    // Exactly one dust output: checkStandard's MAX_DUST_OUTPUTS_PER_TX cap
+    // does not fire, so only PreCheckEphemeralTx (fee != 0) could refuse it
+    // for the dust.
+    try testing.expectEqual(@as(usize, 1), mempool_mod.Mempool.dustOutputCount(&tx));
+    return .{ .r = r, .tx = tx };
+}
+
+test "tests_r3fix_p2sh_sigops order: a 16-sigop P2SH spend with one fee-paying dust output is nonstandard-inputs, not dust (full path)" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const s = try sigopsAndDustSpend(a);
+    try expectMempoolError("NonStandardInputs", s.r.mp.addTransaction(s.tx));
+    try testing.expectEqual(@as(usize, 0), s.r.mp.entries.count());
+}
+
+test "tests_r3fix_p2sh_sigops order: the same sigops+dust spend is nonstandard-inputs, not dust (package path)" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const s = try sigopsAndDustSpend(a);
+    try expectMempoolError("NonStandardInputs", s.r.mp.addTransactionWithPackageRate(s.tx, 10.0));
+    try testing.expectEqual(@as(usize, 0), s.r.mp.entries.count());
+}
+
+test "tests_r3fix_p2sh_sigops order: the same sigops+dust spend is bad-txns-nonstandard-inputs, not dust, in testmempoolaccept" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const s = try sigopsAndDustSpend(a);
+    const row = try tma1(a, s.r.srv, s.tx);
+    try expectRejected(row, NSI);
+}
+
+test "tests_r3fix_p2sh_sigops control: a 15-sigop P2SH spend with one fee-paying dust output is refused as dust on every path" {
+    // The dust gate is still live after the sigop gate: with the sigop rule
+    // satisfied, PreCheckEphemeralTx refuses the fee-paying dust tx.
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const redeem = try skippedSigopsRedeem(a, 15);
+    const op = types.OutPoint{ .hash = PREV, .index = 0 };
+    const r = try rig(a, try chainWithCoin(a, op, 100_000, try p2shOf(a, redeem)));
+    const ins = try a.alloc(types.TxIn, 1);
+    ins[0] = .{ .previous_output = op, .script_sig = try pushOf(a, redeem), .sequence = 0xFFFFFFFD, .witness = &.{} };
+    const outs = try a.alloc(types.TxOut, 2);
+    outs[0] = .{ .value = 98_000, .script_pubkey = try p2wshOf(a, &SCRIPT_OP_TRUE) };
+    outs[1] = .{ .value = 0, .script_pubkey = try p2wshOf(a, &SCRIPT_OP_TRUE) };
+    const tx = types.Transaction{ .version = 2, .inputs = ins, .outputs = outs, .lock_time = 0 };
+
+    try expectRejected(try tma1(a, r.srv, tx), "dust");
+    try expectMempoolError("DustOutput", r.mp.addTransactionWithPackageRate(tx, 10.0));
+    try expectMempoolError("DustOutput", r.mp.addTransaction(tx));
+    try testing.expectEqual(@as(usize, 0), r.mp.entries.count());
+}
