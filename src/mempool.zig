@@ -119,6 +119,11 @@ pub const MAX_STANDARD_SCRIPTSIG_SIZE: usize = 1650;
 /// Mirrors Bitcoin Core's MAX_OP_RETURN_RELAY in policy/policy.h.
 pub const MAX_OP_RETURN_RELAY: usize = consensus.MAX_STANDARD_TX_WEIGHT / consensus.WITNESS_SCALE_FACTOR;
 
+/// Most dust outputs a standard tx may carry (Core MAX_DUST_OUTPUTS_PER_TX,
+/// policy/policy.h).  One is allowed so a 0-fee parent can carry ephemeral
+/// dust that its child spends in the same package.
+pub const MAX_DUST_OUTPUTS_PER_TX: usize = 1;
+
 // ============================================================================
 // IsWitnessStandard Constants (Core policy/policy.h)
 // ============================================================================
@@ -254,8 +259,6 @@ pub const MempoolError = error{
     NonStandardVersion,
     /// Output value is below the dust threshold.
     DustOutput,
-    /// Pay-to-Anchor output has non-zero value.
-    AnchorNonZeroValue,
     /// Serialized transaction weight exceeds MAX_STANDARD_TX_WEIGHT (400,000 WU).
     /// Mirrors Bitcoin Core's "tx-size" relay-policy reject in policy/policy.cpp.
     TxWeightTooLarge,
@@ -400,6 +403,11 @@ pub const MempoolError = error{
     /// (validation.cpp ReplacementChecks, policy/rbf.cpp::ImprovesFeerateDiagram).
     /// See DIAGRAM_REJECT_REASON / DIAGRAM_REJECT_DETAILS.
     DiagramNotImproved,
+    /// A parent (in the pool or the package) has a dust output this tx does
+    /// not spend.  Core CheckEphemeralSpends (policy/ephemeral_policy.cpp):
+    /// TX_MEMPOOL_POLICY "missing-ephemeral-spends"; a package reports
+    /// "unspent-dust".
+    MissingEphemeralSpends,
 };
 
 /// Core's reject reason for a replacement that does not improve the feerate
@@ -522,6 +530,7 @@ fn rejectReasonForError(err: MempoolError) []const u8 {
         MempoolError.NonFinal => "bad-txns-nonfinal",
         MempoolError.ImmatureCoinbase => "bad-txns-premature-spend-of-coinbase",
         MempoolError.SequenceLockNotSatisfied => "non-BIP68-final",
+        MempoolError.MissingEphemeralSpends => "missing-ephemeral-spends",
         else => "rejected",
     };
 }
@@ -1677,6 +1686,11 @@ pub const Mempool = struct {
             return MempoolError.NonStandardInputs;
         }
 
+        // 5d. Core PreCheckEphemeralTx: a tx carrying dust must pay no fee
+        //     (base or modified). Core order: AreInputsStandard (5c), then
+        //     PreCheckEphemeralTx, then CheckFeeRate.
+        try preCheckEphemeralTx(&tx, fee_known, fee, fee + self.applyDelta(tx_hash));
+
         // 6. Compute size and check minimum fee
         const weight = computeTxWeight(&tx, self.allocator) catch return MempoolError.OutOfMemory;
         const vsize = (weight + 3) / 4;
@@ -1716,8 +1730,12 @@ pub const Mempool = struct {
         // run this BEFORE any mutation (RBF removal / TRUC checks) so a
         // failing tx leaves mempool state untouched.
         //
+        // Core CheckEphemeralSpends({tx}) runs first (AcceptSingleTransaction,
+        // skipped under bypass_limits): a pool parent's dust must be spent.
+        //
         // Returns the tx's BIP-141 weighted sigop cost, which feeds the cluster
         // size gate below (Core txmempool.cpp:1017 → policy.cpp:390).
+        if (!self.bypass_limits) try self.checkEphemeralSpends(&tx);
         const sigop_cost = try self.verifyInputScripts(&tx);
 
         // Per-tx cluster contribution, in WEIGHT units:
@@ -1808,10 +1826,8 @@ pub const Mempool = struct {
             return MempoolError.ClusterSizeLimitExceeded;
         }
 
-        // 9. Check dust outputs
-        for (tx.outputs) |output| {
-            if (isDust(&output)) return MempoolError.DustOutput;
-        }
+        // 9. Dust: checkStandard (more than one dust output),
+        // preCheckEphemeralTx (§5c) and checkEphemeralSpends (§6b), as Core.
 
         // 9b. Every gate has passed: apply the staged evictions (RBF
         // conflicts with their descendants, then a TRUC sibling).
@@ -2219,6 +2235,7 @@ pub const Mempool = struct {
                     MempoolError.NonFinal => "non-final",
                     MempoolError.SequenceLockNotSatisfied => "non-BIP68-final",
                     MempoolError.ImmatureCoinbase => "bad-txns-premature-spend-of-coinbase",
+                    MempoolError.MissingEphemeralSpends => "missing-ephemeral-spends",
                     else => "non-standard",
                 };
                 return AcceptResult{
@@ -4218,6 +4235,11 @@ pub const Mempool = struct {
             tx_sigop_cost = sigop_cost;
         }
 
+        // Whole-tx sighash digests, once for this tx, shared by every input
+        // check below under both flag sets (Core: one
+        // PrecomputedTransactionData per tx in MemPoolAccept, ws.m_precomputed_txdata).
+        const txdata = crypto.PrecomputedTxData.init(tx, spent_amounts, spent_scripts);
+
         // Now actually run the script engine against each input.
         for (tx.inputs, 0..) |input, input_index| {
             var engine = script.ScriptEngine.initWithPrevouts(
@@ -4230,6 +4252,7 @@ pub const Mempool = struct {
                 spent_scripts,
             );
             defer engine.deinit();
+            engine.txdata = &txdata;
 
             const result = engine.verify(
                 input.script_sig,
@@ -4296,6 +4319,7 @@ pub const Mempool = struct {
                 spent_scripts,
             );
             defer engine.deinit();
+            engine.txdata = &txdata;
 
             const result = engine.verify(
                 input.script_sig,
@@ -4417,19 +4441,15 @@ pub const Mempool = struct {
         // scriptSigs and the SPENT scriptPubKeys, never this tx's own outputs,
         // so it needs the prevouts.  It runs in validateInputsStandardness.
 
-        // Per-output checks: script type standardness, P2A value, datacarrier
-        // cumulative limit, and bare-multisig n-of-m validity.
+        // Per-output checks: script type standardness, datacarrier cumulative
+        // limit, and bare-multisig n-of-m validity. P2A (Pay-to-Anchor) has no
+        // value rule here: Core's IsStandard / IsStandardTx accept an ANCHOR
+        // output of any value, and its only value bound is the ordinary
+        // witness-program dust threshold (dustThreshold, 240 sat).
         var datacarrier_bytes: usize = 0;
         for (tx.outputs) |output| {
             const stype = script.classifyScript(output.script_pubkey);
             if (stype == .nonstandard) return MempoolError.NonStandard;
-
-            // P2A (Pay-to-Anchor) outputs must have value 0.
-            // They're designed for fee bumping and non-zero value is non-standard.
-            // Reference: Bitcoin Core policy/policy.cpp
-            if (stype == .anchor and output.value != 0) {
-                return MempoolError.AnchorNonZeroValue;
-            }
 
             // Datacarrier (OP_RETURN / null_data) cumulative limit.
             // Core tracks how many bytes remain of max_datacarrier_bytes across
@@ -4459,6 +4479,12 @@ pub const Mempool = struct {
                 }
             }
         }
+
+        // Core IsStandardTx ends with the dust count: at most
+        // MAX_DUST_OUTPUTS_PER_TX dust outputs ("dust").  A single dust
+        // output is judged later, by preCheckEphemeralTx (the tx must pay no
+        // fee) and checkEphemeralSpends (its child must spend it).
+        if (dustOutputCount(tx) > MAX_DUST_OUTPUTS_PER_TX) return MempoolError.DustOutput;
     }
 
     /// Core's "Are inputs missing because we already have the tx?" probe: true
@@ -4499,12 +4525,9 @@ pub const Mempool = struct {
         //    bare-multisig / script-type). Same gate the full path runs first.
         try self.checkStandard(tx);
 
-        // 2. Dust gate — Core folds this into IsStandardTx (GetDust). clearbit
-        //    keeps the dust loop out of checkStandard for the full path, so we
-        //    apply it explicitly here to match the full path's reject.
-        for (tx.outputs) |output| {
-            if (isDust(&output)) return MempoolError.DustOutput;
-        }
+        // 2. Dust: checkStandard refuses more than MAX_DUST_OUTPUTS_PER_TX
+        //    (Core IsStandardTx); one dust output is judged by
+        //    preCheckEphemeralTx below, after the input checks.
 
         // 2b. BIP-113 IsFinalTx (CheckFinalTxAtTip): nLockTime must be satisfied
         //     at the next block. Core runs this in PreChecks (validation.cpp:819)
@@ -4625,6 +4648,10 @@ pub const Mempool = struct {
             //     testmempoolaccept package alike.
             if (try self.p2shSigopsOverLimit(tx)) return MempoolError.NonStandardInputs;
 
+            // 3c. Core PreCheckEphemeralTx, after AreInputsStandard (3b) and
+            //     before CheckFeeRate.
+            try preCheckEphemeralTx(tx, true, fee, fee + self.applyDelta(tx_hash));
+
             const min_fee_sat_kvb = @as(f64, @floatFromInt(self.getMinFee()));
             const modified_fee = fee + self.applyDelta(tx_hash);
             const modified_fee_rate: f64 = if (vsize > 0)
@@ -4634,6 +4661,8 @@ pub const Mempool = struct {
             if (modified_fee_rate * 1000.0 < min_fee_sat_kvb) {
                 return MempoolError.InsufficientFee;
             }
+        } else {
+            try preCheckEphemeralTx(tx, false, 0, 0);
         }
 
         // 4. RBF / mempool-conflict gate (read-only, no mempool mutation).
@@ -4673,6 +4702,11 @@ pub const Mempool = struct {
         if (conflicting_txids.items.len > 0) {
             try self.checkRBFRules(tx, tx_hash, fee, vsize, conflicting_txids.items);
         }
+
+        // 5. Core CheckEphemeralSpends({tx}) (AcceptSingleTransaction, after
+        //    the replacement checks).  testAcceptMultiple checks the whole
+        //    package itself.
+        if (!self.test_disallow_replacement) try self.checkEphemeralSpends(tx);
 
         return fee;
     }
@@ -4875,8 +4909,10 @@ pub const Mempool = struct {
     /// `GetDustThreshold` (policy/policy.cpp:27-63).
     ///
     /// An output whose value is below this threshold is "dust": it would cost
-    /// more in fees to spend than it is worth. Unspendable outputs (OP_RETURN,
-    /// P2A) return 0 — they can never be dust (Core: `IsUnspendable()` ⇒ 0).
+    /// more in fees to spend than it is worth. Unspendable outputs (OP_RETURN)
+    /// return 0 — they can never be dust (Core: `IsUnspendable()` ⇒ 0).
+    /// P2A (`OP_1 <0x4e73>`) has no special case: it is a witness program, so
+    /// its threshold is (13 + 67) * 3 = 240 sat at the default rate.
     ///
     ///   nSize = GetSerializeSize(txout) + spending_cost
     ///         = (8 + CompactSize(scriptlen) + scriptlen) + spending_cost
@@ -4895,9 +4931,6 @@ pub const Mempool = struct {
         // OP_RETURN and other unspendable scripts can never be dust
         // (Core `txout.scriptPubKey.IsUnspendable()` ⇒ return 0).
         if (spk.len > 0 and spk[0] == 0x6a) return 0;
-
-        // P2A (Pay-to-Anchor) outputs are exempt from the dust threshold.
-        if (script.classifyScript(spk) == .anchor) return 0;
 
         const script_len: u64 = spk.len;
         // CompactSize prefix for the script length (GetSerializeSize).
@@ -4930,6 +4963,93 @@ pub const Mempool = struct {
     /// Delegates to `dustThreshold` (Core GetDustThreshold / IsDust).
     pub fn isDust(output: *const types.TxOut) bool {
         return output.value < dustThreshold(output, consensus.DUST_RELAY_FEE);
+    }
+
+    /// Number of dust outputs in `tx` (Core GetDust(tx).size(),
+    /// policy/policy.cpp).
+    pub fn dustOutputCount(tx: *const types.Transaction) usize {
+        var n: usize = 0;
+        for (tx.outputs) |*o| {
+            if (isDust(o)) n += 1;
+        }
+        return n;
+    }
+
+    /// Core PreCheckEphemeralTx (policy/ephemeral_policy.cpp): a tx with a
+    /// dust output must pay no fee, base or modified ("dust"), so it has no
+    /// reason to be mined without the child that spends the dust.  Core runs
+    /// it in PreChecks after CheckTxInputs and the input-standardness checks
+    /// and before the sigops-cost gate and CheckFeeRate.
+    ///
+    /// `fee_known` is false only in a pool with no chain state (unit tests)
+    /// whose inputs could not be valued; there any dust is refused, as before.
+    pub fn preCheckEphemeralTx(tx: *const types.Transaction, fee_known: bool, base_fee: i64, mod_fee: i64) MempoolError!void {
+        if (dustOutputCount(tx) == 0) return;
+        if (!fee_known or base_fee != 0 or mod_fee != 0) return MempoolError.DustOutput;
+    }
+
+    /// A parent tx by txid for CheckEphemeralSpends: the earlier txs of a
+    /// testmempoolaccept package first, then the pool (Core: the package's
+    /// map_txid_ref, then tx_pool.get).
+    fn ephemeralParent(self: *Mempool, txid: types.Hash256) ?*const types.Transaction {
+        for (self.test_package_txids, 0..) |pt, i| {
+            if (std.mem.eql(u8, &pt, &txid)) return &self.test_package_view[i];
+        }
+        if (self.entries.get(txid)) |e| return &e.tx;
+        return null;
+    }
+
+    /// Core CheckEphemeralSpends (policy/ephemeral_policy.cpp) for one tx:
+    /// every dust output of each parent that is in the pool (or earlier in a
+    /// testmempoolaccept package) must be spent by `tx`, else
+    /// "missing-ephemeral-spends".  Parents that are confirmed coins have no
+    /// ephemeral dust to spend.  acceptPackage adds package parents to the
+    /// pool before their child, so the same check covers a package's child.
+    fn checkEphemeralSpends(self: *Mempool, tx: *const types.Transaction) MempoolError!void {
+        for (tx.inputs, 0..) |input, i| {
+            const parent_txid = input.previous_output.hash;
+            // Skip parents already checked (Core processed_parent_set).
+            var seen = false;
+            for (tx.inputs[0..i]) |earlier| {
+                if (std.mem.eql(u8, &earlier.previous_output.hash, &parent_txid)) {
+                    seen = true;
+                    break;
+                }
+            }
+            if (seen) continue;
+            const parent = self.ephemeralParent(parent_txid) orelse continue;
+            for (parent.outputs, 0..) |*o, out_index| {
+                if (!isDust(o)) continue;
+                var spent = false;
+                for (tx.inputs) |spend_in| {
+                    if (spend_in.previous_output.index == out_index and
+                        std.mem.eql(u8, &spend_in.previous_output.hash, &parent_txid))
+                    {
+                        spent = true;
+                        break;
+                    }
+                }
+                if (!spent) return MempoolError.MissingEphemeralSpends;
+            }
+        }
+    }
+
+    /// Core's TxValidationState::ToString for a CheckEphemeralSpends failure:
+    /// "missing-ephemeral-spends, tx <txid> (wtxid=<wtxid>) did not spend
+    /// parent's ephemeral dust".  Owned by `allocator`.
+    pub fn missingEphemeralSpendsDetails(tx: *const types.Transaction, allocator: std.mem.Allocator) error{OutOfMemory}![]u8 {
+        const txid = crypto.computeTxid(tx, allocator) catch return error.OutOfMemory;
+        const wtxid = crypto.computeWtxid(tx, allocator) catch return error.OutOfMemory;
+        var t: [32]u8 = undefined;
+        var w: [32]u8 = undefined;
+        for (0..32) |k| {
+            t[k] = txid[31 - k];
+            w[k] = wtxid[31 - k];
+        }
+        return std.fmt.allocPrint(allocator, "missing-ephemeral-spends, tx {s} (wtxid={s}) did not spend parent's ephemeral dust", .{
+            std.fmt.fmtSliceHexLower(&t),
+            std.fmt.fmtSliceHexLower(&w),
+        });
     }
 
     /// Evict at least `needed_bytes` of memory usage, worst chunk first
@@ -5557,6 +5677,20 @@ pub const Mempool = struct {
             results[i].vsize = r.vsize;
         }
 
+        // Core CheckEphemeralSpends over the package (AcceptMultipleTransactions,
+        // before the script checks): the failing tx is "missing-ephemeral-spends"
+        // and the others stay unfinished.
+        for (txns, 0..) |*tx, i| {
+            self.test_package_view = txns[0..i];
+            self.test_package_txids = txids[0..i];
+            self.checkEphemeralSpends(tx) catch {
+                results[i].state = .rejected;
+                results[i].reject_reason = "missing-ephemeral-spends";
+                results[i].reject_details = try missingEphemeralSpendsDetails(tx, allocator);
+                return;
+            };
+        }
+
         // Script checks (Core PolicyScriptChecks), in order.  A tx that
         // passes is allowed; the first that fails ends validation.
         for (txns, 0..) |*tx, i| {
@@ -6031,11 +6165,16 @@ pub const Mempool = struct {
             if (fee < 0) return MempoolError.InputsBelowOutputs;
         }
 
-        // 5c. AreInputsStandard's P2SH redeemScript sigop limit, before the
-        //     fee gate, as addTransaction §5c.
+        // 5b. AreInputsStandard's P2SH redeemScript sigop limit, before
+        //     PreCheckEphemeralTx and the fee gate, as addTransaction §5c.
         if (self.chain_state != null and try self.p2shSigopsOverLimit(&tx)) {
             return MempoolError.NonStandardInputs;
         }
+
+        // 5c. Core PreCheckEphemeralTx (per tx, in PreChecks, after
+        //     AreInputsStandard): a tx carrying dust must pay no fee itself;
+        //     the package feerate does not help.
+        try preCheckEphemeralTx(&tx, fee_known, fee, fee + self.applyDelta(tx_hash));
 
         // 6. Compute size
         const weight = computeTxWeight(&tx, self.allocator) catch return MempoolError.OutOfMemory;
@@ -6052,6 +6191,11 @@ pub const Mempool = struct {
         if (fee_known and package_fee_rate * 1000.0 < min_fee_rate_sat_kvb) {
             return MempoolError.InsufficientFee;
         }
+
+        // 6a. Core CheckEphemeralSpends, before the script checks.  The
+        // package's parents are already in the pool (acceptPackage adds them
+        // first), so this is the package check for the child.
+        if (!self.bypass_limits) try self.checkEphemeralSpends(&tx);
 
         // 6b. Script verification (STANDARD_SCRIPT_VERIFY_FLAGS) — same gate
         // as `addTransaction`. See that function's comment for the why.
@@ -6112,10 +6256,7 @@ pub const Mempool = struct {
             return MempoolError.ClusterSizeLimitExceeded;
         }
 
-        // 9. Check dust outputs
-        for (tx.outputs) |output| {
-            if (isDust(&output)) return MempoolError.DustOutput;
-        }
+        // 9. Dust: checkStandard, §5b and §6a (see addTransaction §9).
 
         // 9b. Every gate has passed: apply the staged evictions.
         self.applyStagedEvictions(conflicting_txids.items, truc_result.sibling_to_evict);
@@ -7344,12 +7485,14 @@ test "dust detection for different output types" {
     try std.testing.expectEqual(@as(i64, 0), Mempool.dustThreshold(&op_return_output, consensus.DUST_RELAY_FEE));
     try std.testing.expect(!Mempool.isDust(&op_return_output));
 
-    // P2A (Pay-to-Anchor) is exempt → threshold 0 → never dust (Core parity:
-    // ephemeral anchors handled via the ephemeral-dust mechanism, not here).
+    // P2A (Pay-to-Anchor) is an ordinary witness program to Core's
+    // GetDustThreshold: nSize = 13 + 67 = 80 → 240. 0 and 239 are dust, 240 is
+    // not (a 0-sat anchor is standard only as ephemeral dust in a 0-fee tx).
     const p2a_output_zero = types.TxOut{ .value = 0, .script_pubkey = &script.P2A_SCRIPT };
-    try std.testing.expect(!Mempool.isDust(&p2a_output_zero));
-    const p2a_output_nonzero = types.TxOut{ .value = 1, .script_pubkey = &script.P2A_SCRIPT };
-    try std.testing.expect(!Mempool.isDust(&p2a_output_nonzero));
+    try std.testing.expectEqual(@as(i64, 240), Mempool.dustThreshold(&p2a_output_zero, consensus.DUST_RELAY_FEE));
+    try std.testing.expect(Mempool.isDust(&p2a_output_zero));
+    try std.testing.expect(Mempool.isDust(&types.TxOut{ .value = 239, .script_pubkey = &script.P2A_SCRIPT }));
+    try std.testing.expect(!Mempool.isDust(&types.TxOut{ .value = 240, .script_pubkey = &script.P2A_SCRIPT }));
 }
 
 test "P2A (Pay-to-Anchor) standardness" {
@@ -7360,7 +7503,7 @@ test "P2A (Pay-to-Anchor) standardness" {
 
     // Create input. Use a single OP_0 (0x00) scriptSig so the non-witness
     // serialization is exactly 65 bytes, satisfying MIN_STANDARD_TX_NONWITNESS_SIZE.
-    // Without it the tx is 64 bytes and hits TxTooSmall before AnchorNonZeroValue.
+    // Without it the tx is 64 bytes and hits TxTooSmall before the output checks.
     // Serialization: version(4) + in_count(1) + outpoint(36) + scriptSig_len(1) +
     //   scriptSig(1) + sequence(4) + out_count(1) + value(8) + spk_len(1) +
     //   P2A_SCRIPT(4) + locktime(4) = 65 bytes.
@@ -7388,16 +7531,17 @@ test "P2A (Pay-to-Anchor) standardness" {
         return error.TestUnexpectedResult;
     };
 
-    // P2A output with non-zero value should be rejected
-    const p2a_output_bad = types.TxOut{ .value = 1000, .script_pubkey = &script.P2A_SCRIPT };
-    const outputs_bad = [_]types.TxOut{p2a_output_bad};
-    const tx_bad = types.Transaction{
+    // P2A output with a non-zero value is standard too: Core has no value
+    // rule for ANCHOR outputs (only the dust threshold, checked separately).
+    const p2a_output_valued = types.TxOut{ .value = 1000, .script_pubkey = &script.P2A_SCRIPT };
+    const outputs_valued = [_]types.TxOut{p2a_output_valued};
+    const tx_valued = types.Transaction{
         .version = 2,
         .inputs = &inputs_ok,
-        .outputs = &outputs_bad,
+        .outputs = &outputs_valued,
         .lock_time = 0,
     };
-    try std.testing.expectError(MempoolError.AnchorNonZeroValue, mempool.checkStandard(&tx_bad));
+    try mempool.checkStandard(&tx_valued);
 }
 
 test "RBF signaling detection" {
@@ -11906,13 +12050,12 @@ fn packageTxVsize(mempool: *Mempool, txns: []const types.Transaction, txids: []c
     return .{ .vsize = (cw + 3) / 4, .cluster_weight = cw };
 }
 
-/// Standardness, dust and script checks of package tx `i` (against the pool
-/// plus `txns[0..i]`), then its sigop-adjusted size.
-fn packageTxPrechecks(mempool: *Mempool, txns: []const types.Transaction, txids: []const types.Hash256, i: usize, fail: *?ScriptFailure) MempoolError!PkgTxSize {
+/// Standardness, dust (Core IsStandardTx + PreCheckEphemeralTx on the tx's
+/// own base and modified fee) and script checks of package tx `i` (against
+/// the pool plus `txns[0..i]`), then its sigop-adjusted size.
+fn packageTxPrechecks(mempool: *Mempool, txns: []const types.Transaction, txids: []const types.Hash256, i: usize, base_fee: i64, fail: *?ScriptFailure) MempoolError!PkgTxSize {
     try mempool.checkStandard(&txns[i]);
-    for (txns[i].outputs) |*o| {
-        if (Mempool.isDust(o)) return MempoolError.DustOutput;
-    }
+    try Mempool.preCheckEphemeralTx(&txns[i], true, base_fee, base_fee + mempool.applyDelta(txids[i]));
     return packageTxVsize(mempool, txns, txids, i, fail);
 }
 
@@ -11958,7 +12101,7 @@ fn packageRbf(
     var cw: [2]u64 = undefined;
     for (txns, 0..) |*tx, i| {
         var fail: ?ScriptFailure = null;
-        const v = packageTxPrechecks(mempool, txns, &txids, i, &fail) catch |err| {
+        const v = packageTxPrechecks(mempool, txns, &txids, i, tx_results[i].fee, &fail) catch |err| {
             if (err == MempoolError.OutOfMemory) return PackageError.OutOfMemory;
             if (tx_results[i].error_message_owned) if (tx_results[i].error_message) |m| allocator.free(m);
             tx_results[i].error_message_owned = false;
@@ -12330,13 +12473,67 @@ pub fn acceptPackage(
         }
     }
 
+    var package_msg: ?[]const u8 = null;
+    var pkg_rbf_replaced: []types.Hash256 = &.{};
+    defer if (pkg_rbf_replaced.len > 0) allocator.free(pkg_rbf_replaced);
+
+    // Core AcceptPackage -> AcceptMultipleTransactions: the txs that need
+    // package evaluation (below the relay minimum alone, or spending such a
+    // tx) enter the pool together or not at all.  CheckEphemeralSpends
+    // failing there is "unspent-dust", with the child's
+    // "missing-ephemeral-spends".  clearbit adds package txs one at a time,
+    // so a 0-fee parent carrying dust is already in when its child fails;
+    // it must not stay without the child that spends its dust.  So when a
+    // package-evaluated tx failed and either it was CheckEphemeralSpends or
+    // an admitted package-evaluated tx carries dust, every tx that was here
+    // only on the package feerate (package_eval) is taken out again and
+    // keeps its own failure, "min relay fee not met".  A tx that got in on
+    // its own fee stays, as in Core.
+    var unspent_dust = false;
+    var pkg_eval_failed = false;
+    for (txns, 0..) |*tx, i| {
+        const e = tx_errs[i] orelse continue;
+        var needs_pkg = tx_results[i].fee * 1000 < MIN_RELAY_FEE * @as(i64, @intCast(tx_results[i].vsize));
+        for (tx.inputs) |input| {
+            for (tx_results[0..i]) |r| {
+                if (r.package_eval and std.mem.eql(u8, &r.txid, &input.previous_output.hash)) needs_pkg = true;
+            }
+        }
+        if (!needs_pkg) continue;
+        pkg_eval_failed = true;
+        if (e != MempoolError.MissingEphemeralSpends) continue;
+        unspent_dust = true;
+        if (tx_results[i].error_message_owned) if (tx_results[i].error_message) |m| allocator.free(m);
+        tx_results[i].error_message = Mempool.missingEphemeralSpendsDetails(tx, allocator) catch return PackageError.OutOfMemory;
+        tx_results[i].error_message_owned = true;
+    }
+    var dusty_admitted = false;
+    for (tx_results, 0..) |r, j| {
+        if (r.accepted and r.package_eval and !already_in_mempool.contains(r.txid) and Mempool.dustOutputCount(&txns[j]) > 0) dusty_admitted = true;
+    }
+    if (unspent_dust or (pkg_eval_failed and dusty_admitted)) {
+        mempool.lockChainThenPool();
+        defer mempool.unlockPoolThenChain();
+        for (tx_results, 0..) |*r, j| {
+            if (!r.accepted or !r.package_eval or already_in_mempool.contains(r.txid)) continue;
+            mempool.removeTransactionWithDescendants(r.txid);
+            r.accepted = false;
+            r.package_eval = false;
+            r.effective_fee_rate = null;
+            if (mempool.minRelayFeeDetails(&txns[j], r.txid, allocator) catch return PackageError.OutOfMemory) |d| {
+                r.error_message = d;
+                r.error_message_owned = true;
+            } else {
+                r.error_message = "min relay fee not met";
+            }
+        }
+        if (unspent_dust) package_msg = "unspent-dust";
+    }
+
     // Core AcceptPackage: a parent that failed alone only because it cannot
     // pay for its replacement (TX_RECONSIDERABLE), and a child whose parent
     // is therefore missing, are evaluated together; with conflicts, that is
     // PackageRBFChecks (validation.cpp).
-    var package_msg: ?[]const u8 = null;
-    var pkg_rbf_replaced: []types.Hash256 = &.{};
-    defer if (pkg_rbf_replaced.len > 0) allocator.free(pkg_rbf_replaced);
     if (!all_accepted and txns.len == 2 and already_in_mempool.count() == 0 and
         tx_errs[0] != null and isRbfReconsiderable(tx_errs[0].?) and
         tx_errs[1] != null and (tx_errs[1].? == MempoolError.MissingInputs or isRbfReconsiderable(tx_errs[1].?)))

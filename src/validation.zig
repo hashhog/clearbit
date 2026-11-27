@@ -492,6 +492,52 @@ pub fn isFinalTx(tx: *const types.Transaction, block_height: u32, lock_time_cuto
 // Transaction Validation
 // ============================================================================
 
+/// Inputs at or below this count use the pairwise scan: at most 496
+/// comparisons, cheaper than an allocation.
+const DUP_INPUT_PAIRWISE_MAX: usize = 32;
+
+fn outpointLessThan(_: void, a: types.OutPoint, b: types.OutPoint) bool {
+    return switch (std.mem.order(u8, &a.hash, &b.hash)) {
+        .lt => true,
+        .gt => false,
+        .eq => a.index < b.index,
+    };
+}
+
+fn hasDuplicateOutpointPairwise(inputs: []const types.TxIn) bool {
+    for (inputs, 0..) |input_a, i| {
+        for (inputs[i + 1 ..]) |input_b| {
+            if (std.mem.eql(u8, &input_a.previous_output.hash, &input_b.previous_output.hash) and
+                input_a.previous_output.index == input_b.previous_output.index)
+            {
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
+/// True if two inputs spend the same outpoint (hash and index both equal).
+/// Same verdict as Core's std::set<COutPoint> insert loop: sort a copy of
+/// the outpoints and compare neighbours, O(n log n).  If the scratch copy
+/// cannot be allocated, fall back to the pairwise scan so the verdict never
+/// depends on memory pressure.
+pub fn hasDuplicateOutpoint(inputs: []const types.TxIn) bool {
+    if (inputs.len <= DUP_INPUT_PAIRWISE_MAX) return hasDuplicateOutpointPairwise(inputs);
+
+    const allocator = std.heap.c_allocator;
+    const outpoints = allocator.alloc(types.OutPoint, inputs.len) catch
+        return hasDuplicateOutpointPairwise(inputs);
+    defer allocator.free(outpoints);
+
+    for (inputs, outpoints) |input, *op| op.* = input.previous_output;
+    std.sort.pdq(types.OutPoint, outpoints, {}, outpointLessThan);
+    for (outpoints[0 .. outpoints.len - 1], outpoints[1..]) |a, b| {
+        if (std.mem.eql(u8, &a.hash, &b.hash) and a.index == b.index) return true;
+    }
+    return false;
+}
+
 /// Check transaction rules that do not require context (no UTXO lookups).
 /// These are "sanity checks" that can be performed without accessing the chain state.
 pub fn checkTransactionSanity(tx: *const types.Transaction) ValidationError!void {
@@ -516,15 +562,11 @@ pub fn checkTransactionSanity(tx: *const types.Transaction) ValidationError!void
     }
 
     // 3. Check for duplicate inputs (same outpoint)
-    for (tx.inputs, 0..) |input_a, i| {
-        for (tx.inputs[i + 1 ..]) |input_b| {
-            if (std.mem.eql(u8, &input_a.previous_output.hash, &input_b.previous_output.hash) and
-                input_a.previous_output.index == input_b.previous_output.index)
-            {
-                return ValidationError.DuplicateInput;
-            }
-        }
-    }
+    // Core: consensus/tx_check.cpp:41-44 inserts every prevout into a
+    // std::set<COutPoint> (O(n log n)).  Step 1b allows up to ~24,389 inputs,
+    // so a pairwise scan here is ~3e8 comparisons per relayed 1 MB tx, all of
+    // it under the chain+pool lock.
+    if (hasDuplicateOutpoint(tx.inputs)) return ValidationError.DuplicateInput;
 
     // 4. Coinbase-specific checks
     if (tx.isCoinbase()) {
@@ -597,6 +639,7 @@ pub fn checkTransactionContextual(
         spent_amounts[i] = utxos[i].value;
         spent_scripts[i] = utxos[i].script_pubkey;
     }
+    const txdata = crypto.PrecomputedTxData.init(tx, spent_amounts, spent_scripts);
 
     for (tx.inputs, 0..) |input, input_index| {
         var engine = script.ScriptEngine.initWithPrevouts(
@@ -609,6 +652,7 @@ pub fn checkTransactionContextual(
             spent_scripts,
         );
         defer engine.deinit();
+        engine.txdata = &txdata;
 
         const result = engine.verify(
             input.script_sig,
@@ -3205,6 +3249,11 @@ pub const ScriptCheckJob = struct {
     /// Empty slices `&.{}` if Taproot won't be exercised.
     spent_amounts: []const i64 = &.{},
     spent_scripts: []const []const u8 = &.{},
+    /// The tx's whole-tx sighash digests, built once per tx from the same
+    /// tx and `spent_amounts` / `spent_scripts` and shared read-only by all
+    /// of its jobs (Core: every CScriptCheck of a tx points at one
+    /// PrecomputedTransactionData).  Null = the job's checks rebuild them.
+    txdata: ?*const crypto.PrecomputedTxData = null,
     /// Result of verification (set by worker thread)
     result: std.atomic.Value(VerifyResult),
     /// Reject reason; 0 on success. Written by the worker that ran this job.
@@ -3717,6 +3766,9 @@ fn verifyScriptJob(job: *ScriptCheckJob, allocator: std.mem.Allocator, cache: *s
         job.spent_scripts,
     );
     defer engine.deinit();
+    // Built from the block's copy of this tx; `tx` above is a byte-exact
+    // re-parse of it, so the digests are the same.
+    engine.txdata = job.txdata;
 
     const result = engine.verify(
         input.script_sig,
@@ -3831,7 +3883,15 @@ pub fn verifyBlockScriptsParallel(
         prevouts_list.deinit();
     }
 
-    for (block.transactions[1..]) |*tx| {
+    // One PrecomputedTxData per tx, built here on the submitting thread
+    // before submit() and only read by the workers.  A fixed-size slice, so
+    // the jobs' pointers into it stay valid until waitAll returns.
+    const txdatas = allocator.alloc(crypto.PrecomputedTxData, block.transactions.len - 1) catch {
+        return ValidationError.OutOfMemory;
+    };
+    defer allocator.free(txdatas);
+
+    for (block.transactions[1..], 0..) |*tx, tx_i| {
         // Serialize transaction once for all its inputs
         var writer = serialize.Writer.init(allocator);
         defer writer.deinit();
@@ -3867,6 +3927,7 @@ pub fn verifyBlockScriptsParallel(
             allocator.free(pt.scripts);
             return ValidationError.OutOfMemory;
         };
+        txdatas[tx_i] = crypto.PrecomputedTxData.init(tx, pt.amounts, pt.scripts);
 
         for (tx.inputs, 0..) |input, input_idx| {
             jobs[job_idx] = ScriptCheckJob.initWithPrevouts(
@@ -3879,6 +3940,7 @@ pub fn verifyBlockScriptsParallel(
                 pt.amounts,
                 pt.scripts,
             );
+            jobs[job_idx].txdata = &txdatas[tx_i];
             job_idx += 1;
         }
     }
@@ -3963,6 +4025,8 @@ fn verifyBlockScriptsSingleThreaded(
             spent_amounts[i] = entry.amount;
             spent_scripts[i] = entry.script_pubkey;
         }
+        // Whole-tx sighash digests, once for all of this tx's inputs.
+        const txdata = crypto.PrecomputedTxData.init(tx, spent_amounts, spent_scripts);
 
         for (tx.inputs, 0..) |input, input_idx| {
             var engine = script.ScriptEngine.initWithPrevouts(
@@ -3975,6 +4039,7 @@ fn verifyBlockScriptsSingleThreaded(
                 spent_scripts,
             );
             defer engine.deinit();
+            engine.txdata = &txdata;
 
             const result = engine.verify(
                 input.script_sig,
@@ -3999,6 +4064,7 @@ fn verifyBlockScriptsSingleThreaded(
                     spent_scripts,
                 );
                 defer retry.deinit();
+                retry.txdata = &txdata;
                 if (retry.verify(input.script_sig, spent_scripts[input_idx], input.witness)) |valid2| {
                     if (!valid2) return false;
                 } else |err2| {

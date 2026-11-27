@@ -382,23 +382,25 @@ test "w127 G28 BUG-1 (P2 perf): SigCache wired at per-input granularity, not per
 // G29: PrecomputedTransactionData analog missing. BUG-2 P1 (perf).
 // ---------------------------------------------------------------------------
 
-test "w127 G29 BUG-2 (P1 perf): no PrecomputedTransactionData; sha_prevouts / sha_amounts / sha_scriptpubkeys / sha_sequences re-hashed per input (xfail)" {
+test "w127 G29 BUG-2 (P1 perf): PrecomputedTransactionData analog; sha_prevouts / sha_amounts / sha_scriptpubkeys / sha_sequences / sha_outputs once per tx (fixed)" {
     // Core's PrecomputedTransactionData caches:
     //   m_prevouts_single_hash, m_spent_amounts_single_hash,
     //   m_spent_scripts_single_hash, m_sequences_single_hash,
     //   m_outputs_single_hash, m_spent_outputs[]
-    // and reuses them across every input's sighash. clearbit's
-    // taproot_sighash.zig rebuilds all four SHA256 streams on every call —
-    // i.e. once per CHECKSIG inside every input. Quadratic-ish cost.
-    //
-    // None of the cache field names appear in the codebase:
-    try testing.expect(!srcContains(SIGHASH_SRC, "PrecomputedTransactionData"));
-    try testing.expect(!srcContains(SIGHASH_SRC, "m_prevouts_single_hash"));
-    try testing.expect(!srcContains(SIGHASH_SRC, "prevouts_single_hash"));
-    try testing.expect(!srcContains(SIGHASH_SRC, "spent_amounts_single_hash"));
-    // And the buildSigMsg fn itself walks tx.inputs unconditionally each call:
-    try testing.expect(srcContains(SIGHASH_SRC, "for (tx.inputs) |inp| {"));
-    try testing.expect(srcContains(SIGHASH_SRC, "&crypto.sha256(prevouts_buf.items)"));
+    // and reuses them across every input's sighash.  This test used to pin
+    // that clearbit had none of it (taproot_sighash.zig rebuilt every stream
+    // on every CHECKSIG).  Fixed: crypto.PrecomputedTxData holds the five
+    // single hashes, buildSigMsgTxData reads them when given one, and every
+    // Schnorr check site in script.zig passes the engine's per-tx data.
+    // The behavioural proof (digest work per input flat in N, vectors
+    // byte-identical) is tests_cffix_precomputed_sighash.zig.
+    try testing.expect(srcContains(CRYPTO_SRC, "pub const PrecomputedTxData = struct {"));
+    try testing.expect(srcContains(CRYPTO_SRC, "PrecomputedTransactionData::Init"));
+    try testing.expect(srcContains(SIGHASH_SRC, "try out.appendSlice(&c.prevouts_single_hash);"));
+    try testing.expect(srcContains(SIGHASH_SRC, "try out.appendSlice(&c.spent_amounts_single_hash);"));
+    try testing.expect(srcContains(SIGHASH_SRC, "try out.appendSlice(&cache.?.outputs_single_hash);"));
+    try testing.expect(!srcContains(SCRIPT_SRC, "taproot_sighash.computeTaprootSighash("));
+    try testing.expect(srcContains(SCRIPT_SRC, "self.txdata,"));
 }
 
 // ---------------------------------------------------------------------------
