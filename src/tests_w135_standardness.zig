@@ -216,13 +216,19 @@ test "w135/G15 BUG-13: anchor classifier matches; P2A has Core's 240-sat witness
     try testing.expect(!Mempool.isDust(&out));
 }
 
-// G16 MISSING: no MAX_DUST_OUTPUTS_PER_TX gate (BUG-1, BUG-2).
-// `checkStandard` is private; we assert the constant is missing AND
-// that `Mempool.isDust` (public) flags dust outputs that should be
-// counted by the missing gate.
-test "w135/G16 BUG-1+BUG-2: no MAX_DUST_OUTPUTS_PER_TX cap; isDust ready (MISSING)" {
-    // No MAX_DUST_OUTPUTS_PER_TX constant exposed by the mempool module.
-    try testing.expect(!@hasDecl(mempool_mod, "MAX_DUST_OUTPUTS_PER_TX"));
+// G16 FIXED (BUG-1, BUG-2): checkStandard refuses more than
+// MAX_DUST_OUTPUTS_PER_TX dust outputs, as Core's IsStandardTx
+// (r3fix-clearbit-ephemeral-dust).  `checkStandard` is private; we assert
+// the constant and that `Mempool.isDust` (public) flags what it counts.
+test "w135/G16 BUG-1+BUG-2: MAX_DUST_OUTPUTS_PER_TX = 1 cap present (Core policy/policy.h); isDust ready" {
+    // Core IsStandardTx refuses more than MAX_DUST_OUTPUTS_PER_TX (= 1) dust
+    // outputs (policy/policy.cpp).  Fixed by r3fix-clearbit-ephemeral-dust:
+    // checkStandard ends with that count.  @hasDecl keeps this compiling on
+    // a tree without the constant, where it fails on the first expect.
+    try testing.expect(@hasDecl(mempool_mod, "MAX_DUST_OUTPUTS_PER_TX"));
+    if (@hasDecl(mempool_mod, "MAX_DUST_OUTPUTS_PER_TX")) {
+        try testing.expectEqual(@as(usize, 1), @field(mempool_mod, "MAX_DUST_OUTPUTS_PER_TX"));
+    }
 
     // The lower-level primitive is in place: build a 1-sat P2WPKH output
     // and confirm Mempool.isDust flags it.
@@ -232,14 +238,9 @@ test "w135/G16 BUG-1+BUG-2: no MAX_DUST_OUTPUTS_PER_TX cap; isDust ready (MISSIN
     for (2..22) |j| spk[j] = @intCast(j);
     const dust_out = types.TxOut{ .value = 1, .script_pubkey = spk[0..] };
     try testing.expect(Mempool.isDust(&dust_out));
-
-    // A standard 50-output dust tx would have 50 dust outputs counted by
-    // isDust.  Core's IsStandardTx would reject because 50 > 1
-    // (MAX_DUST_OUTPUTS_PER_TX). clearbit's checkStandard does not have
-    // a loop that consults isDust for this cap — confirmed by reading
-    // mempool.zig:2774-2923 (no `dust_count` accumulator over outputs).
-    // BUG present; no fix landed.
-    try testing.expect(true);
+    // The behaviour (two dust outputs refused at IsStandardTx, one judged by
+    // PreCheckEphemeralTx / CheckEphemeralSpends) is pinned in
+    // tests_r3fix_ephemeral_dust.zig.
 }
 
 // =========================================================================
