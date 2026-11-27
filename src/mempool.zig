@@ -12055,6 +12055,15 @@ fn packageTxVsize(mempool: *Mempool, txns: []const types.Transaction, txids: []c
 /// the pool plus `txns[0..i]`), then its sigop-adjusted size.
 fn packageTxPrechecks(mempool: *Mempool, txns: []const types.Transaction, txids: []const types.Hash256, i: usize, base_fee: i64, fail: *?ScriptFailure) MempoolError!PkgTxSize {
     try mempool.checkStandard(&txns[i]);
+    // AreInputsStandard's P2SH redeemScript sigop limit, between IsStandardTx
+    // and PreCheckEphemeralTx as in Core PreChecks; the child's prevout is
+    // the parent, txns[0..i].
+    mempool.test_package_view = txns[0..i];
+    mempool.test_package_txids = txids[0..i];
+    const p2sh_over = mempool.p2shSigopsOverLimit(&txns[i]);
+    mempool.test_package_view = &.{};
+    mempool.test_package_txids = &.{};
+    if (try p2sh_over) return MempoolError.NonStandardInputs;
     try Mempool.preCheckEphemeralTx(&txns[i], true, base_fee, base_fee + mempool.applyDelta(txids[i]));
     return packageTxVsize(mempool, txns, txids, i, fail);
 }
