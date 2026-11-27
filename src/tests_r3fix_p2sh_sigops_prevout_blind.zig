@@ -142,6 +142,33 @@ fn expectRejected(row: std.json.ObjectMap, reason: []const u8) !void {
     try testing.expectEqualStrings(reason, row.get("reject-reason").?.string);
 }
 
+/// Expect `result` to be the mempool error named `name`.  Matched by name, so
+/// this file still compiles on a master that has no NonStandardInputs (the
+/// test then fails on the assertion, naming the error master returned).
+fn expectMempoolError(name: []const u8, result: mempool_mod.MempoolError!void) !void {
+    if (result) |_| {
+        std.debug.print("expected error.{s}, the tx was accepted\n", .{name});
+        return error.TestExpectedError;
+    } else |err| {
+        if (!std.mem.eql(u8, name, @errorName(err))) {
+            std.debug.print("expected error.{s}, found error.{s}\n", .{ name, @errorName(err) });
+            return error.TestExpectedError;
+        }
+    }
+}
+
+/// sendrawtransaction of `tx`; returns the error object (null on success).
+fn sendRaw(a: std.mem.Allocator, srv: *rpc.RpcServer, tx: *const types.Transaction) !?std.json.ObjectMap {
+    const req = try std.fmt.allocPrint(a, "{{\"id\":1,\"method\":\"sendrawtransaction\",\"params\":[\"{s}\"]}}", .{try hexOf(a, tx)});
+    const resp = try srv.dispatch(req);
+    const p = try std.json.parseFromSlice(std.json.Value, a, resp, .{ .allocate = .alloc_always });
+    const e = p.value.object.get("error") orelse return null;
+    return switch (e) {
+        .object => |o| o,
+        else => null,
+    };
+}
+
 const PREV = [_]u8{0x42} ** 32;
 
 /// One-input tx spending `prev` with `script_sig`, paying one
@@ -258,15 +285,29 @@ test "tests_r3fix_p2sh_sigops R2: the minimised P2SH spend (redeemScript CHECKMU
     try testing.expectEqualStrings(NSI, row.get("reject-details").?.string);
 }
 
-test "tests_r3fix_p2sh_sigops control: the R2 spend stays refused on the full path" {
+test "tests_r3fix_p2sh_sigops R2: the full path refuses the R2 spend as bad-txns-nonstandard-inputs" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
     const tx = try decodeHex(a, R2_HEX);
     const r = try rig(a, try chainWithCoin(a, tx.inputs[0].previous_output, 100_000, try p2shOf(a, &[_]u8{0xaf})));
 
-    try testing.expectError(mempool_mod.MempoolError.NonStandard, r.mp.addTransaction(tx));
+    try expectMempoolError("NonStandardInputs", r.mp.addTransaction(tx));
     try testing.expectEqual(@as(usize, 0), r.mp.entries.count());
+}
+
+test "tests_r3fix_p2sh_sigops R2: sendrawtransaction refuses the R2 spend with Core's message" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const tx = try decodeHex(a, R2_HEX);
+    const r = try rig(a, try chainWithCoin(a, tx.inputs[0].previous_output, 100_000, try p2shOf(a, &[_]u8{0xaf})));
+
+    // Core: RPC_TRANSACTION_REJECTED (-26), state.ToString() with no debug
+    // message.
+    const e = (try sendRaw(a, r.srv, &tx)) orelse return error.TestExpectedError;
+    try testing.expectEqual(@as(i64, -26), e.get("code").?.integer);
+    try testing.expectEqualStrings(NSI, e.get("message").?.string);
 }
 
 /// `OP_0 OP_IF <n x OP_CHECKSIG> OP_ENDIF OP_1`: counts n sigops, and
@@ -307,7 +348,7 @@ test "tests_r3fix_p2sh_sigops control: a valid P2SH spend with exactly 15 redeem
     try testing.expectEqual(@as(usize, 1), r.mp.entries.count());
 }
 
-test "tests_r3fix_p2sh_sigops control: the same valid P2SH spend with 16 redeemScript sigops is refused" {
+test "tests_r3fix_p2sh_sigops boundary: the same valid P2SH spend with 16 redeemScript sigops is bad-txns-nonstandard-inputs" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
@@ -319,7 +360,7 @@ test "tests_r3fix_p2sh_sigops control: the same valid P2SH spend with 16 redeemS
     const row = try tma1(a, r.srv, tx);
     try expectRejected(row, NSI);
     try testing.expectEqualStrings(NSI, row.get("reject-details").?.string);
-    try testing.expectError(mempool_mod.MempoolError.NonStandard, r.mp.addTransaction(tx));
+    try expectMempoolError("NonStandardInputs", r.mp.addTransaction(tx));
     try testing.expectEqual(@as(usize, 0), r.mp.entries.count());
 }
 
@@ -335,8 +376,22 @@ test "tests_r3fix_p2sh_sigops order: a 16-sigop P2SH spend paying no fee is refu
     const tx = try spendOf(a, op, try pushOf(a, redeem), null);
     @constCast(tx.outputs)[0].value = 100_000; // fee 0
 
-    try testing.expectError(mempool_mod.MempoolError.NonStandard, r.mp.addTransaction(tx));
-    try testing.expectError(mempool_mod.MempoolError.NonStandard, r.mp.addTransactionWithPackageRate(tx, 0.0));
+    try expectMempoolError("NonStandardInputs", r.mp.addTransaction(tx));
+    try testing.expectEqual(@as(usize, 0), r.mp.entries.count());
+}
+
+test "tests_r3fix_p2sh_sigops order: the same zero-fee spend is refused as nonstandard, not for the fee (package path)" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const redeem = try skippedSigopsRedeem(a, 16);
+    const op = types.OutPoint{ .hash = PREV, .index = 0 };
+    const r = try rig(a, try chainWithCoin(a, op, 100_000, try p2shOf(a, redeem)));
+    const tx = try spendOf(a, op, try pushOf(a, redeem), null);
+    @constCast(tx.outputs)[0].value = 100_000; // fee 0
+
+    // A package feerate of 0 is below the floor too.
+    try expectMempoolError("NonStandardInputs", r.mp.addTransactionWithPackageRate(tx, 0.0));
     try testing.expectEqual(@as(usize, 0), r.mp.entries.count());
 }
 

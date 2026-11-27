@@ -318,10 +318,8 @@ pub const MempoolError = error{
     /// Core reject code: "bad-witness-nonstandard".
     WitnessNonStandard,
     /// A P2SH input whose redeemScript counts more than MAX_P2SH_SIGOPS
-    /// sigops (Core AreInputsStandard, policy/policy.cpp).
-    /// Core reject code: "bad-txns-nonstandard-inputs".  Raised only by the
-    /// testmempoolaccept dry run (checkTestAcceptPolicy); the full and
-    /// package paths still report it as NonStandard.
+    /// sigops (Core AreInputsStandard, policy/policy.cpp; p2shSigopsOverLimit).
+    /// Core reject code: "bad-txns-nonstandard-inputs", on every path.
     NonStandardInputs,
     /// CheckTransaction sanity failure (W96 ATMP gate).
     /// Maps to one of Core's `bad-txns-*` consensus rejects from
@@ -1674,8 +1672,9 @@ pub const Mempool = struct {
         //     place in PreChecks: after CheckTxInputs and the BIP-68 locks,
         //     before IsWitnessStandard and CheckFeeRate (validation.cpp).
         //     With chain state only, as validateInputsStandardness gate 3.
+        //     Core's token, "bad-txns-nonstandard-inputs".
         if (self.chain_state != null and try self.p2shSigopsOverLimit(&tx)) {
-            return MempoolError.NonStandard;
+            return MempoolError.NonStandardInputs;
         }
 
         // 6. Compute size and check minimum fee
@@ -6035,7 +6034,7 @@ pub const Mempool = struct {
         // 5c. AreInputsStandard's P2SH redeemScript sigop limit, before the
         //     fee gate, as addTransaction §5c.
         if (self.chain_state != null and try self.p2shSigopsOverLimit(&tx)) {
-            return MempoolError.NonStandard;
+            return MempoolError.NonStandardInputs;
         }
 
         // 6. Compute size
