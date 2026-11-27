@@ -254,8 +254,6 @@ pub const MempoolError = error{
     NonStandardVersion,
     /// Output value is below the dust threshold.
     DustOutput,
-    /// Pay-to-Anchor output has non-zero value.
-    AnchorNonZeroValue,
     /// Serialized transaction weight exceeds MAX_STANDARD_TX_WEIGHT (400,000 WU).
     /// Mirrors Bitcoin Core's "tx-size" relay-policy reject in policy/policy.cpp.
     TxWeightTooLarge,
@@ -4398,19 +4396,15 @@ pub const Mempool = struct {
             }
         }
 
-        // Per-output checks: script type standardness, P2A value, datacarrier
-        // cumulative limit, and bare-multisig n-of-m validity.
+        // Per-output checks: script type standardness, datacarrier cumulative
+        // limit, and bare-multisig n-of-m validity. P2A (Pay-to-Anchor) has no
+        // value rule here: Core's IsStandard / IsStandardTx accept an ANCHOR
+        // output of any value, and its only value bound is the ordinary
+        // witness-program dust threshold (dustThreshold, 240 sat).
         var datacarrier_bytes: usize = 0;
         for (tx.outputs) |output| {
             const stype = script.classifyScript(output.script_pubkey);
             if (stype == .nonstandard) return MempoolError.NonStandard;
-
-            // P2A (Pay-to-Anchor) outputs must have value 0.
-            // They're designed for fee bumping and non-zero value is non-standard.
-            // Reference: Bitcoin Core policy/policy.cpp
-            if (stype == .anchor and output.value != 0) {
-                return MempoolError.AnchorNonZeroValue;
-            }
 
             // Datacarrier (OP_RETURN / null_data) cumulative limit.
             // Core tracks how many bytes remain of max_datacarrier_bytes across
@@ -4850,8 +4844,10 @@ pub const Mempool = struct {
     /// `GetDustThreshold` (policy/policy.cpp:27-63).
     ///
     /// An output whose value is below this threshold is "dust": it would cost
-    /// more in fees to spend than it is worth. Unspendable outputs (OP_RETURN,
-    /// P2A) return 0 — they can never be dust (Core: `IsUnspendable()` ⇒ 0).
+    /// more in fees to spend than it is worth. Unspendable outputs (OP_RETURN)
+    /// return 0 — they can never be dust (Core: `IsUnspendable()` ⇒ 0).
+    /// P2A (`OP_1 <0x4e73>`) has no special case: it is a witness program, so
+    /// its threshold is (13 + 67) * 3 = 240 sat at the default rate.
     ///
     ///   nSize = GetSerializeSize(txout) + spending_cost
     ///         = (8 + CompactSize(scriptlen) + scriptlen) + spending_cost
@@ -4870,9 +4866,6 @@ pub const Mempool = struct {
         // OP_RETURN and other unspendable scripts can never be dust
         // (Core `txout.scriptPubKey.IsUnspendable()` ⇒ return 0).
         if (spk.len > 0 and spk[0] == 0x6a) return 0;
-
-        // P2A (Pay-to-Anchor) outputs are exempt from the dust threshold.
-        if (script.classifyScript(spk) == .anchor) return 0;
 
         const script_len: u64 = spk.len;
         // CompactSize prefix for the script length (GetSerializeSize).
@@ -7313,12 +7306,14 @@ test "dust detection for different output types" {
     try std.testing.expectEqual(@as(i64, 0), Mempool.dustThreshold(&op_return_output, consensus.DUST_RELAY_FEE));
     try std.testing.expect(!Mempool.isDust(&op_return_output));
 
-    // P2A (Pay-to-Anchor) is exempt → threshold 0 → never dust (Core parity:
-    // ephemeral anchors handled via the ephemeral-dust mechanism, not here).
+    // P2A (Pay-to-Anchor) is an ordinary witness program to Core's
+    // GetDustThreshold: nSize = 13 + 67 = 80 → 240. 0 and 239 are dust, 240 is
+    // not (a 0-sat anchor is standard only as ephemeral dust in a 0-fee tx).
     const p2a_output_zero = types.TxOut{ .value = 0, .script_pubkey = &script.P2A_SCRIPT };
-    try std.testing.expect(!Mempool.isDust(&p2a_output_zero));
-    const p2a_output_nonzero = types.TxOut{ .value = 1, .script_pubkey = &script.P2A_SCRIPT };
-    try std.testing.expect(!Mempool.isDust(&p2a_output_nonzero));
+    try std.testing.expectEqual(@as(i64, 240), Mempool.dustThreshold(&p2a_output_zero, consensus.DUST_RELAY_FEE));
+    try std.testing.expect(Mempool.isDust(&p2a_output_zero));
+    try std.testing.expect(Mempool.isDust(&types.TxOut{ .value = 239, .script_pubkey = &script.P2A_SCRIPT }));
+    try std.testing.expect(!Mempool.isDust(&types.TxOut{ .value = 240, .script_pubkey = &script.P2A_SCRIPT }));
 }
 
 test "P2A (Pay-to-Anchor) standardness" {
@@ -7329,7 +7324,7 @@ test "P2A (Pay-to-Anchor) standardness" {
 
     // Create input. Use a single OP_0 (0x00) scriptSig so the non-witness
     // serialization is exactly 65 bytes, satisfying MIN_STANDARD_TX_NONWITNESS_SIZE.
-    // Without it the tx is 64 bytes and hits TxTooSmall before AnchorNonZeroValue.
+    // Without it the tx is 64 bytes and hits TxTooSmall before the output checks.
     // Serialization: version(4) + in_count(1) + outpoint(36) + scriptSig_len(1) +
     //   scriptSig(1) + sequence(4) + out_count(1) + value(8) + spk_len(1) +
     //   P2A_SCRIPT(4) + locktime(4) = 65 bytes.
@@ -7357,16 +7352,17 @@ test "P2A (Pay-to-Anchor) standardness" {
         return error.TestUnexpectedResult;
     };
 
-    // P2A output with non-zero value should be rejected
-    const p2a_output_bad = types.TxOut{ .value = 1000, .script_pubkey = &script.P2A_SCRIPT };
-    const outputs_bad = [_]types.TxOut{p2a_output_bad};
-    const tx_bad = types.Transaction{
+    // P2A output with a non-zero value is standard too: Core has no value
+    // rule for ANCHOR outputs (only the dust threshold, checked separately).
+    const p2a_output_valued = types.TxOut{ .value = 1000, .script_pubkey = &script.P2A_SCRIPT };
+    const outputs_valued = [_]types.TxOut{p2a_output_valued};
+    const tx_valued = types.Transaction{
         .version = 2,
         .inputs = &inputs_ok,
-        .outputs = &outputs_bad,
+        .outputs = &outputs_valued,
         .lock_time = 0,
     };
-    try std.testing.expectError(MempoolError.AnchorNonZeroValue, mempool.checkStandard(&tx_bad));
+    try mempool.checkStandard(&tx_valued);
 }
 
 test "RBF signaling detection" {

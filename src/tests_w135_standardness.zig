@@ -203,17 +203,17 @@ test "w135/G14: bare-multisig n>3 rejected behavior; classifier still flags it (
     try testing.expectEqual(ScriptType.multisig, stype);
 }
 
-// G15 PRESENT (BUG-13): anchor classifier exists; the strict zero-value
-// rejection lives in checkStandard (private), exercised by mempool.zig
-// unit tests at line ~4729.
-test "w135/G15 BUG-13: anchor classifier matches (PRESENT, stricter-than-Core check in private fn)" {
+// G15 FIXED (BUG-13): anchor classifier exists, and the stricter-than-Core
+// zero-value rejection is gone (r3fix-clearbit-p2a-dust-rule). Core has no
+// value rule for ANCHOR outputs; P2A takes the ordinary witness-program dust
+// threshold (240 sat), pinned in tests_r3fix_p2a_dust_rule.zig.
+test "w135/G15 BUG-13: anchor classifier matches; P2A has Core's 240-sat witness dust threshold, no value rule" {
     const p2a = [_]u8{ 0x51, 0x02, 0x4e, 0x73 };
     try testing.expect(script.isPayToAnchor(&p2a));
     try testing.expectEqual(ScriptType.anchor, script.classifyScript(&p2a));
-    // MempoolError.AnchorNonZeroValue exists as the dispatch target for
-    // the stricter-than-Core decision in checkStandard.
-    const err: MempoolError = MempoolError.AnchorNonZeroValue;
-    try testing.expect(err == MempoolError.AnchorNonZeroValue);
+    const out = types.TxOut{ .value = 545, .script_pubkey = &p2a };
+    try testing.expectEqual(@as(i64, 240), Mempool.dustThreshold(&out, 3000));
+    try testing.expect(!Mempool.isDust(&out));
 }
 
 // G16 MISSING: no MAX_DUST_OUTPUTS_PER_TX gate (BUG-1, BUG-2).

@@ -1056,6 +1056,7 @@ comptime {
     _ = @import("tests_mtp_bip68_fix.zig"); // 2026-10-05 mempool MTP / BIP68 (new API: removeForReorg, tipMtp)
     _ = @import("tests_neon_bip68_version.zig"); // 2026-11-24 audit F7: BIP-68 version compared unsigned in the height-only sequence-lock arm
     _ = @import("mempool.zig");
+    _ = @import("tests_r3fix_p2a_dust_rule.zig"); // R3 G3: P2A takes Core's witness dust threshold (240 sat), no value rule
     _ = @import("tests_unbroadcast.zig"); // unbroadcast set (Core m_unbroadcast_txids)
     _ = @import("tests_sec_wallet_files_perms.zig"); // security audit H8/H9/H11: datadir paths, private umask + wallet modes, label escaping
     _ = @import("mempool_persist.zig"); // mempool.dat dump/load (Bitcoin Core-compatible)
