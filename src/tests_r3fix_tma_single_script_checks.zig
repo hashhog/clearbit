@@ -4,7 +4,7 @@
 //! Run via `zig build test-r3fix-tma-single` (also part of `zig build test`).
 //!
 //! Core v31.1 single-tx testmempoolaccept is ProcessTransaction(test_accept=
-//! true): the full MemPoolAccept::PreChecks (ValidateInputsStandardness
+//! true): the full MemPoolAccept::PreChecks (AreInputsStandard
 //! "bad-txns-nonstandard-inputs" before CheckFeeRate, IsWitnessStandard, the
 //! sigops-cost gate, SingleTRUCChecks "TRUC-violation"), then
 //! PolicyScriptChecks / ConsensusScriptChecks, and only then the early return
@@ -183,11 +183,15 @@ test "tests_r3fix_tma_single R10: spending a bare nonstandard output is bad-txns
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
-    // Bare OP_TRUE: TxoutType NONSTANDARD (policy.cpp ValidateInputsStandardness).
+    // Bare OP_TRUE: TxoutType NONSTANDARD (policy/policy.cpp AreInputsStandard).
     const r = try rig(a, try chainWithCoin(a, .{ .hash = PREV, .index = 0 }, 100_000, &SCRIPT_OP_TRUE));
     const tx = try spend(a, 2, &.{}, 1, 98_000);
 
-    try expectRejected(try tma(a, r.srv, &tx), "bad-txns-nonstandard-inputs");
+    const row = try tma(a, r.srv, &tx);
+    try expectRejected(row, "bad-txns-nonstandard-inputs");
+    // No debug message in Core v31.1 (validation.cpp PreChecks), so
+    // reject-details (TxValidationState::ToString) is the reason itself.
+    try testing.expectEqualStrings("bad-txns-nonstandard-inputs", row.get("reject-details").?.string);
 }
 
 test "tests_r3fix_tma_single R4: a nonstandard input is reported before a zero fee (Core order)" {
@@ -196,10 +200,12 @@ test "tests_r3fix_tma_single R4: a nonstandard input is reported before a zero f
     const a = arena.allocator();
     const r = try rig(a, try chainWithCoin(a, .{ .hash = PREV, .index = 0 }, 100_000, &SCRIPT_OP_TRUE));
     // Pays no fee: min relay fee not met too, but Core's PreChecks runs
-    // ValidateInputsStandardness before CheckFeeRate.
+    // AreInputsStandard before CheckFeeRate.
     const tx = try spend(a, 2, &.{}, 1, 100_000);
 
-    try expectRejected(try tma(a, r.srv, &tx), "bad-txns-nonstandard-inputs");
+    const row = try tma(a, r.srv, &tx);
+    try expectRejected(row, "bad-txns-nonstandard-inputs");
+    try testing.expectEqualStrings("bad-txns-nonstandard-inputs", row.get("reject-details").?.string);
 }
 
 /// 240 P2WSH outputs: vsize just over TRUC_MAX_VSIZE (10,000 vB).

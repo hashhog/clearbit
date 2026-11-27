@@ -25609,8 +25609,10 @@ fn rejectDetailsEqualReason(reason: []const u8) bool {
         "scriptsig-size",
         "scriptsig-not-pushonly",
         "dust",
-        // IsWitnessStandard failure: state.Invalid(TX_WITNESS_MUTATED,
-        // "bad-witness-nonstandard") with no debug message (validation.cpp).
+        // AreInputsStandard / IsWitnessStandard failures: state.Invalid(..,
+        // "bad-txns-nonstandard-inputs" / "bad-witness-nonstandard") with no
+        // debug message (Core v31.1 validation.cpp PreChecks).
+        "bad-txns-nonstandard-inputs",
         "bad-witness-nonstandard",
     };
     for (bare) |t| if (std.mem.eql(u8, reason, t)) return true;

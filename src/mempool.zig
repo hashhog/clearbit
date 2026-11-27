@@ -317,8 +317,9 @@ pub const MempoolError = error{
     /// Witness data violates standardness rules (IsWitnessStandard).
     /// Core reject code: "bad-witness-nonstandard".
     WitnessNonStandard,
-    /// A spent output fails ValidateInputsStandardness (AreInputsStandard:
-    /// nonstandard / witness-unknown prevout, P2SH or BIP54 sigops).
+    /// A spent output fails Core's AreInputsStandard (clearbit's
+    /// validateInputsStandardness: nonstandard / witness-unknown prevout,
+    /// P2SH or BIP54 sigops).
     /// Core reject code: "bad-txns-nonstandard-inputs".  Raised only by the
     /// single-tx testmempoolaccept dry run; the other paths still report
     /// these as NonStandard.
@@ -2192,7 +2193,7 @@ pub const Mempool = struct {
                     MempoolError.DatacarrierTooLarge => "datacarrier",
                     MempoolError.TooManySigopsCost => "bad-txns-too-many-sigops",
                     // Input policy and TRUC, single-tx dry run (Core PreChecks:
-                    // ValidateInputsStandardness, IsWitnessStandard,
+                    // AreInputsStandard, IsWitnessStandard,
                     // SingleTRUCChecks).
                     MempoolError.NonStandardInputs => "bad-txns-nonstandard-inputs",
                     MempoolError.WitnessNonStandard => "bad-witness-nonstandard",
@@ -4537,7 +4538,7 @@ pub const Mempool = struct {
     /// only the commit (validation.cpp AcceptSingleTransactionInternal returns
     /// on m_test_accept after ConsensusScriptChecks).  For a single tx this
     /// therefore runs, in Core's order: IsStandardTx (checkStandard + dust),
-    /// finality, inputs, BIP-68, CheckTxInputs, ValidateInputsStandardness,
+    /// finality, inputs, BIP-68, CheckTxInputs, AreInputsStandard,
     /// IsWitnessStandard, the sigops-cost gate, the fee floor, TRUC, RBF, and
     /// the STANDARD and consensus script checks; a script failure is recorded
     /// in `fail`.
@@ -4684,7 +4685,7 @@ pub const Mempool = struct {
         }
 
         // 3b. Input policy (single tx): Core PreChecks runs, after
-        //     CheckTxInputs and before CheckFeeRate, ValidateInputsStandardness
+        //     CheckTxInputs and before CheckFeeRate, AreInputsStandard
         //     ("bad-txns-nonstandard-inputs"), IsWitnessStandard
         //     ("bad-witness-nonstandard") and the MAX_STANDARD_TX_SIGOPS_COST
         //     gate (validation.cpp PreChecks).  The same gates the full path
