@@ -1247,8 +1247,9 @@ pub const Mempool = struct {
     /// testmempoolaccept with several txs: the earlier txs of the array, whose
     /// outputs the later ones may spend (Core AcceptMultipleTransactions:
     /// m_viewmempool.PackageAddTransaction).  `getOutputFromMempool` falls
-    /// back to these.  Set only by `testAcceptMultiple`, under `mutex`, and
-    /// reset before it returns; empty otherwise.
+    /// back to these.  Set by `testAcceptMultiple`, and by package RBF's
+    /// `packageTxPrechecks` / `packageTxVsize`, under `mutex`, and reset
+    /// before they return; empty otherwise.
     test_package_view: []const types.Transaction = &.{},
     test_package_txids: []const types.Hash256 = &.{},
     /// Core ATMPArgs m_allow_replacement=false for the same call: a tx that
@@ -12050,7 +12051,8 @@ fn packageTxVsize(mempool: *Mempool, txns: []const types.Transaction, txids: []c
     return .{ .vsize = (cw + 3) / 4, .cluster_weight = cw };
 }
 
-/// Standardness, dust (Core IsStandardTx + PreCheckEphemeralTx on the tx's
+/// Standardness, the P2SH redeemScript sigop limit, dust (Core IsStandardTx,
+/// AreInputsStandard's MAX_P2SH_SIGOPS, then PreCheckEphemeralTx on the tx's
 /// own base and modified fee) and script checks of package tx `i` (against
 /// the pool plus `txns[0..i]`), then its sigop-adjusted size.
 fn packageTxPrechecks(mempool: *Mempool, txns: []const types.Transaction, txids: []const types.Hash256, i: usize, base_fee: i64, fail: *?ScriptFailure) MempoolError!PkgTxSize {
