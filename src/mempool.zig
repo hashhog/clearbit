@@ -320,8 +320,8 @@ pub const MempoolError = error{
     /// A P2SH input whose redeemScript counts more than MAX_P2SH_SIGOPS
     /// sigops (Core AreInputsStandard, policy/policy.cpp).
     /// Core reject code: "bad-txns-nonstandard-inputs".  Raised only by the
-    /// testmempoolaccept dry run (checkTestAcceptPolicy); the full path's
-    /// validateInputsStandardness still reports it as NonStandard.
+    /// testmempoolaccept dry run (checkTestAcceptPolicy); the full and
+    /// package paths still report it as NonStandard.
     NonStandardInputs,
     /// CheckTransaction sanity failure (W96 ATMP gate).
     /// Maps to one of Core's `bad-txns-*` consensus rejects from
@@ -1669,6 +1669,14 @@ pub const Mempool = struct {
         //     Reference: Bitcoin Core CheckSequenceLocksAtTip() (validation.cpp ~line 887).
         //     See checkSequenceLocksAtTip for the per-coin height / time rules.
         try self.checkSequenceLocksAtTip(&tx);
+
+        // 5c. AreInputsStandard's P2SH redeemScript sigop limit, at Core's
+        //     place in PreChecks: after CheckTxInputs and the BIP-68 locks,
+        //     before IsWitnessStandard and CheckFeeRate (validation.cpp).
+        //     With chain state only, as validateInputsStandardness gate 3.
+        if (self.chain_state != null and try self.p2shSigopsOverLimit(&tx)) {
+            return MempoolError.NonStandard;
+        }
 
         // 6. Compute size and check minimum fee
         const weight = computeTxWeight(&tx, self.allocator) catch return MempoolError.OutOfMemory;
@@ -3974,7 +3982,8 @@ pub const Mempool = struct {
     ///      spend).
     ///   3. P2SH prevout with redeemScript > MAX_P2SH_SIGOPS (15) sigops → reject.
     ///      Uses the actual prevout type (from spent_scripts) so only real P2SH
-    ///      inputs are gated, unlike the conservative approximation in checkStandard().
+    ///      inputs are gated.  addTransaction and the package path run the
+    ///      same rule earlier, at Core's place (p2shSigopsOverLimit).
     ///
     /// `spent_scripts[i]` must be the scriptPubKey of the output spent by
     /// `tx.inputs[i]` (populated from UTXO set / mempool parent).
@@ -4036,17 +4045,16 @@ pub const Mempool = struct {
     /// "bad-txns-nonstandard-inputs" (validation.cpp PreChecks).  An input
     /// spending anything else never has its scriptSig read as a script here.
     ///
-    /// For the testmempoolaccept dry run (checkTestAcceptPolicy), which does
-    /// not run validateInputsStandardness (gate 3 there is the same rule for
-    /// the full and submitpackage paths).  Prevouts come from the mempool,
-    /// the earlier members of a testmempoolaccept package, or the UTXO set;
-    /// an input that resolves to none was already refused as missing-inputs.
-    fn checkTestAcceptP2SHSigops(self: *Mempool, tx: *const types.Transaction) MempoolError!void {
+    /// Run at Core's place in PreChecks (after CheckTxInputs and the BIP-68
+    /// locks, before IsWitnessStandard and CheckFeeRate) by addTransaction,
+    /// the package path and the testmempoolaccept dry run.  Prevouts come
+    /// from the mempool, the earlier members of a testmempoolaccept package,
+    /// or the UTXO set; an input that resolves to none was already refused as
+    /// missing-inputs.  validateInputsStandardness gate 3 is the same rule.
+    fn p2shSigopsOverLimit(self: *Mempool, tx: *const types.Transaction) MempoolError!bool {
         for (tx.inputs) |input| {
             if (self.getOutputFromMempool(&input.previous_output)) |out| {
-                if (p2shRedeemSigopsOverLimit(out.script_pubkey, input.script_sig)) {
-                    return MempoolError.NonStandardInputs;
-                }
+                if (p2shRedeemSigopsOverLimit(out.script_pubkey, input.script_sig)) return true;
             } else if (self.chain_state) |cs| {
                 const utxo_opt = cs.utxo_set.get(&input.previous_output) catch null;
                 const utxo = utxo_opt orelse continue;
@@ -4056,11 +4064,10 @@ pub const Mempool = struct {
                 }
                 const spk = utxo.reconstructScript(self.allocator) catch return MempoolError.OutOfMemory;
                 defer self.allocator.free(spk);
-                if (p2shRedeemSigopsOverLimit(spk, input.script_sig)) {
-                    return MempoolError.NonStandardInputs;
-                }
+                if (p2shRedeemSigopsOverLimit(spk, input.script_sig)) return true;
             }
         }
+        return false;
     }
 
     /// True when `prevout_script` is P2SH and the redeemScript (last push of
@@ -4402,9 +4409,9 @@ pub const Mempool = struct {
         // tell a P2SH input from any other; it used to apply the limit to the
         // last push of EVERY input, which refused e.g. a P2PKH spend whose
         // 33-byte pubkey reads as > 15 sigops (about 1 compressed key in 32).
-        // The prevout-aware check runs in validateInputsStandardness (full
-        // path, package path) and checkTestAcceptP2SHSigops (single-tx dry
-        // run).
+        // The prevout-aware check is p2shSigopsOverLimit, run after the
+        // input lookups by addTransaction, the package path and the
+        // testmempoolaccept dry run (and validateInputsStandardness gate 3).
         //
         // The per-tx BIP54 legacy sigop limit (MAX_TX_LEGACY_SIGOPS = 2_500)
         // is not checked here either: Core's CheckSigopsBIP54 counts the
@@ -4617,7 +4624,7 @@ pub const Mempool = struct {
             //     PreChecks runs it after CheckTxInputs and before
             //     CheckFeeRate, for a single tx and for each member of a
             //     testmempoolaccept package alike.
-            try self.checkTestAcceptP2SHSigops(tx);
+            if (try self.p2shSigopsOverLimit(tx)) return MempoolError.NonStandardInputs;
 
             const min_fee_sat_kvb = @as(f64, @floatFromInt(self.getMinFee()));
             const modified_fee = fee + self.applyDelta(tx_hash);
@@ -6023,6 +6030,12 @@ pub const Mempool = struct {
         if (fee_known) {
             fee = total_in - total_out;
             if (fee < 0) return MempoolError.InputsBelowOutputs;
+        }
+
+        // 5c. AreInputsStandard's P2SH redeemScript sigop limit, before the
+        //     fee gate, as addTransaction §5c.
+        if (self.chain_state != null and try self.p2shSigopsOverLimit(&tx)) {
+            return MempoolError.NonStandard;
         }
 
         // 6. Compute size

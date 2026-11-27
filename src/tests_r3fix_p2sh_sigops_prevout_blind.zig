@@ -323,6 +323,37 @@ test "tests_r3fix_p2sh_sigops control: the same valid P2SH spend with 16 redeemS
     try testing.expectEqual(@as(usize, 0), r.mp.entries.count());
 }
 
+test "tests_r3fix_p2sh_sigops order: a 16-sigop P2SH spend paying no fee is refused as nonstandard, not for the fee (full path)" {
+    // Core PreChecks runs AreInputsStandard before CheckFeeRate
+    // (validation.cpp), so the input-standardness refusal wins.
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const redeem = try skippedSigopsRedeem(a, 16);
+    const op = types.OutPoint{ .hash = PREV, .index = 0 };
+    const r = try rig(a, try chainWithCoin(a, op, 100_000, try p2shOf(a, redeem)));
+    const tx = try spendOf(a, op, try pushOf(a, redeem), null);
+    @constCast(tx.outputs)[0].value = 100_000; // fee 0
+
+    try testing.expectError(mempool_mod.MempoolError.NonStandard, r.mp.addTransaction(tx));
+    try testing.expectError(mempool_mod.MempoolError.NonStandard, r.mp.addTransactionWithPackageRate(tx, 0.0));
+    try testing.expectEqual(@as(usize, 0), r.mp.entries.count());
+}
+
+test "tests_r3fix_p2sh_sigops order: the same zero-fee spend is bad-txns-nonstandard-inputs in testmempoolaccept" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const redeem = try skippedSigopsRedeem(a, 16);
+    const op = types.OutPoint{ .hash = PREV, .index = 0 };
+    const r = try rig(a, try chainWithCoin(a, op, 100_000, try p2shOf(a, redeem)));
+    const tx = try spendOf(a, op, try pushOf(a, redeem), null);
+    @constCast(tx.outputs)[0].value = 100_000; // fee 0
+
+    const row = try tma1(a, r.srv, tx);
+    try expectRejected(row, NSI);
+}
+
 test "tests_r3fix_p2sh_sigops package: a child spending its package parent's P2SH output over the limit is bad-txns-nonstandard-inputs" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
