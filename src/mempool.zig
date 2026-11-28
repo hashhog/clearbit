@@ -320,6 +320,13 @@ pub const MempoolError = error{
     /// Witness data violates standardness rules (IsWitnessStandard).
     /// Core reject code: "bad-witness-nonstandard".
     WitnessNonStandard,
+    /// A spent output fails Core's AreInputsStandard (clearbit's
+    /// validateInputsStandardness: nonstandard / witness-unknown prevout,
+    /// P2SH or BIP54 sigops).
+    /// Core reject code: "bad-txns-nonstandard-inputs".  Raised only by the
+    /// single-tx testmempoolaccept dry run; the other paths still report
+    /// these as NonStandard.
+    NonStandardInputs,
     /// CheckTransaction sanity failure (W96 ATMP gate).
     /// Maps to one of Core's `bad-txns-*` consensus rejects from
     /// CheckTransaction(): bad-txns-vin-empty, bad-txns-vout-empty,
@@ -504,6 +511,7 @@ fn rejectReasonForError(err: MempoolError) []const u8 {
         MempoolError.Coinbase => "coinbase",
         MempoolError.InputValuesOutOfRange => "bad-txns-inputvalues-outofrange",
         MempoolError.TooManySigopsCost => "bad-txns-too-many-sigops",
+        MempoolError.NonStandardInputs => "bad-txns-nonstandard-inputs",
         MempoolError.WitnessStripped => "witness-stripped",
         MempoolError.ScriptSigTooLarge => "scriptsig-size",
         MempoolError.ScriptSigNotPushOnly => "scriptsig-not-pushonly",
@@ -1951,6 +1959,10 @@ pub const Mempool = struct {
         vsize: usize,
         /// Rejection reason (set on failure).
         reject_reason: ?[]const u8,
+        /// Set when the reject came from a script check (the single-tx
+        /// dry run): the failing input and the engine's error, from which
+        /// the caller builds Core's reject-details.
+        script_failure: ?ScriptFailure = null,
     };
 
     /// AcceptToMemoryPool validates and adds a transaction to the mempool.
@@ -2178,8 +2190,15 @@ pub const Mempool = struct {
             // hole. checkTestAcceptPolicy() closes it by also running the dust
             // gate and the min-relay-fee gate (read-only UTXO lookup, no state
             // mutation), exactly as the full path does.
-            const fee_out = self.checkTestAcceptPolicy(&tx, tx_hash) catch |err| {
-                const reason: []const u8 = switch (err) {
+            var script_fail: ?ScriptFailure = null;
+            const fee_out = self.checkTestAcceptPolicy(&tx, tx_hash, &script_fail) catch |err| {
+                // Script-check rejects (single-tx dry run only): Core's
+                // "mempool-script-verify-flag-failed (<ScriptErrorString>)",
+                // also for a stripped witness (PolicyScriptChecks keeps the
+                // script error as the reason).
+                const from_script = script_fail != null and
+                    (err == MempoolError.ScriptVerifyFailed or err == MempoolError.WitnessStripped);
+                const reason: []const u8 = if (from_script) script_fail.?.reason() else switch (err) {
                     MempoolError.NonStandard => "non-standard",
                     MempoolError.NonStandardVersion => "version",
                     MempoolError.TxWeightTooLarge => "tx-size",
@@ -2188,6 +2207,19 @@ pub const Mempool = struct {
                     MempoolError.ScriptSigNotPushOnly => "scriptsig-not-pushonly",
                     MempoolError.DatacarrierTooLarge => "datacarrier",
                     MempoolError.TooManySigopsCost => "bad-txns-too-many-sigops",
+                    // Input policy and TRUC, single-tx dry run (Core PreChecks:
+                    // AreInputsStandard, IsWitnessStandard,
+                    // SingleTRUCChecks).
+                    MempoolError.NonStandardInputs => "bad-txns-nonstandard-inputs",
+                    MempoolError.WitnessNonStandard => "bad-witness-nonstandard",
+                    MempoolError.TrucTxTooLarge,
+                    MempoolError.TrucChildTooLarge,
+                    MempoolError.TrucTooManyAncestors,
+                    MempoolError.TrucTooManyDescendants,
+                    MempoolError.TrucV3SpendsNonV3,
+                    MempoolError.TrucNonV3SpendsV3,
+                    => "TRUC-violation",
+                    MempoolError.ScriptVerifyFailed, MempoolError.WitnessStripped => rejectReasonForError(err),
                     MempoolError.DustOutput => "dust",
                     MempoolError.InsufficientFee => "min relay fee not met",
                     MempoolError.InputsBelowOutputs => "bad-txns-in-belowout",
@@ -2228,6 +2260,7 @@ pub const Mempool = struct {
                     .fee = 0,
                     .vsize = 0,
                     .reject_reason = reason,
+                    .script_failure = if (from_script) script_fail else null,
                 };
             };
             // Compute vsize for the response (weight / 4 rounded up).
@@ -4070,23 +4103,83 @@ pub const Mempool = struct {
         const params = self.params orelse &consensus.MAINNET;
         const flags = validation.getStandardScriptFlags(cs.best_height, params);
 
+        var spent = try self.resolveSpentOutputs(cs, tx);
+        defer spent.deinit();
+        const spent_amounts = spent.amounts;
+        const spent_scripts = spent.scripts;
+
+        // Enforce IsWitnessStandard() before running the full script engine.
+        // This mirrors Core's MemPoolAccept::PreChecks calling IsWitnessStandard()
+        // before PolicyScriptChecks (validation.cpp).  We need spent_scripts to be
+        // fully populated (above) before calling this.
+        try checkWitnessStandard(tx, spent_scripts);
+
+        // ValidateInputsStandardness (FIX-12 / W96): per-input prevout type gates.
+        // See validateInputsStandardness() for the three gates checked here.
+        try validateInputsStandardness(tx, spent_scripts);
+
+        // W96: MAX_STANDARD_TX_SIGOPS_COST relay gate.
+        //
+        //   Bitcoin Core line 908 + 941: after collecting prevouts, compute the
+        //   weighted sigop cost (4× legacy + 4× P2SH + 1× witness) and reject
+        //   if it exceeds MAX_STANDARD_TX_SIGOPS_COST = 16,000 (MAX_BLOCK_SIGOPS_COST/5).
+        //   Distinct from the per-tx legacy-only consensus cap (2,500) already
+        //   gated in `checkStandard`. Without this gate a single tx can occupy
+        //   ~5× the policy budget of standard sigops and still be relayed.
+        //
+        //   Reference: Bitcoin Core validation.cpp:941-943,
+        //   getTransactionSigOpCost in consensus/tx_verify.cpp.
+        //
+        //   The computed cost is also returned to the caller so the cluster
+        //   size gate can apply Core's sigop-adjusted weight (policy.cpp:390).
+        const tx_sigop_cost = standardSigopCost(tx, spent_amounts, spent_scripts, flags);
+        if (tx_sigop_cost > consensus.MAX_STANDARD_TX_SIGOPS_COST) {
+            return MempoolError.TooManySigopsCost;
+        }
+
+        const consensus_flags = validation.getBlockScriptFlags(cs.best_height, params);
+        try self.runScriptChecks(tx, spent_amounts, spent_scripts, flags, consensus_flags, fail);
+
+        return tx_sigop_cost;
+    }
+
+    /// The outputs a tx spends, resolved from the mempool (unconfirmed
+    /// parents) or the UTXO set: per-input amounts and scriptPubKeys, as
+    /// BIP-341 needs ALL of them for every input.  `owned` holds the
+    /// scriptPubKeys reconstructed from the UTXO set (mempool-resolved ones
+    /// are slices into the parent tx).  Free with `deinit`.
+    const SpentOutputs = struct {
+        amounts: []i64,
+        scripts: [][]const u8,
+        owned: std.ArrayList([]const u8),
+        allocator: std.mem.Allocator,
+
+        fn deinit(self: *SpentOutputs) void {
+            for (self.owned.items) |s| self.allocator.free(s);
+            self.owned.deinit();
+            self.allocator.free(self.scripts);
+            self.allocator.free(self.amounts);
+        }
+    };
+
+    fn resolveSpentOutputs(self: *Mempool, cs: *storage.ChainState, tx: *const types.Transaction) MempoolError!SpentOutputs {
         // Two-pass: collect all spent UTXOs first so per-input prevouts
         // (BIP-341 sha_amounts / sha_scriptpubkeys) are available throughout
         // script verification — Taproot commits to ALL inputs' amounts and
         // scripts, not just the input being verified. Mirror the layout
         // used in `validation.checkTransactionContextual`.
-        var spent_amounts = self.allocator.alloc(i64, tx.inputs.len) catch
+        const spent_amounts = self.allocator.alloc(i64, tx.inputs.len) catch
             return MempoolError.OutOfMemory;
-        defer self.allocator.free(spent_amounts);
-        var spent_scripts = self.allocator.alloc([]const u8, tx.inputs.len) catch
+        errdefer self.allocator.free(spent_amounts);
+        const spent_scripts = self.allocator.alloc([]const u8, tx.inputs.len) catch
             return MempoolError.OutOfMemory;
-        defer self.allocator.free(spent_scripts);
+        errdefer self.allocator.free(spent_scripts);
 
         // Some scriptPubKeys are owned (reconstructed from CompactUtxo); track
         // and free at the end. Mempool-resolved prevouts are slices into the
         // parent tx and must NOT be freed here.
         var owned_scripts = std.ArrayList([]const u8).init(self.allocator);
-        defer {
+        errdefer {
             for (owned_scripts.items) |s| self.allocator.free(s);
             owned_scripts.deinit();
         }
@@ -4116,31 +4209,17 @@ pub const Mempool = struct {
             }
         }
 
-        // Enforce IsWitnessStandard() before running the full script engine.
-        // This mirrors Core's MemPoolAccept::PreChecks calling IsWitnessStandard()
-        // before PolicyScriptChecks (validation.cpp).  We need spent_scripts to be
-        // fully populated (above) before calling this.
-        try checkWitnessStandard(tx, spent_scripts);
+        return SpentOutputs{
+            .amounts = spent_amounts,
+            .scripts = spent_scripts,
+            .owned = owned_scripts,
+            .allocator = self.allocator,
+        };
+    }
 
-        // ValidateInputsStandardness (FIX-12 / W96): per-input prevout type gates.
-        // See validateInputsStandardness() for the three gates checked here.
-        try validateInputsStandardness(tx, spent_scripts);
-
-        // W96: MAX_STANDARD_TX_SIGOPS_COST relay gate.
-        //
-        //   Bitcoin Core line 908 + 941: after collecting prevouts, compute the
-        //   weighted sigop cost (4× legacy + 4× P2SH + 1× witness) and reject
-        //   if it exceeds MAX_STANDARD_TX_SIGOPS_COST = 16,000 (MAX_BLOCK_SIGOPS_COST/5).
-        //   Distinct from the per-tx legacy-only consensus cap (2,500) already
-        //   gated in `checkStandard`. Without this gate a single tx can occupy
-        //   ~5× the policy budget of standard sigops and still be relayed.
-        //
-        //   Reference: Bitcoin Core validation.cpp:941-943,
-        //   getTransactionSigOpCost in consensus/tx_verify.cpp.
-        //
-        //   The computed cost is also returned to the caller so the cluster
-        //   size gate can apply Core's sigop-adjusted weight (policy.cpp:390).
-        var tx_sigop_cost: u64 = 0;
+    /// The tx's BIP-141 weighted sigop cost (Core GetTransactionSigOpCost)
+    /// over its resolved prevouts.
+    fn standardSigopCost(tx: *const types.Transaction, spent_amounts: []const i64, spent_scripts: []const []const u8, flags: script.ScriptFlags) u64 {
         {
             const W96SigopView = struct {
                 inputs: []const types.TxIn,
@@ -4171,13 +4250,17 @@ pub const Mempool = struct {
                 .context = @ptrCast(&sv),
                 .lookupFn = W96SigopView.lookup,
             };
-            const sigop_cost = validation.getTransactionSigOpCost(tx, &sigop_view, flags);
-            if (sigop_cost > consensus.MAX_STANDARD_TX_SIGOPS_COST) {
-                return MempoolError.TooManySigopsCost;
-            }
-            tx_sigop_cost = sigop_cost;
+            return validation.getTransactionSigOpCost(tx, &sigop_view, flags);
         }
+    }
 
+    /// Core PolicyScriptChecks then ConsensusScriptChecks: run every input's
+    /// scripts under the STANDARD flags, then again under the block flags.
+    /// On a STANDARD-flag failure records the first failing input in `fail`
+    /// (also when the failure is then reported as WitnessStripped: Core keeps
+    /// the script error as the reject reason for a stripped witness,
+    /// validation.cpp PolicyScriptChecks).
+    fn runScriptChecks(self: *Mempool, tx: *const types.Transaction, spent_amounts: []const i64, spent_scripts: []const []const u8, flags: script.ScriptFlags, consensus_flags: script.ScriptFlags, fail: *?ScriptFailure) MempoolError!void {
         // Whole-tx sighash digests, once for this tx, shared by every input
         // check below under both flag sets (Core: one
         // PrecomputedTransactionData per tx in MemPoolAccept, ws.m_precomputed_txdata).
@@ -4223,14 +4306,14 @@ pub const Mempool = struct {
                 //
                 //   We don't have a separate state-result enum, but we surface a
                 //   distinct error variant so callers (RPC / p2p) can diagnose.
-                if (!txHasAnyWitness(tx) and spendsNonAnchorWitnessProgram(tx, spent_scripts)) {
-                    return MempoolError.WitnessStripped;
-                }
                 // Core CheckInputScripts reports the first failing input.
                 // (The consensus-flags re-check below records nothing: Core
                 // treats a failure there as an internal bug, and the STANDARD
                 // set is a superset, so it cannot fail after this loop passed.)
                 fail.* = .{ .input_index = input_index, .err = script_err };
+                if (!txHasAnyWitness(tx) and spendsNonAnchorWitnessProgram(tx, spent_scripts)) {
+                    return MempoolError.WitnessStripped;
+                }
                 return MempoolError.ScriptVerifyFailed;
             }
         }
@@ -4250,7 +4333,6 @@ pub const Mempool = struct {
         // passes the STANDARD verify above must by construction also pass the
         // consensus verify — unless a soft-fork policy bit is doing the wrong
         // thing. We still re-run for parity + future-proofing, matching Core.
-        const consensus_flags = validation.getBlockScriptFlags(cs.best_height, params);
         for (tx.inputs, 0..) |input, input_index| {
             var engine = script.ScriptEngine.initWithPrevouts(
                 self.allocator,
@@ -4278,8 +4360,6 @@ pub const Mempool = struct {
                 return MempoolError.ScriptVerifyFailed;
             }
         }
-
-        return tx_sigop_cost;
     }
 
     /// Helper: does any input of `tx` carry a non-empty witness?
@@ -4479,11 +4559,18 @@ pub const Mempool = struct {
     /// Run the relay-policy floor for testmempoolaccept (test_accept=true)
     /// WITHOUT mutating mempool state, returning the computed fee in satoshis.
     ///
-    /// Mirrors the subset of Bitcoin Core's MemPoolAccept::PreChecks that
-    /// testmempoolaccept exercises: IsStandardTx (checkStandard), the dust gate,
-    /// and the min-relay-fee gate. These are exactly the always-on standardness
-    /// rules; the full addTransaction path additionally runs RBF / ancestor /
-    /// cluster / persistence logic which a dry run must NOT perform.
+    /// Core's testmempoolaccept runs ALL of MemPoolAccept's checks and skips
+    /// only the commit (validation.cpp AcceptSingleTransactionInternal returns
+    /// on m_test_accept after ConsensusScriptChecks).  For a single tx this
+    /// therefore runs, in Core's order: IsStandardTx (checkStandard + dust),
+    /// finality, inputs, BIP-68, CheckTxInputs, AreInputsStandard,
+    /// IsWitnessStandard, PreCheckEphemeralTx, the sigops-cost gate, the fee
+    /// floor, TRUC, RBF, CheckEphemeralSpends, and the STANDARD and consensus
+    /// script checks; a script failure is recorded in `fail`.
+    ///
+    /// Inside testAcceptMultiple (test_disallow_replacement) only the part
+    /// up to the fee floor runs here: the package path runs the input policy
+    /// and script checks itself, in its second phase.
     ///
     /// Without this helper the dry-run path ran only checkStandard, so dust and
     /// below-min-relay transactions returned allowed=true even though the real
@@ -4493,7 +4580,10 @@ pub const Mempool = struct {
     ///
     /// Reference: Bitcoin Core policy/policy.cpp (GetDust / IsStandardTx) and
     /// validation.cpp MemPoolAccept::PreChecks (CheckFeeRate / GetMinFee).
-    fn checkTestAcceptPolicy(self: *Mempool, tx: *const types.Transaction, tx_hash: types.Hash256) MempoolError!i64 {
+    fn checkTestAcceptPolicy(self: *Mempool, tx: *const types.Transaction, tx_hash: types.Hash256, fail: *?ScriptFailure) MempoolError!i64 {
+        // A single-tx testmempoolaccept (not a member of testAcceptMultiple).
+        const single = !self.test_disallow_replacement;
+
         // 1. Standardness (version / weight / scriptSig / sigops / datacarrier /
         //    bare-multisig / script-type). Same gate the full path runs first.
         try self.checkStandard(tx);
@@ -4614,9 +4704,47 @@ pub const Mempool = struct {
             for (tx.outputs) |output| total_out += output.value;
             fee = total_in - total_out;
             if (fee < 0) return MempoolError.InputsBelowOutputs;
+        }
 
-            // Core PreCheckEphemeralTx, before CheckFeeRate.
-            try preCheckEphemeralTx(tx, true, fee, fee + self.applyDelta(tx_hash));
+        // 3b. Input policy (single tx): Core PreChecks runs, after
+        //     CheckTxInputs and before CheckFeeRate, AreInputsStandard
+        //     ("bad-txns-nonstandard-inputs"), IsWitnessStandard
+        //     ("bad-witness-nonstandard"), PreCheckEphemeralTx ("dust") and
+        //     the MAX_STANDARD_TX_SIGOPS_COST gate, in that order
+        //     (validation.cpp PreChecks).  Apart from PreCheckEphemeralTx
+        //     (the full path runs it at §5c), these are the gates the full
+        //     path runs in verifyInputScriptsDetailed, in Core's order.
+        const params = self.params orelse &consensus.MAINNET;
+        var spent: ?SpentOutputs = null;
+        defer if (spent) |*sp| sp.deinit();
+        var ephemeral_checked = false;
+        if (single) {
+            if (self.chain_state) |cs| {
+                spent = try self.resolveSpentOutputs(cs, tx);
+                const sp = &spent.?;
+                validateInputsStandardness(tx, sp.scripts) catch |err| {
+                    return if (err == MempoolError.NonStandard) MempoolError.NonStandardInputs else err;
+                };
+                try checkWitnessStandard(tx, sp.scripts);
+                // Core PreCheckEphemeralTx: between IsWitnessStandard and
+                // the sigops reject (validation.cpp PreChecks).  With chain
+                // state every input was valued above, so the fee is known;
+                // were it not, the call below the block still runs.
+                if (have_inputs) {
+                    try preCheckEphemeralTx(tx, true, fee, fee + self.applyDelta(tx_hash));
+                    ephemeral_checked = true;
+                }
+                const std_flags = validation.getStandardScriptFlags(cs.best_height, params);
+                if (standardSigopCost(tx, sp.amounts, sp.scripts, std_flags) > consensus.MAX_STANDARD_TX_SIGOPS_COST) {
+                    return MempoolError.TooManySigopsCost;
+                }
+            }
+        }
+
+        if (have_inputs) {
+            // Core PreCheckEphemeralTx, before CheckFeeRate (package members
+            // and the no-chain-state pool, which skip the block above).
+            if (!ephemeral_checked) try preCheckEphemeralTx(tx, true, fee, fee + self.applyDelta(tx_hash));
 
             const min_fee_sat_kvb = @as(f64, @floatFromInt(self.getMinFee()));
             const modified_fee = fee + self.applyDelta(tx_hash);
@@ -4665,14 +4793,38 @@ pub const Mempool = struct {
                 }
             }
         }
+        // 4a. TRUC (single tx): Core PreChecks runs SingleTRUCChecks after the
+        //     fee floor ("TRUC-violation", policy/truc_policy.cpp), before
+        //     ReplacementChecks.  Same call as addTransaction §7b; a sibling
+        //     the full path would evict is not a reject.
+        if (single) {
+            _ = try self.checkTrucPolicy(tx, vsize, conflicting_txids.items);
+        }
+
         if (conflicting_txids.items.len > 0) {
             try self.checkRBFRules(tx, tx_hash, fee, vsize, conflicting_txids.items);
         }
 
         // 5. Core CheckEphemeralSpends({tx}) (AcceptSingleTransaction, after
-        //    the replacement checks).  testAcceptMultiple checks the whole
-        //    package itself.
+        //    the replacement checks and before PolicyScriptChecks).
+        //    testAcceptMultiple checks the whole package itself.
         if (!self.test_disallow_replacement) try self.checkEphemeralSpends(tx);
+
+        // 6. Script checks (single tx): Core PolicyScriptChecks then
+        //    ConsensusScriptChecks, which test_accept runs before returning
+        //    (validation.cpp AcceptSingleTransactionInternal).  The same
+        //    engine runs as for addTransaction §6b.
+        if (spent) |*sp| {
+            const cs = self.chain_state.?;
+            try self.runScriptChecks(
+                tx,
+                sp.amounts,
+                sp.scripts,
+                validation.getStandardScriptFlags(cs.best_height, params),
+                validation.getBlockScriptFlags(cs.best_height, params),
+                fail,
+            );
+        }
 
         return fee;
     }

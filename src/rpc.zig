@@ -16338,6 +16338,16 @@ pub const RpcServer = struct {
                                 try writer.writeByte('"');
                             }
                         }
+                        // A script-check failure: CScriptCheck's ToString,
+                        // "<reason>, input N of <txid> (wtxid <wtxid>),
+                        // spending <prevout>:<n>" (validation.cpp).
+                        if (result.script_failure) |f| {
+                            const d = try f.details(self.allocator, &tx);
+                            defer self.allocator.free(d);
+                            try writer.writeAll(",\"reject-details\":\"");
+                            try writer.writeAll(d);
+                            try writer.writeByte('"');
+                        }
                         // Value in < value out: CheckTxInputs' ToString, which
                         // carries both amounts.
                         if (std.mem.eql(u8, reason, "bad-txns-in-belowout")) {
@@ -25607,6 +25617,11 @@ fn rejectDetailsEqualReason(reason: []const u8) bool {
         "scriptsig-size",
         "scriptsig-not-pushonly",
         "dust",
+        // AreInputsStandard / IsWitnessStandard failures: state.Invalid(..,
+        // "bad-txns-nonstandard-inputs" / "bad-witness-nonstandard") with no
+        // debug message (Core v31.1 validation.cpp PreChecks).
+        "bad-txns-nonstandard-inputs",
+        "bad-witness-nonstandard",
     };
     for (bare) |t| if (std.mem.eql(u8, reason, t)) return true;
     return false;

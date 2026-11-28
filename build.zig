@@ -2024,6 +2024,38 @@ pub fn build(b: *std.Build) void {
         test_step.dependOn(&run_mes_tests.step);
     }
 
+    // Single-tx testmempoolaccept runs Core's input-policy, TRUC and script
+    // checks (r3fix-clearbit-tma-single-script-checks).  Same rig as
+    // test-mempool-error-strings; also part of `test`.
+    {
+        const tmass_tests = b.addTest(.{
+            .root_source_file = b.path("tests_r3fix_tma_single_script_checks.zig"),
+            .target = target,
+            .optimize = optimize,
+            .filters = &[_][]const u8{"tests_r3fix_tma_single"},
+        });
+        tmass_tests.linkSystemLibrary("rocksdb");
+        tmass_tests.linkSystemLibrary("secp256k1");
+        tmass_tests.addIncludePath(.{ .cwd_relative = secp256k1_include });
+        tmass_tests.linkLibC();
+        if (target.result.cpu.arch == .x86_64) {
+            tmass_tests.addCSourceFile(.{
+                .file = b.path("src/sha256_shani.c"),
+                .flags = shani_cflags,
+            });
+        }
+        if (minisketch_enabled) {
+            tmass_tests.linkSystemLibrary("minisketch");
+            tmass_tests.addIncludePath(.{ .cwd_relative = minisketch_include });
+        }
+        tmass_tests.root_module.addOptions("build_options", build_options);
+
+        const run_tmass_tests = b.addRunArtifact(tmass_tests);
+        const tmass_step = b.step("test-r3fix-tma-single", "Run the single-tx testmempoolaccept full-checks tests");
+        tmass_step.dependOn(&run_tmass_tests.step);
+        test_step.dependOn(&run_tmass_tests.step);
+    }
+
     // BIP54 non-witness sigop policy limit counts spent-prevout and scriptSig
     // sigops, not the tx's own outputs (policy/policy.cpp CheckSigopsBIP54).
     // Same rig as test-mempool-error-strings; also part of `test`.
